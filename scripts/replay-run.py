@@ -8,7 +8,11 @@ with no detector attached, against events that are real rather than synthetic.
     scripts/replay-run.py run00201.mid.lz4 --rate 20 --loop
 
 Reads the file, re-stamps each event's serial number and timestamp so consumers
-see a plausible live stream, and sends it at a chosen rate.
+see a plausible live stream, and sends it at a chosen rate. With
+``--keep-header`` the file's own serial numbers and time stamps are sent
+unchanged, so a tag copied from the pages (run, serial) finds the same event in
+the file; with ``--loop`` the serials then start again at every pass, which the
+SMA plugin treats as a restart (not a gap, and not frames offered).
 
 Safety
 ------
@@ -106,18 +110,32 @@ def _client_names(client, path: str) -> list[str]:
 
 
 def replay(path: Path, client, buf, rate: float, limit: int | None,
-           loop: bool, event_ids: set[int] | None, verbose: bool) -> int:
-    """Send events from `path` at `rate` per second. Returns how many were sent."""
+           loop: bool, event_ids: set[int] | None, verbose: bool,
+           use_numpy: bool = True, report_s: float = 0.0, keep_header: bool = False) -> int:
+    """Send events from `path` at `rate` per second. Returns how many were sent.
+
+    With `report_s`, prints one line every `report_s` seconds: the events sent
+    and the rate achieved in that interval, and the time spent inside
+    ``send_event`` (mean and max per event). The last two show whether the
+    producer was ever held up by the buffer, i.e. by a consumer.
+    """
     interval = 1.0 / rate if rate > 0 else 0.0
     sent = 0
     serial = 0
     t_next = time.time()
+    rep = {"t": time.time(), "n": 0, "send_s": 0.0, "send_max": 0.0}
 
     while not _stop:
         # Reopened each pass: MidasFile is a one-shot iterator, and reopening is
         # also what makes --loop replay the run's first event again, which is
         # the only event carrying the full DRS calibration table.
-        f = midas.file_reader.MidasFile(str(path))
+        #
+        # use_numpy hands banks over as ndarrays, not tuples of Python ints. A
+        # 40000-word TID_DWORD bank is 40000 int objects as a tuple, and both
+        # unpacking it and struct-packing it again in send_event are per-word
+        # Python loops; as an array the pack is one memmove (midas/event.py,
+        # the `np_buf = bank.data.tobytes()` branch).
+        f = midas.file_reader.MidasFile(str(path), use_numpy=use_numpy)
         for event in f:
             if _stop:
                 break
@@ -129,11 +147,25 @@ def replay(path: Path, client, buf, rate: float, limit: int | None,
             if event_ids is not None and event.header.event_id not in event_ids:
                 continue
 
-            serial += 1
-            event.header.serial_number = serial
-            event.header.timestamp = int(time.time())
+            if not keep_header:
+                serial += 1
+                event.header.serial_number = serial
+                event.header.timestamp = int(time.time())
+            t_send = time.perf_counter()
             client.send_event(buf, event)
+            d_send = time.perf_counter() - t_send
             sent += 1
+            if report_s:
+                rep["n"] += 1
+                rep["send_s"] += d_send
+                rep["send_max"] = max(rep["send_max"], d_send)
+                now = time.time()
+                if now - rep["t"] >= report_s:
+                    dt = now - rep["t"]
+                    print(f"report t={now:.3f} sent={sent} rate={rep['n'] / dt:.2f} "
+                          f"send_mean_ms={1e3 * rep['send_s'] / rep['n']:.3f} "
+                          f"send_max_ms={1e3 * rep['send_max']:.2f}", flush=True)
+                    rep.update(t=now, n=0, send_s=0.0, send_max=0.0)
 
             if verbose and sent % 100 == 0:
                 print(f"  sent {sent}", flush=True)
@@ -173,7 +205,16 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--max-event-size", type=int, default=8 * 1024 * 1024)
     ap.add_argument("--allow-during-run", action="store_true",
                     help="inject even with a run active -- see the safety note")
+    ap.add_argument("--numpy", action=argparse.BooleanOptionalAction, default=True,
+                    help="read banks as numpy arrays (default; --no-numpy gives the "
+                         "slow tuple path, useful only to compare)")
     ap.add_argument("--quiet", action="store_true")
+    ap.add_argument("--keep-header", action="store_true",
+                    help="send the file's own serial numbers and time stamps (tags from the "
+                         "pages then match the file); default: renumber from 1, stamp now")
+    ap.add_argument("--report-s", type=float, default=0.0,
+                    help="print the achieved rate and the time spent in send_event every "
+                         "this many seconds (0: never)")
     args = ap.parse_args(argv)
 
     if not args.run_file.is_file():
@@ -210,11 +251,18 @@ def main(argv: list[str] | None = None) -> int:
         sent = replay(args.run_file, client, buf,
                       args.rate, args.limit, args.loop,
                       set(args.event_id) if args.event_id else None,
-                      not args.quiet)
+                      not args.quiet, args.numpy, args.report_s, args.keep_header)
         dt = time.time() - t0
 
     if not args.quiet:
-        print(f"sent {sent} events in {dt:.1f}s ({sent / dt if dt else 0:.1f} ev/s)")
+        achieved = sent / dt if dt else 0.0
+        print(f"sent {sent} events in {dt:.1f}s ({achieved:.1f} ev/s)")
+        # A warning, not an error: the stream is still valid, it is just slower
+        # than the consumer test assumed. Matters when the rate is the variable.
+        if args.rate > 0 and achieved < 0.95 * args.rate:
+            print(f"warning: asked for {args.rate:g} ev/s but achieved {achieved:.1f}; "
+                  "the replay itself is the bottleneck"
+                  + ("" if args.numpy else " (try --numpy)"), file=sys.stderr)
     return 0
 
 
