@@ -74,8 +74,11 @@ async function call(client, cmd, args, maxLength) {
 
     if (rpc.byteLength < size) {
       if (attempt === 0) {
-        max = size;
-        continue;                    // the header told us how much to ask for
+        // The header told us how much to ask for -- then. A reply that grows
+        // between the two calls (the 10-minute trend gains a row) must still
+        // fit, or the retry fails every time on a fresh page load.
+        max = size + Math.max(4096, size >> 3);
+        continue;
       }
       throw new Error(`${cmd} still truncated at ${size} bytes`);
     }
