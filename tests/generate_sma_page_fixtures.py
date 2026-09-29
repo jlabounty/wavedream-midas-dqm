@@ -31,6 +31,28 @@ Written to ``tests/js/sma-summary-fixture.json``:
                        the page asks for it on Freeze
 ``raw_seq`` / ``raw_event``  the seeded frame's seq and its sma::raw payload (hex):
                        one raw MIDAS event, a one-event .mid file
+``seeded_any``         the seeded view with seed "any" on the same frame (``select``)
+``seeded_filtered``    seed S1 with filters ["tot", "rf"] (fewer seeds, each ``odd``)
+``seeded_stale``       the default seeded view after frames without S1 (682 frames
+                       with the S1 words taken out): the old frame, with ``stale_view``
+``seeded_any_nos1``    seed "any" on such a frame: seeds without S1 (``rf_na``)
+``seeded_nomatch``     seed "ch8" with filter "tot": ``search.no_match``
+``summary_noseeds``    sma::summary after 12 s of frames without S1: ``no_seeds``
+``seeded_mupix_both``  seed S1 with the MuPix selector "both" (``select.mupix``)
+``seeded_mupix_none``  seed S1 with the MuPix selector "none"
+``summary_mupix_sync`` the 682 frames with the MuPix in-time window moved 1 us late
+                       (nothing in it), after the sync hold: a ``mupix_sync`` warning
+``trend_mupix_sync``   its sma::trend (MuPix fractions near 0)
+``summary_1008``       sma::summary of the real 1008 frame at shift 14: S5's fine =
+                       t/2 fault in ``timestamp_faults``
+``seeded_pattern``     that frame, filter "incomplete" (S5 ignored: ``meta.incomplete``)
+                       and pattern {"1": "present", "3": "absent"} (``select.pattern``)
+``hists`` also carries four MuPix histograms of the normal case (dt L1/L2, the
+S1 match, the column occupancy).
+
+The 682 frames carry MuPix pixel words, so ``seeded`` / ``raster`` /
+``raster_words`` have the smaf pixel block (``meta.mupix``) as the analyzer
+sends it by default.
 
 Run by hand after a change to the plugin's JSON or the smaf layout::
 
@@ -121,12 +143,70 @@ def build() -> dict:
     dims = {n: (2 if hasattr(p.store.get(n), "y") else 1) for n in names}
     h1 = "sma/words_per_ch"
     h2 = "sma/tot_vs_ch_lsb0"
+    # The MuPix histograms the page tests look at (the others fall back to the
+    # generic 1D/2D ones: a 2D histogram is 140 kB of hex here).
+    mupix_hists = {n: p.store.get(n).encode().hex() for n in
+                   ("sma/mupix_dt_L1", "sma/mupix_dt_L2", "sma/mupix_s1_match", "sma/mupix_col_chip")}
     status = {
         "client": "sma_analyzer", "run_number": 682, "run_active": True,
         "events_seen": p.frames, "events_processed": p.frames, "processed_per_s": 4.2,
         "throttled": False, "rate_limit": 1000.0, "configured_rate": 1000.0,
         "reconnects": 0, "plugin": p.status(),
     }
+
+    seeded_any = p.frame_blob("seeded", seed="any")
+    seeded_filtered = p.frame_blob("seeded", filters=["tot", "rf"])
+    assert framing.decode_sma_frame(seeded_filtered)["meta"]["seeds"], "a filtered seed"
+    seeded_mupix_both = p.frame_blob("seeded", mupix="both")
+    d = framing.decode_sma_frame(seeded_mupix_both)
+    assert d["meta"]["select"]["mupix"] == "both" and d["meta"]["mupix"]["seeds"], "L1+L2 seeds"
+    assert d["pixels"] is not None and d["pixels"]["n"] > 0
+    seeded_mupix_none = p.frame_blob("seeded", mupix="none")
+    assert framing.decode_sma_frame(raster)["pixels"]["n"] > 100, "the raster's pixel hits"
+
+    # -- MuPix out of time: the in-time window moved 1 us late (nothing real
+    # in it), the sync flag after its hold time --
+    clock5 = _Clock(T0)
+    v = SmaPlugin(HistStore(), clock=clock5, settings={
+        "MuPix": {"window lo ns": 1000, "window hi ns": 1600},
+        "Self check": {"mupix sync hold s": 3.0, "mupix sync window s": 3.0,
+                       "mupix sync min S1": 100}})
+    serial5 = 0
+    for sec in range(8):
+        for w in r682[2:]:
+            clock5.t = T0 + sec + 0.1 + 0.2 * (serial5 % 4)
+            v.process(_Event(w, serial=serial5), run_number=682)
+            serial5 += 1
+    clock5.t = T0 + 8.5
+    mupix_sync = v.summary(run_active=True)
+    assert any(f["code"] == "mupix_sync" for f in mupix_sync["flags"]), mupix_sync["flags"]
+    trend_sync = v.trend()
+
+    # -- S1 goes missing: 682 frames without their S1 words, for 12 s --
+    clock4 = _Clock(T0)
+    u = SmaPlugin(HistStore(), clock=clock4)
+    u.process(_Event(r682[4], serial=0), run_number=682)
+    s1 = u.cfg.roles.s1
+
+    def no_s1(w):
+        w = np.asarray(w, dtype="<u8")
+        trig = (w >> np.uint64(63)) == 1
+        ch = (w >> np.uint64(56)) & np.uint64(0xF)
+        return w[~(trig & (ch == s1) & (w != np.uint64(0xFFFFFFFFFFFFFFFF)))]
+
+    for k in range(12):
+        clock4.t = T0 + 1 + k
+        u.process(_Event(no_s1(r682[2 + k % 4]), serial=1 + k), run_number=682)
+    clock4.t = T0 + 13.2
+    seeded_stale = u.frame_blob("seeded")
+    assert framing.decode_sma_frame(seeded_stale)["meta"]["stale_view"]["good_since"] == 12
+    seeded_any_nos1 = u.frame_blob("seeded", seed="any")
+    seeds = framing.decode_sma_frame(seeded_any_nos1)["meta"]["seeds"]
+    assert seeds and all(x["rf_na"] for x in seeds), seeds
+    seeded_nomatch = u.frame_blob("seeded", seed="ch8", filters=["tot"])
+    assert framing.decode_sma_frame(seeded_nomatch)["meta"]["search"]["no_match"]
+    noseeds = u.summary(run_active=True)
+    assert any(f["code"] == "no_seeds" for f in noseeds["flags"]), noseeds["flags"]
 
     # -- the shift-mismatch case --
     clock2 = _Clock(T0)
@@ -137,6 +217,20 @@ def build() -> dict:
     clock2.t = T0 + 3.5
     shift13 = q.summary(run_active=True)
     assert shift13["shift"]["verdict"] == "mismatch", shift13["shift"]
+
+    # -- run 1008 at its own shift: S5's fine = t/2 fault is a known timestamp fault --
+    clock5 = _Clock(T0)
+    f = SmaPlugin(HistStore(), clock=clock5)
+    for k in range(3):
+        clock5.t = T0 + k
+        f.process(_Event(r1008, serial=k), run_number=1008)
+    clock5.t = T0 + 3.5
+    summary_1008 = f.summary(run_active=True)
+    assert [x["counter"] for x in summary_1008["timestamp_faults"]["counters"]] == [5]
+    seeded_pattern = f.frame_blob("seeded", filters=["incomplete"],
+                                  pattern={"1": "present", "3": "absent"})
+    d = framing.decode_sma_frame(seeded_pattern)["meta"]
+    assert d["seeds"] and d["incomplete"]["ignored"][0]["counter"] == 5, d["incomplete"]
     assert any(f["code"] == "shift_mismatch" for f in shift13["flags"])
 
     # -- a broken time base: run 342's frames at the default shift 14 --
@@ -225,13 +319,26 @@ def build() -> dict:
         "status": json.loads(json.dumps(status, default=str)),
         "hist_names": names,
         "hist_dims": dims,
-        "hists": {h1: p.store.get(h1).encode().hex(), h2: p.store.get(h2).encode().hex()},
+        "hists": {h1: p.store.get(h1).encode().hex(), h2: p.store.get(h2).encode().hex(),
+                  **mupix_hists},
         "current_channel": current,
         "seeded": seeded.hex(),
         "raster": raster.hex(),
         "raster_words": raster_words.hex(),
         "raw_seq": int(seeded_seq),
         "raw_event": bytes(raw.data).hex(),
+        "seeded_any": seeded_any.hex(),
+        "seeded_filtered": seeded_filtered.hex(),
+        "seeded_stale": seeded_stale.hex(),
+        "seeded_any_nos1": seeded_any_nos1.hex(),
+        "seeded_nomatch": seeded_nomatch.hex(),
+        "summary_noseeds": json.loads(json.dumps(noseeds)),
+        "seeded_mupix_both": seeded_mupix_both.hex(),
+        "seeded_mupix_none": seeded_mupix_none.hex(),
+        "summary_1008": json.loads(json.dumps(summary_1008)),
+        "seeded_pattern": seeded_pattern.hex(),
+        "summary_mupix_sync": json.loads(json.dumps(mupix_sync)),
+        "trend_mupix_sync": json.loads(json.dumps(trend_sync)),
     }
 
 

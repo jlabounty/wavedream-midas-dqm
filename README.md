@@ -37,14 +37,23 @@ checkout heals itself.
 
 A second analyzer plugin, `src/mdqm/plugins/sma.py`, decodes SMA readout frames
 (event 301, bank `H000`) and serves two more pages, **SMAPlots** (flags,
-per-channel table, Health / ToT / Timing / RF / Trends tabs) and **SMAEvents**
-(S1-seeded events and a whole-frame raster). It runs as its own client next to
-the WaveDREAM one, with its own ODB tree `/DQM/SMA`:
+per-channel table, Health / ToT / Timing / RF / MuPix / Trends tabs) and **SMAEvents**
+(S1-seeded events and a whole-frame raster). The MuPix pixel words of the same
+bank are decoded too: MuPix lanes and rows on SMAEvents, the in-time share of
+S1 hits per plane and an SMA <-> MuPix time-sync flag on SMAPlots. It runs as
+its own client next to the WaveDREAM one, with its own ODB tree `/DQM/SMA`:
 
 ```bash
-nice -n 19 ionice -c3 mdqm-analyzer --experiment MYEXPT --plugin sma --client sma_analyzer
+scripts/start-sma-analyzer.sh --experiment MYEXPT --python /path/to/python   # tmux session; --status, --stop
 mdqm-sma-file run01008_00001.mid.lz4          # same plugin over one file, no MIDAS
 ```
+
+`scripts/start-sma-analyzer.sh` needs no `pip install`: it runs the analyzer
+from this checkout as a low-priority guest (one BLAS thread, `nice -n 19`,
+`ionice -c3`, 1 GiB `prlimit`), refuses to start a second copy, and has
+`--status`, `--stop` (waits up to 20 s for the client to detach) and
+`--foreground`. Hooking it into a restart script, and the raw command it runs:
+"Starting and stopping the analyzer" in docs/SMA-DQM.md.
 
 **It is a live peek, bounded by a CPU budget, not a lossless record.** The
 analyzer measures its own CPU and analyses only as many frames per second as fit

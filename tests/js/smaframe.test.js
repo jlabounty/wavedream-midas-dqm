@@ -57,6 +57,35 @@ function check(f, e, name) {
     assert.strictEqual(f.rawWord, null, `${name}: no raw words in v1`);
     assert.strictEqual(f.wordIndex, null, `${name}: no word index in v1`);
   }
+  checkPixels(f, e, name);
+}
+
+function checkPixels(f, e, name) {
+  if (e.pixels === undefined) return;
+  if (e.pixels === null) {
+    assert.strictEqual(f.pixels, null, `${name}: no pixel block`);
+    assert.ok(!(f.flags & SMAF.FLAGS.PIXELS), `${name}: no PIXELS flag`);
+    return;
+  }
+  const p = f.pixels, x = e.pixels;
+  assert.ok(f.flags & SMAF.FLAGS.PIXELS, `${name}: PIXELS flag`);
+  assert.strictEqual(p.n, x.n, `${name}: pixel count`);
+  assert.strictEqual(p.timeShift, x.time_shift, `${name}: pixel time shift`);
+  assert.strictEqual(p.words, x.words, `${name}: pixel words`);
+  assert.strictEqual(p.offset, x.offset, `${name}: pixel block offset`);
+  assert.deepStrictEqual(Array.from(p.tRaw), x.t_rel, `${name}: pixel t_rel (wire)`);
+  assert.deepStrictEqual(Array.from(p.t), x.t_rel.map((v) => v * 2 ** x.time_shift), `${name}: pixel t`);
+  for (const k of ["chip", "col", "row", "tot", "flags"]) {
+    assert.deepStrictEqual(Array.from(p[k]), x[k], `${name}: pixel ${k}`);
+  }
+  if (x.words) {
+    assert.deepStrictEqual(Array.from(p.rawWord, (w) => w.toString(16).padStart(16, "0")),
+                           x.raw_words, `${name}: pixel raw words`);
+    assert.deepStrictEqual(Array.from(p.wordIndex), x.word_index, `${name}: pixel word index`);
+  } else {
+    assert.strictEqual(p.rawWord, null, `${name}: no pixel raw words`);
+    assert.strictEqual(p.wordIndex, null, `${name}: no pixel word index`);
+  }
 }
 
 for (const c of cases) {
@@ -171,5 +200,36 @@ test("the flag constants agree with framing.py", () => {
 });
 
 test("every case ran", () => {
-  assert.ok(cases.length >= 13, `only ${cases.length} cases`);
+  assert.ok(cases.length >= 20, `only ${cases.length} cases`);
+});
+
+test("pixel blocks come after v1 and v2, with and without words, and old fields are untouched", () => {
+  const px = cases.filter((c) => c.expect.pixels);
+  assert.deepStrictEqual([...new Set(px.map((c) => c.expect.version))].sort(), [1, 2]);
+  assert.deepStrictEqual([...new Set(px.map((c) => c.expect.pixels.words))].sort(), [false, true]);
+  // The same real frame with and without the block: the trigger hits read the same.
+  const a = cases.find((c) => c.name === "real 4k-word frame, seeded (v2, words)");
+  const b = cases.find((c) => /seeded \(v2, words\), no pixel block/.test(c.name));
+  const fa = SMAF.decode(bufferOf(a.payload_hex)), fb = SMAF.decode(bufferOf(b.payload_hex));
+  assert.ok(fa.pixels && fa.pixels.n > 0 && fb.pixels === null);
+  assert.deepStrictEqual(Array.from(fa.t), Array.from(fb.t));
+  assert.deepStrictEqual(Array.from(fa.ch), Array.from(fb.ch));
+});
+
+test("a truncated pixel block is refused, and an unknown block version too", () => {
+  const c = cases.find((x) => x.expect.pixels && x.expect.pixels.n > 100);
+  const at = c.expect.pixels.offset;
+  assert.throws(() => SMAF.decode(bufferOf(c.payload_hex).slice(0, at + 20)), /short smaf pixel block/);
+  const ab = bufferOf(c.payload_hex);
+  new DataView(ab).setUint8(at + 6, 9);
+  assert.throws(() => SMAF.decode(ab), /unknown smaf pixel block version 9/);
+});
+
+test("the pixel flag constants agree with framing.py", () => {
+  const py = fs.readFileSync(
+    path.join(__dirname, "..", "..", "src", "mdqm", "dqm", "framing.py"), "utf8");
+  assert.ok(new RegExp(`^SMAF_PIXELS = 1 << ${Math.log2(SMAF.FLAGS.PIXELS)}`, "m").test(py));
+  assert.ok(new RegExp(`^PIX_OFF_SENSOR = 1 << ${Math.log2(SMAF.PIX.OFF_SENSOR)}`, "m").test(py));
+  assert.ok(new RegExp(`^PIX_IN_SEED = 1 << ${Math.log2(SMAF.PIX.IN_SEED)}`, "m").test(py));
+  assert.ok(/^PIX_PLANE_MASK = 0x3/m.test(py) && SMAF.PIX.PLANE_MASK === 3);
 });

@@ -265,6 +265,22 @@ def counter_roles(summary: dict) -> list[tuple[str, str, int]]:
     return out + [(e["counter"], e["label"], e["ch"]) for e in summary["efficiency"]]
 
 
+def mupix_line(mp: dict) -> str:
+    """One line on the MuPix pixel words: the in-time shares of S1 hits and the sync verdict."""
+    if not mp.get("enabled", True):
+        return "MuPix: analysis off (MuPix/max pixel hits per frame = 0)"
+    f = mp["fractions"]
+    w, sb = mp["window_ns"], mp["sideband_ns"]
+    parts = [f"{k} {_frac(f[key]['in'])} (sideband {_frac(f[key]['side'])}, corrected "
+             f"{_frac(f[key]['corr'])})" for k, key in (("L1", "L1"), ("L2", "L2"),
+                                                          ("L1+L2", "both"))]
+    ppf = mp.get("pixels_per_frame")
+    return (f"MuPix: S1 hits with a pixel hit in [{w[0]}, {w[1]}) ns (sideband [{sb[0]}, {sb[1]}) "
+            f"ns), of {mp['n_s1']}: " + ", ".join(parts)
+            + f"; {ppf if ppf is not None else 0:.0f} pixel words per frame"
+            + f"; time sync {mp.get('sync', {}).get('state', '?')}")
+
+
 def text_summary(summary: dict, stats: FeedStats, file_label: str, elapsed_s: float) -> str:
     f = summary["frames"]
     sh = summary["shift"]
@@ -299,6 +315,9 @@ def text_summary(summary: dict, stats: FeedStats, file_label: str, elapsed_s: fl
     rf = summary["rf"]
     lines.append(f"RF: valid gate {_frac(rf['valid_frac'])}, vetoed {_frac(rf['vetoed_frac'])} "
                  f"of {rf['n_s1']} S1 hits")
+    mp = summary.get("mupix")
+    if mp:
+        lines.append(mupix_line(mp))
     flags = summary["flags"]
     if flags:
         lines.append(f"flags ({len(flags)}):")
@@ -351,8 +370,10 @@ def figure_text(summary: dict) -> list[str]:
            else "")
         + "; consistent fraction per shift: "
         + ", ".join(f"{s}: {_frac(x, 0)}" for s, x in fr.items()),
-        "",
     ]
+    if summary.get("mupix"):
+        lines.append(mupix_line(summary["mupix"]))
+    lines.append("")
     flags = summary["flags"]
     if not flags:
         lines.append("No flags.")
@@ -614,12 +635,19 @@ def _show_event(ev, path: Path, run, word_range, args) -> int:
         pos = {int(w): k for k, w in enumerate(widx)}
         print(f"{'word':>7} {'raw':>18} {'type':>7} {'ch':>3} {'ToT':>4} {'fine':>7} "
               f"{'coarse':>9} {'time_ns':>15} fine/coarse")
+        print(f"{'':>7} {'':>18} {'pixel':>7} chip, col, row, TS2, ToT (x 256 ns), time_ns "
+              "(pixel words)")
         for w in range(a, b + 1):
             raw = int(words[w])
             k = pos.get(w)
+            if k is None and raw != W.FILLER:
+                px = W.pixel_decode(np.array([raw], dtype=np.uint64))
+                print(f"{w:7d} 0x{raw:016x} {'pixel':>7} chip {int(px['chip'][0])}, col "
+                      f"{int(px['col'][0])}, row {int(px['row'][0])}, TS2 {int(px['ts2'][0])}, "
+                      f"ToT {int(px['tot'][0])}, {int(px['time'][0])} ns")
+                continue
             if k is None:
-                kind = "filler" if raw == W.FILLER else "pixel"
-                print(f"{w:7d} 0x{raw:016x} {kind:>7}")
+                print(f"{w:7d} 0x{raw:016x} {'filler':>7}")
                 continue
             print(f"{w:7d} 0x{raw:016x} {'trigger':>7} {int(d['ch'][k]):3d} "
                   f"{int(d['tot'][k]):4d} 0x{int(d['fine'][k]):05x} 0x{int(d['coarse'][k]):07x} "

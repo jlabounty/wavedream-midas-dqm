@@ -3,13 +3,33 @@
 //
 // Two views of the analyzer's latest frame, from sma::frame:
 //
-//   Seeded  up to four S1 hits of the latest good frame, each with every
+//   Seeded  up to four seeds of the latest good frame, each with every
 //           channel that has a role in [-200 ns, +3 us] around it: one lane per
 //           channel, each hit a bar from t to t+ToT. This is where a missing
 //           counter, an RF burst in the wrong place, or a fine/coarse-corrupt
-//           word is seen hit by hit.
+//           word is seen hit by hit. The seeds are S1 hits by default; the
+//           toolbar chooses another channel or "any counter" (the first hit of
+//           each counter cluster, so events without S1 show up), and filters
+//           that keep only seeds with an oddity in their window. Both are this
+//           viewer's own choice (sessionStorage), sent with every request; the
+//           analyzer searches back through its last good frames for a match.
+//           A banner says when the frame shown is not the newest one, and why.
+//           "incomplete pattern" leaves out counters with a known timestamp
+//           fault (the analyzer says which, per reply: meta.incomplete). A row
+//           of per-counter any / present / absent selectors (S1..S5 within the
+//           coincidence window of the seed) is AND-ed with all of that.
 //   Raster  the whole latest frame, time vs channel, ToT as colour. This is
 //           where a stale buffer, a dead channel or a frame-sized hole is seen.
+//
+// MuPix: the same bank carries the pixel words (smaf pixel block). The seeded
+// view gets two more lanes, "MuPix L1" and "MuPix L2" (a third for chips the
+// plane map does not know, when there are any), one tick per pixel hit coloured
+// by its ToT, the in-time window shaded, and per seed a badge saying which
+// planes had a hit in time; the "MuPix:" selector (any / L1+L2 / L1 or L2 /
+// none in time) is AND-ed with the oddity filters. The raster gets the planes
+// as extra rows (every pixel hit, noise included; "hide MuPix" drops them).
+// A pixel hit is hit number nHits + j of its frame (j in the pixel block), so
+// hovering, tagging, Copy all and the word ranges treat it like any other hit.
 //
 // Drawn on our own <canvas>, not mplot: mplot has no shapes (see dqm-evd.js,
 // markEdge), and a 33k-hit raster as 16 scatter series would be both slow and
@@ -59,7 +79,26 @@ const COPIED_MS = 1500;          // how long a copy button says "Copied"
 const RAW_KEEP = 2;              // frozen frames whose raw event the page keeps (one per tab)
 const MAX_TAGS = 200;            // tagged hits the list holds
 const SS_TAGS = "dqm-sma-events-tagged";   // sessionStorage: the list survives a reload
+const SS_SEED = "dqm-sma-events-seed";     // sessionStorage: this viewer's seed choice and filters
+// The oddity filters (sma_words.FILTERS), in the order the analyzer uses.
+const FILTERS = [
+  ["incomplete", "incomplete pattern", "not every counter S1..S5 within the coincidence window of the " +
+   "seed. Counters with a known timestamp fault (the SMAPlots fine/coarse flag) are left out, " +
+   "since they are almost never in time; the header says which"],
+  ["mismatch", "fine/coarse mismatch", "a hit in the window whose fine and coarse fields disagree"],
+  ["tot", "ToT ≥ 250", "a hit in the window with a corrupt ToT code (Cuts/tot corrupt)"],
+  ["rf", "RF not valid / vetoed", "the S1 hit's RF gate is not valid, or vetoed by another S1 hit"],
+];
 const TAG_MARK = "#000";         // a tagged hit's outline and number box
+// The MuPix selector (sma_words.MUPIX_MODES): AND-ed with the filters above.
+const MUPIX_MODES = [
+  ["any", "any"], ["both", "L1+L2 in time"], ["either", "L1 or L2 in time"], ["none", "none in time"],
+];
+// The per-counter pattern selector (sma_words.PATTERN_STATES): AND-ed with everything else.
+const PATTERN_STATES = [["any", "any"], ["present", "present"], ["absent", "absent"]];
+const N_PATTERN = 5;             // S1..S5
+const PLANE_LABEL = { 0: "no plane", 1: "MuPix L1", 2: "MuPix L2" };
+const IN_TIME_FILL = "rgba(44, 160, 44, 0.16)";   // the in-time window on the MuPix lanes
 
 const LANE_COLOURS = {
   s1: "#1f77b4", counter: ["#1f77b4", "#2ca02c", "#17becf", "#9467bd", "#8c564b", "#bcbd22"],
@@ -72,7 +111,12 @@ const state = {
   paused: false,
   zoom: "full",
   hideCurrent: true,
+  hidePixels: false,             // the raster's "hide MuPix"
   intervals: { seeded: 250, raster: 500 },
+  // Which hits seed the seeded view, and which oddities it is limited to (OR):
+  // this viewer's choice, sent with every seeded request (see seedArgs()).
+  // pattern: {"<k>": "present"|"absent"} per counter k = 1..5 (S1..S5); "any" is left out.
+  seedSel: { seed: "s1", filters: [], mupix: "any", pattern: {} },
   frames: { seeded: null, raster: null },
   lastNewAt: { seeded: null, raster: null },
   summary: null,
@@ -101,6 +145,7 @@ window.addEventListener("load", function () {
   mhttpd_init(mhttpd_getParameterByName("page") || "SMAEvents", 1000);
   restore();
   restoreTags();
+  restoreSeedSel();
   build();
   showTab(state.tab);
   window.addEventListener("resize", function () { redraw(); });
@@ -174,12 +219,13 @@ async function fetchFor(tab, extra) {
       state.summary = await BRPC.json(state.client, "sma::summary", "");
     } catch (e) { /* keep the last one, or the fallbacks */ }
     state.summaryAt = Date.now();
+    try { updateSeedOptions(); } catch (e) { /* the list keeps its fallback labels */ }
   }
   // max_hits: a bound on the reply, so a pathological frame is truncated (and
   // says so in the header) rather than growing the reply without limit. Real
   // 40k-word frames are ~33k hits.
-  const args = Object.assign(tab === "raster" ? { view: "raster", drop: rasterDrop(), max_hits: MAX_HITS }
-                                             : { view: "seeded" }, extra || {});
+  const args = Object.assign(tab === "raster" ? rasterArgs() : Object.assign({ view: "seeded" }, seedArgs()),
+                             extra || {});
   return SMAF.fetchFrame(state.client, args, args.words ? WORDS_MAX_REPLY : undefined);
 }
 
@@ -250,6 +296,13 @@ function rasterDrop() {
   return state.hideCurrent && cur !== null ? [cur] : [];
 }
 
+/** The raster request: the drop list, the reply bound, and "pixels": false when MuPix is hidden. */
+function rasterArgs() {
+  const a = { view: "raster", drop: rasterDrop(), max_hits: MAX_HITS };
+  if (state.hidePixels) a.pixels = false;
+  return a;
+}
+
 // ---------------------------------------------------------------------------
 // Roles and lanes
 // ---------------------------------------------------------------------------
@@ -305,8 +358,13 @@ function labelOf(ch, r) {
   return l || `ch${String(ch).padStart(2, "0")}`;
 }
 
-/** Seeded-view lanes: counters in order, RF, delayed channels, then current. */
-function lanes() {
+/**
+ * Seeded-view lanes: counters in order, RF, delayed channels, current, then
+ * the MuPix planes when the frame has a pixel block (L1 and L2 always, "no
+ * plane" only when a shipped pixel hit is on a chip the plane map lacks).
+ * A MuPix lane has `pix` (the plane code) instead of `ch`.
+ */
+function lanes(frame) {
   const r = roles();
   const out = [];
   r.counters.forEach(function (ch, k) {
@@ -317,7 +375,52 @@ function lanes() {
   if (r.current !== null) {
     out.push({ ch: r.current, label: labelOf(r.current, r), colour: LANE_COLOURS.current });
   }
+  for (const pl of pixelPlanes(frame)) out.push({ pix: pl, label: PLANE_LABEL[pl], colour: "#555" });
   return out;
+}
+
+// -- MuPix pixel hits: hit nHits + j of a frame is pixel j of its pixel block ----------
+
+/** The frame's pixel block, or null (no MuPix in the frame, or hidden). */
+function pixOf(frame) { return frame && frame.pixels ? frame.pixels : null; }
+
+/** Hits of the frame, pixel hits included: the valid hit indices are 0 .. nAll - 1. */
+function nAll(frame) { return frame.nHits + (frame.pixels ? frame.pixels.n : 0); }
+
+function isPix(frame, i) { return i >= frame.nHits; }
+
+/** Pixel j's time in ns from meta.t0_ns, the SMA hits' reference: one time axis for both. */
+function pixRel(frame, j) {
+  const m = frame.meta || {};
+  const mp = m.mupix || {};
+  return (mp.t0_ns - m.t0_ns) + frame.pixels.t[j];
+}
+
+/** The planes a frame's MuPix lanes/rows show: [1, 2], and 0 when a shipped hit has no plane. */
+function pixelPlanes(frame) {
+  const p = pixOf(frame);
+  if (!p || !(frame.meta && frame.meta.mupix)) return [];
+  for (let j = 0; j < p.n; j++) if (!(p.flags[j] & SMAF.PIX.PLANE_MASK)) return [1, 2, 0];
+  return [1, 2];
+}
+
+/** A hit's H000 word index (SMA or pixel), or undefined without word data. */
+function wordOf(frame, i) {
+  if (!isPix(frame, i)) return frame.wordIndex ? frame.wordIndex[i] : undefined;
+  const p = frame.pixels;
+  return p && p.wordIndex ? p.wordIndex[i - frame.nHits] : undefined;
+}
+
+function rawOf(frame, i) {
+  if (!isPix(frame, i)) return frame.rawWord ? frame.rawWord[i] : undefined;
+  const p = frame.pixels;
+  return p && p.rawWord ? p.rawWord[i - frame.nHits] : undefined;
+}
+
+/** A pixel ToT colour, 0..31: its own scale (cyan-blue short, orange long), not the SMA one. */
+function pixColour(tot) {
+  const v = Math.min(1, tot / 31);
+  return `hsl(${Math.round(200 - v * 170)}, 75%, ${Math.round(55 - v * 15)}%)`;
 }
 
 // ---------------------------------------------------------------------------
@@ -437,6 +540,15 @@ function frameHeader(frame, holder) {
                              "yellow"));
   }
   if (m.shift !== undefined) holder.appendChild(badge(`coarse shift ${m.shift}`));
+  const mp = m.mupix;
+  if (mp && mp.per_plane) {
+    const pp = mp.per_plane;
+    let t = `MuPix ${num(mp.n_examined)} hits: L1 ${num(pp[1])} · L2 ${num(pp[2])}`;
+    if (pp[0]) t += ` · ${num(pp[0])} no plane`;
+    if (mp.n_skipped) t += ` (${num(mp.n_skipped)} more not examined)`;
+    if (mp.truncated) t += `; latest ${num(frame.pixels ? frame.pixels.n : 0)} shown`;
+    holder.appendChild(badge(t, pp[0] || mp.truncated ? "yellow" : ""));
+  }
   const note = samplingNote();
   if (note) holder.appendChild(el("span", { class: "dqm-footnote dqm-smaev-sampling" }, note));
 }
@@ -469,20 +581,26 @@ function renderSeeded(frame) {
     holder.innerHTML = "";
     state.seedPanels = [];
     head.innerHTML = "";
+    guard("dqm-smaev-banner", () => renderBanner(null));
     noFrameNote("seeded", `${state.client} has not seen a good SMA frame yet. The seeded view ` +
       "shows only good frames (a stale buffer has no seeds worth showing).");
     return;
   }
   clearNote("seeded");
-  guard(head, () => frameHeader(frame, head));
+  guard(head, () => { frameHeader(frame, head); selectHeader(frame, head); });
+  guard("dqm-smaev-banner", () => renderBanner(frame));
+  try { updatePatternWarnings(); } catch (e) { /* the row keeps its last warnings */ }
 
   const seeds = (frame.meta && frame.meta.seeds) || [];
   while (state.seedPanels.length > seeds.length) state.seedPanels.pop().wrap.remove();
   while (state.seedPanels.length < seeds.length) state.seedPanels.push(makeSeedPanel(holder));
-  if (!seeds.length) {
-    noFrameNote("seeded", "This frame has no S1 hit whose whole window lies inside it.");
+  const sel = (frame.meta || {}).select;
+  if (!seeds.length && !(frame.meta && frame.meta.search && frame.meta.search.no_match)) {
+    noFrameNote("seeded", sel
+      ? `This frame has no ${sel.seed_label} hit whose whole window lies inside it.`
+      : "This frame has no S1 hit whose whole window lies inside it.");
   }
-  const ls = lanes();
+  const ls = lanes(frame);
   const nums = tagNumbers("seeded", frame);
   seeds.forEach(function (seed, k) {
     const p = state.seedPanels[k];
@@ -549,11 +667,41 @@ function seedHits(frame, seed) {
   return [Math.max(0, h[0]), Math.min(frame.nHits, h[1])];
 }
 
+/** The seed's pixel hits: [pa, pb) in the pixel block (meta.mupix.seeds[k].pix). */
+function seedPixels(frame, k) {
+  const p = pixOf(frame);
+  const ms = (((frame.meta || {}).mupix || {}).seeds || [])[k];
+  if (!p || !ms || !ms.pix) return [0, 0];
+  return [Math.max(0, ms.pix[0]), Math.min(p.n, ms.pix[1])];
+}
+
+/**
+ * The seed's MuPix badge: which planes had a hit in the in-time window
+ * (counted by the analyzer, meta.mupix.seeds[k]), or why it cannot say (no
+ * hit, and the window runs past the frame's pixel data).
+ */
+function mupixBadge(frame, k) {
+  const mp = (frame.meta || {}).mupix;
+  const ms = mp && (mp.seeds || [])[k];
+  if (!ms) return null;
+  const w = mp.window_ns || [];
+  const title = `MuPix hits in the in-time window [${w[0]}, ${w[1]}) ns around the seed`;
+  const l1 = ms.l1 > 0, l2 = ms.l2 > 0;
+  if (!ms.covered && !l1 && !l2) {
+    // No hit found, but the window runs past the frame's pixel data: says nothing.
+    return el("span", { class: "dqm-sma-badge", title: "The seed's in-time window runs past the " +
+                        "MuPix data of this frame" }, "MuPix n/a (outside the pixel data)");
+  }
+  const text = l1 && l2 ? "L1+L2 ✓" : l1 ? "L1 ✓" : l2 ? "L2 ✓" : "no MuPix in time";
+  return el("span", { class: `dqm-sma-badge ${l1 || l2 ? "green" : ""}`.trim(),
+                      title: `${title}: L1 ${ms.l1}, L2 ${ms.l2}` }, text);
+}
+
 function drawSeed(frame, seed, k, p, ls, nums) {
   const [a, b] = seedHits(frame, seed);
   let nMis = 0, nTot = 0, nOther = 0;
-  const laneOf = {};
-  ls.forEach((l, i) => { laneOf[l.ch] = i; });
+  const laneOf = {}, pixLane = {};
+  ls.forEach((l, i) => { if (l.pix === undefined) laneOf[l.ch] = i; else pixLane[l.pix] = i; });
   for (let i = a; i < b; i++) {
     if (frame.hitFlags[i] & SMAF.HIT.MISMATCH) nMis++;
     if (frame.hitFlags[i] & SMAF.HIT.TOT_CORRUPT) nTot++;
@@ -564,22 +712,33 @@ function drawSeed(frame, seed, k, p, ls, nums) {
   const head = p.head;
   head.innerHTML = "";
   p.geom = null;
+  const who = seed.seed_ch === undefined ? `S1` : `${labelOf(seed.seed_ch)} (ch ${seed.seed_ch})`;
+  const tot = seed.seed_ch === undefined ? seed.s1_tot : seed.seed_tot;
   head.appendChild(el("span", { class: "dqm-sma-seedtitle" },
-    `seed ${k + 1}: S1 at ${ms(frameOffsetNs(frame) + seed.t_rel)} ms in the frame, ToT ${seed.s1_tot}`));
+    `seed ${k + 1}: ${who} at ${ms(frameOffsetNs(frame) + seed.t_rel)} ms in the frame, ToT ${tot}`));
   const pat = el("span", { class: "dqm-sma-pattern", title: "coincidence pattern" });
   const nCounters = Math.max(roles().counters.length, 5);
+  const inc = (frame.meta || {}).incomplete;
+  const ignored = new Set(((inc && inc.ignored) || []).map((f) => f.counter));
   for (let c = 0; c < nCounters; c++) {
     const lit = (seed.pattern >> c) & 1;
-    pat.appendChild(el("span", { class: lit ? "dqm-sma-pbox lit" : "dqm-sma-pbox" }, `S${c + 1}`));
+    const attrs = { class: `dqm-sma-pbox${lit ? " lit" : ""}${ignored.has(c + 1) ? " ignored" : ""}` };
+    if (ignored.has(c + 1)) attrs.title = `S${c + 1}: timestamp fault, left out of "incomplete pattern"`;
+    pat.appendChild(el("span", attrs, `S${c + 1}`));
   }
   head.appendChild(pat);
-  head.appendChild(badge(rfText(seed), seed.rf_vetoed ? "yellow" : (seed.rf_valid ? "blue" : "")));
+  head.appendChild(badge(rfText(seed), seed.rf_na ? "" : seed.rf_vetoed ? "yellow" : (seed.rf_valid ? "blue" : "")));
   head.appendChild(badge(`${b - a} hits`));
   if (nMis) head.appendChild(badge(`${nMis} fine/coarse mismatch`, "red"));
   if (nTot) head.appendChild(badge(`${nTot} ToT ≥ ${frame.meta.tot_corrupt || 250}`, "yellow"));
   if (nOther) head.appendChild(badge(`${nOther} on channels without a role`));
+  const mb = mupixBadge(frame, k);
+  if (mb) head.appendChild(mb);
   const wr = seed.word_range;
   if (wr) head.appendChild(badge(`words ${wr[0]}–${wr[1]}`));
+  const [pa, pb] = seedPixels(frame, k);
+  const pw = pixelWords(frame, pa, pb);
+  if (pw.length) head.appendChild(badge(`${pb - pa} MuPix hits · words ${pw[0]}–${pw[pw.length - 1]}`));
 
   p.copyText = seedText(frame, seed, k, a, b);
   p.copy.disabled = !frame.wordIndex;
@@ -587,8 +746,19 @@ function drawSeed(frame, seed, k, p, ls, nums) {
 
   const win = (frame.meta && frame.meta.window) || { pre_ns: 200, post_ns: 3000 };
   const range = state.zoom === "prompt" ? [-PROMPT_NS, PROMPT_NS] : [-win.pre_ns, win.post_ns];
-  const g = paintSeed(p.canvas, frame, seed, a, b, ls, laneOf, range, nums || tagNumbers("seeded", frame));
-  p.geom = Object.assign(g, { frame, seed, a, b, ls, range });
+  if (seed.odd && seed.odd.length) {
+    head.appendChild(badge(`odd: ${seed.odd.map((n) => oddText(frame, n, true)).join(" · ")}`, "yellow"));
+  }
+  const g = paintSeed(p.canvas, frame, seed, a, b, ls, laneOf, range, nums || tagNumbers("seeded", frame),
+                     { lane: pixLane, pa, pb });
+  p.geom = Object.assign(g, { frame, seed, a, b, ls, range, pixLane, pa, pb });
+}
+
+/** The sorted bank word indices of pixel hits [pa, pb) (empty without word data). */
+function pixelWords(frame, pa, pb) {
+  const p = pixOf(frame);
+  if (!p || !p.wordIndex || pb <= pa) return [];
+  return Array.from(p.wordIndex.subarray(pa, pb)).sort((x, y) => x - y);
 }
 
 /**
@@ -599,16 +769,24 @@ function drawSeed(frame, seed, k, p, ls, nums) {
 function seedText(frame, seed, k, a, b) {
   const wr = seed.word_range;
   const s1 = seed.s1_word === null || seed.s1_word === undefined ? "—" : seed.s1_word;
-  const parts = [tagOf(frame), `seed ${k + 1}: S1 word ${s1}`,
+  // A seed on another channel names its own word, then the S1 word it took the RF from.
+  const who = seed.seed_word === undefined || seed.seed_word === seed.s1_word
+    ? `S1 word ${s1}`
+    : `${labelOf(seed.seed_ch)} word ${seed.seed_word} · S1 word ${s1}`;
+  const parts = [tagOf(frame), `seed ${k + 1}: ${who}`,
                  `words ${wr ? `${wr[0]}–${wr[1]}` : "—"} (${b - a} hits in window)`];
   if (frame.wordIndex) {
     const w = Array.from(frame.wordIndex.subarray(a, b)).sort((x, y) => x - y);
     parts.push(`hit words ${w.join(", ")}`);
   }
+  const [pa, pb] = seedPixels(frame, k);
+  const pw = pixelWords(frame, pa, pb);
+  if (pw.length) parts.push(`MuPix pixel words ${pw.join(", ")}`);
   return parts.join(" · ");
 }
 
 function rfText(seed) {
+  if (seed.rf_na) return "RF n/a (no S1)";
   const parts = ["RF"];
   if (seed.rf_valid) {
     parts.push(`phase ${fmt(seed.rf_phase, 1)} ns`);
@@ -617,13 +795,14 @@ function rfText(seed) {
   parts.push(`${seed.rf_n} pulse${seed.rf_n === 1 ? "" : "s"}`);
   parts.push(seed.rf_valid ? "valid" : "not valid");
   if (seed.rf_vetoed) parts.push("vetoed");
+  if (seed.s1_dt) parts.push(`from the S1 hit at ${seed.s1_dt > 0 ? "+" : ""}${seed.s1_dt} ns`);
   return parts.join(" · ");
 }
 
 const LANE_H = 20;
 const MARGIN = { left: 84, right: 12, top: 6, bottom: 34 };
 
-function paintSeed(canvas, frame, seed, a, b, ls, laneOf, range, nums) {
+function paintSeed(canvas, frame, seed, a, b, ls, laneOf, range, nums, pix) {
   const H = MARGIN.top + ls.length * LANE_H + MARGIN.bottom;
   const { ctx, W } = setupCanvas(canvas, H);
   const x0 = MARGIN.left, x1 = W - MARGIN.right;
@@ -638,9 +817,10 @@ function paintSeed(canvas, frame, seed, a, b, ls, laneOf, range, nums) {
     ctx.font = "12px sans-serif";
     ctx.textBaseline = "middle";
     ctx.textAlign = "right";
-    ctx.fillText(`${l.label} (${l.ch})`, x0 - 6, y + LANE_H / 2);
+    ctx.fillText(l.pix === undefined ? `${l.label} (${l.ch})` : l.label, x0 - 6, y + LANE_H / 2);
   });
-  timeAxis(ctx, range, X, MARGIN.top + ls.length * LANE_H, "ns from S1");
+  const s1Seed = seed.seed_ch === undefined || seed.seed_ch === roles().counters[0];
+  timeAxis(ctx, range, X, MARGIN.top + ls.length * LANE_H, s1Seed ? "ns from S1" : "ns from the seed");
 
   // S1 itself, through every lane: everything else is read against it.
   ctx.strokeStyle = "#d62728";
@@ -654,7 +834,8 @@ function paintSeed(canvas, frame, seed, a, b, ls, laneOf, range, nums) {
   // The last RF pulse the phase was measured from, on the RF lane.
   const rfLane = laneOf[roles().rf];
   if (seed.rf_valid && rfLane !== undefined && Number.isFinite(seed.rf_phase)) {
-    const x = X(seed.rf_phase);
+    // The phase is from the S1 hit, which for another seed sits s1_dt away.
+    const x = X((seed.s1_dt || 0) + seed.rf_phase);
     const y = MARGIN.top + rfLane * LANE_H;
     ctx.strokeStyle = "#000";
     ctx.beginPath(); ctx.moveTo(x, y); ctx.lineTo(x, y + LANE_H); ctx.stroke();
@@ -697,6 +878,7 @@ function paintSeed(canvas, frame, seed, a, b, ls, laneOf, range, nums) {
     const n = nums.any ? nums.of(i) : undefined;
     if (n !== undefined) marks.push([px0, y, pw, h, n]);
   }
+  paintSeedPixels(ctx, frame, seed, pix, X, range, marks, nums);
   for (const [mx, my, mw, mh] of marks) {
     // A tagged hit, boxed in black: its number is its row in "Tagged hits".
     ctx.strokeStyle = TAG_MARK;
@@ -712,6 +894,37 @@ function paintSeed(canvas, frame, seed, a, b, ls, laneOf, range, nums) {
   return { x0, x1, laneOf };
 }
 
+const PIX_TICK_W = 2.5;          // a pixel hit's tick on a MuPix lane or row, px
+
+/**
+ * The MuPix lanes of a seed panel: the in-time window shaded on every plane's
+ * lane, then one tick per pixel hit of the seed's window, coloured by its ToT.
+ * Tagged ticks join `marks` (boxed and numbered by the caller).
+ */
+function paintSeedPixels(ctx, frame, seed, pix, X, range, marks, nums) {
+  const mp = (frame.meta || {}).mupix;
+  const p = pixOf(frame);
+  if (!mp || !p || !pix) return;
+  const w = mp.window_ns || [-150, 450];
+  const xa = X(Math.max(range[0], w[0])), xb = X(Math.min(range[1], w[1]));
+  for (const pl of Object.keys(pix.lane)) {
+    const y = MARGIN.top + pix.lane[pl] * LANE_H;
+    if (xb > xa) { ctx.fillStyle = IN_TIME_FILL; ctx.fillRect(xa, y + 1, xb - xa, LANE_H - 2); }
+  }
+  for (let j = pix.pa; j < pix.pb; j++) {
+    const lane = pix.lane[p.flags[j] & SMAF.PIX.PLANE_MASK];
+    if (lane === undefined) continue;
+    const t = pixRel(frame, j) - seed.t_rel;
+    if (t < range[0] || t > range[1]) continue;
+    const x = X(t) - PIX_TICK_W / 2;
+    const y = MARGIN.top + lane * LANE_H + 3;
+    ctx.fillStyle = pixColour(p.tot[j]);
+    ctx.fillRect(x, y, PIX_TICK_W, LANE_H - 6);
+    const n = nums.any ? nums.of(frame.nHits + j) : undefined;
+    if (n !== undefined) marks.push([x, y, PIX_TICK_W, LANE_H - 6, n]);
+  }
+}
+
 /** The hit under (x, y) on a seed panel, or -1: its bar, or within HIT_SLOP_PX of it. */
 function seedHitAt(p, x, y) {
   const g = p.geom;
@@ -721,6 +934,18 @@ function seedHitAt(p, x, y) {
   const ch = g.ls[lane].ch;
   const f = g.frame;
   const X = (t) => g.x0 + (t - g.range[0]) / (g.range[1] - g.range[0]) * (g.x1 - g.x0);
+  if (g.ls[lane].pix !== undefined) {
+    // A MuPix lane: the nearest tick of that plane.
+    const px = pixOf(f);
+    const plane = g.ls[lane].pix;
+    let bestJ = -1, bd = HIT_SLOP_PX;
+    for (let j = g.pa; px && j < g.pb; j++) {
+      if ((px.flags[j] & SMAF.PIX.PLANE_MASK) !== plane) continue;
+      const d = Math.abs(X(pixRel(f, j) - g.seed.t_rel) - x);
+      if (d <= bd) { bestJ = j; bd = d; }
+    }
+    return bestJ < 0 ? -1 : f.nHits + bestJ;
+  }
   let best = -1, bestD = HIT_SLOP_PX;
   for (let i = g.a; i < g.b; i++) {
     if (f.ch[i] !== ch) continue;
@@ -789,6 +1014,14 @@ function rasterRange(frame) {
   if (state.view) return state.view;
   let hi = frame.meta && frame.meta.span_ns ? frame.meta.span_ns / 1e6 : 0;
   if (frame.nHits) hi = Math.max(hi, (frameOffsetNs(frame) + frame.t[frame.nHits - 1]) / 1e6);
+  // The MuPix part of a frame does not cover quite the same time as the SMA
+  // part: the axis runs on to the last pixel hit too. (Pixel hits before the
+  // first SMA hit, rare, are counted in the row total but left off the axis,
+  // which starts at the frame's first kept SMA hit.)
+  const px = pixOf(frame);
+  if (px && px.n && frame.meta && frame.meta.mupix) {
+    hi = Math.max(hi, (frameOffsetNs(frame) + pixRel(frame, px.n - 1)) / 1e6);
+  }
   return [0, hi > 0 ? hi : 1];
 }
 
@@ -802,8 +1035,10 @@ function paintRaster(frame) {
     wireDrag(canvas);
   }
   const nCh = 16;
+  const planes = pixelPlanes(frame);          // MuPix rows under the 16 channels
+  const nRows = nCh + planes.length;
   const M = RASTER_MARGIN;
-  const H = M.top + nCh * ROW_H + M.bottom;
+  const H = M.top + nRows * ROW_H + M.bottom;
   const { ctx, W } = setupCanvas(canvas, H);
   const x0 = M.left, x1 = W - M.right;
   const range = rasterRange(frame);
@@ -830,7 +1065,20 @@ function paintRaster(frame) {
     ctx.fillText(n === null || n === undefined ? "" : `${num(n)}${dropped.has(c) ? " (hidden)" : ""}`,
                  x1 + 6, y + ROW_H / 2);
   }
-  timeAxis(ctx, range, X, M.top + nCh * ROW_H, "ms from the frame's first kept hit");
+  const mp = meta.mupix || {};
+  planes.forEach(function (pl, k) {
+    const y = M.top + (nCh + k) * ROW_H;
+    ctx.fillStyle = "#eef6ee";
+    ctx.fillRect(x0, y, x1 - x0, ROW_H);
+    ctx.fillStyle = "#333";
+    ctx.textAlign = "right";
+    ctx.fillText(PLANE_LABEL[pl], x0 - 6, y + ROW_H / 2);
+    // Every examined pixel hit of the plane, shipped or not (max_hits).
+    const n = mp.per_plane ? mp.per_plane[pl] : null;
+    ctx.textAlign = "left";
+    ctx.fillText(n === null || n === undefined ? "" : num(n), x1 + 6, y + ROW_H / 2);
+  });
+  timeAxis(ctx, range, X, M.top + nRows * ROW_H, "ms from the frame's first kept hit");
 
   // One fill per colour bucket, not per hit: 33k fillStyle changes is what
   // makes a canvas raster slow, 33k rects in 33 paths is not.
@@ -855,14 +1103,38 @@ function paintRaster(frame) {
     for (let j = 0; j < pts.length; j += 2) ctx.rect(pts[j], pts[j + 1], 1.5, ROW_H - 8);
     ctx.fill();
   }
+  // The MuPix rows: one path per pixel ToT code (32 colours).
+  const px = pixOf(frame);
+  const rowOf = {};
+  planes.forEach((pl, k) => { rowOf[pl] = nCh + k; });
+  if (px && planes.length) {
+    const pp = new Array(32);
+    for (let j = 0; j < px.n; j++) {
+      const t = (off + pixRel(frame, j)) / scale;
+      if (t < range[0] || t > range[1]) continue;
+      const row = rowOf[px.flags[j] & SMAF.PIX.PLANE_MASK];
+      if (row === undefined) continue;
+      (pp[px.tot[j] & 31] = pp[px.tot[j] & 31] || []).push(X(t), M.top + row * ROW_H + 4);
+    }
+    for (let tot = 0; tot < 32; tot++) {
+      const pts = pp[tot];
+      if (!pts) continue;
+      ctx.fillStyle = pixColour(tot);
+      ctx.beginPath();
+      for (let j = 0; j < pts.length; j += 2) ctx.rect(pts[j], pts[j + 1], 1.5, ROW_H - 8);
+      ctx.fill();
+    }
+  }
 
   const nums = tagNumbers("raster", frame);
-  for (let i = 0; nums.any && i < frame.nHits; i++) {
+  for (let i = 0; nums.any && i < nAll(frame); i++) {
     const n = nums.of(i);
     if (n === undefined) continue;
-    const t = (off + frame.t[i]) / scale;
-    const c = frame.ch[i];
-    if (t < range[0] || t > range[1] || c >= nCh) continue;
+    const pixel = isPix(frame, i);
+    const j = i - frame.nHits;
+    const t = (off + (pixel ? pixRel(frame, j) : frame.t[i])) / scale;
+    const c = pixel ? rowOf[px.flags[j] & SMAF.PIX.PLANE_MASK] : frame.ch[i];
+    if (t < range[0] || t > range[1] || c === undefined || c >= nRows) continue;
     // A tagged hit, boxed in black: its number is its row in "Tagged hits".
     const x = X(t);
     ctx.strokeStyle = TAG_MARK;
@@ -875,9 +1147,9 @@ function paintRaster(frame) {
   if (state.drag && state.drag.x1 !== undefined) {
     ctx.fillStyle = "rgba(0, 102, 204, 0.15)";
     const a = Math.min(state.drag.x0, state.drag.x1), b = Math.max(state.drag.x0, state.drag.x1);
-    ctx.fillRect(a, M.top, b - a, nCh * ROW_H);
+    ctx.fillRect(a, M.top, b - a, nRows * ROW_H);
   }
-  state.rasterGeom = { x0, x1, range };
+  state.rasterGeom = { x0, x1, range, planes };
 }
 
 /**
@@ -889,10 +1161,24 @@ function rasterHitAt(frame, x, y) {
   const g = state.rasterGeom;
   if (!g || !frame || x < g.x0 - HIT_SLOP_PX || x > g.x1 + HIT_SLOP_PX) return -1;
   const c = Math.floor((y - RASTER_MARGIN.top) / ROW_H);
-  if (c < 0 || c >= 16) return -1;
+  const planes = g.planes || [];
+  if (c < 0 || c >= 16 + planes.length) return -1;
   const off = frameOffsetNs(frame);
   const k = (g.x1 - g.x0) / (g.range[1] - g.range[0]);
   let best = -1, bestD = HIT_SLOP_PX;
+  if (c >= 16) {
+    // A MuPix row: the nearest pixel hit of that plane.
+    const px = pixOf(frame);
+    const plane = planes[c - 16];
+    for (let j = 0; px && j < px.n; j++) {
+      if ((px.flags[j] & SMAF.PIX.PLANE_MASK) !== plane) continue;
+      const t = (off + pixRel(frame, j)) / 1e6;
+      if (t < g.range[0] || t > g.range[1]) continue;
+      const d = Math.abs(g.x0 + (t - g.range[0]) * k + 0.75 - x);
+      if (d <= bestD) { best = frame.nHits + j; bestD = d; }
+    }
+    return best;
+  }
   for (let i = 0; i < frame.nHits; i++) {
     if (frame.ch[i] !== c) continue;
     const t = (off + frame.t[i]) / 1e6;
@@ -1256,6 +1542,7 @@ async function copyWithFeedback(btn, text) {
  * t0 plus the hit's) and from the first shipped hit.
  */
 function hitText(frame, i, tab) {
+  if (isPix(frame, i)) return pixelText(frame, i, tab);
   const c = frame.ch[i];
   const l = roles().labels[c];
   const named = l && !/^ch\d+$/.test(l);
@@ -1268,10 +1555,30 @@ function hitText(frame, i, tab) {
   return parts.join(" · ");
 }
 
+/**
+ * A pixel hit as a line: plane (or "chip N (no plane)"), chip, column, row,
+ * ToT in counts and ns, time (absolute and from the first shipped SMA hit, as
+ * for the SMA hits), and its word.
+ */
+function pixelText(frame, i, tab) {
+  const p = frame.pixels;
+  const j = i - frame.nHits;
+  const m = frame.meta || {};
+  const mp = m.mupix || {};
+  const plane = p.flags[j] & SMAF.PIX.PLANE_MASK;
+  const rel = pixRel(frame, j);
+  const totNs = (mp.tot_ns || 256) * p.tot[j];
+  const parts = [plane ? `MuPix ${plane === 1 ? "L1" : "L2"} chip ${p.chip[j]}` : `MuPix chip ${p.chip[j]} (no plane)`,
+    `col ${p.col[j]}`, `row ${p.row[j]}${p.flags[j] & SMAF.PIX.OFF_SENSOR ? " (not on the sensor)" : ""}`,
+    `ToT ${p.tot[j]} (~${totNs} ns)`,
+    Number.isFinite(m.t0_ns) ? `t ${m.t0_ns + rel} ns (t_rel ${rel} ns)` : `t_rel ${rel} ns`,
+    wordText(frame, i, tab)];
+  return parts.join(" · ");
+}
+
 function wordText(frame, i, tab) {
-  if (frame.rawWord && frame.wordIndex) {
-    return `word ${frame.wordIndex[i]} · ${SMAF.hex64(frame.rawWord[i])}`;
-  }
+  const w = wordOf(frame, i), raw = rawOf(frame, i);
+  if (w !== undefined && raw !== undefined) return `word ${w} · ${SMAF.hex64(raw)}`;
   if (!state.paused) return "freeze for word index";
   if (state.wordsBusy[tab]) return "fetching word index…";
   const n = state.wordsNote[tab];
@@ -1350,7 +1657,8 @@ function dropKey(frame) { return JSON.stringify((frame.meta || {}).dropped || []
  */
 function hitKey(frame, tab, i) {
   const fk = frameKey(frame);
-  return frame.wordIndex ? `${fk}|w${frame.wordIndex[i]}` : `${fk}|${tab}|${dropKey(frame)}|${i}`;
+  const w = wordOf(frame, i);
+  return w !== undefined ? `${fk}|w${w}` : `${fk}|${tab}|${dropKey(frame)}|${i}`;
 }
 
 /**
@@ -1361,15 +1669,21 @@ function makeTag(tab, frame, i) {
   const m = frame.meta || {};
   const ev = m.event || {};
   const t0 = Number.isFinite(m.t0_ns) ? m.t0_ns : null;
+  const pixel = isPix(frame, i);
+  const j = i - frame.nHits;
+  const tRel = pixel ? pixRel(frame, j) : frame.t[i];
+  const w = wordOf(frame, i), raw = rawOf(frame, i);
   return {
     key: hitKey(frame, tab, i), frame: frameKey(frame), tag: tagOf(frame),
     run: frame.run, eventId: ev.id === undefined ? null : ev.id, serial: serialOf(frame),
     utc: Number.isFinite(ev.timestamp) ? new Date(ev.timestamp * 1000).toISOString() : null,
     seq: frame.frameSeq, view: tab, drop: dropKey(frame), i,
-    word: frame.wordIndex ? frame.wordIndex[i] : null,
-    raw: frame.rawWord ? SMAF.hex64(frame.rawWord[i]) : null,
-    ch: frame.ch[i], tot: frame.tot[i], tRel: frame.t[i],
-    tAbs: t0 === null ? null : t0 + frame.t[i],
+    word: w === undefined ? null : w,
+    raw: raw === undefined ? null : SMAF.hex64(raw),
+    kind: pixel ? "pixel" : "sma",
+    ch: pixel ? null : frame.ch[i], tot: pixel ? frame.pixels.tot[j] : frame.tot[i],
+    chip: pixel ? frame.pixels.chip[j] : null, tRel,
+    tAbs: t0 === null ? null : t0 + tRel,
     line: hitText(frame, i, tab),
   };
 }
@@ -1437,7 +1751,7 @@ function flushPending() {
   const f = state.frames.raster;
   let full = false;
   for (const x of p) {
-    if (f && f.frameSeq === x.seq && x.i < f.nHits && !addTag("raster", f, x.i)) full = true;
+    if (f && f.frameSeq === x.seq && x.i < nAll(f) && !addTag("raster", f, x.i)) full = true;
   }
   saveTags();
   renderTags(full ? `the list is full (${MAX_TAGS} hits): remove some, or Clear all` : "");
@@ -1454,7 +1768,7 @@ function refreshTags(tab, frame) {
   let changed = false;
   const out = [];
   for (const x of state.tagged) {
-    if (x.frame !== fk || x.word !== null || x.view !== tab || x.drop !== dk || x.i >= frame.nHits) {
+    if (x.frame !== fk || x.word !== null || x.view !== tab || x.drop !== dk || x.i >= nAll(frame)) {
       out.push(x);
       continue;
     }
@@ -1611,14 +1925,16 @@ function tagNumbers(tab, frame) {
       for (const r of g.rows) {
         const x = r.x;
         if (x.word !== null && frame.wordIndex) byWord.set(x.word, r.n);
-        else if (x.view === tab && x.drop === dk && x.i < frame.nHits) byIndex.set(x.i, r.n);
+        else if (x.view === tab && x.drop === dk && x.i < nAll(frame)) byIndex.set(x.i, r.n);
       }
     }
   }
-  const wi = frame && frame.wordIndex;
   return {
     any: byWord.size + byIndex.size > 0,
-    of: (i) => (wi && byWord.has(wi[i]) ? byWord.get(wi[i]) : byIndex.get(i)),
+    of: function (i) {
+      const w = byWord.size ? wordOf(frame, i) : undefined;
+      return w !== undefined && byWord.has(w) ? byWord.get(w) : byIndex.get(i);
+    },
   };
 }
 
@@ -1696,7 +2012,8 @@ async function wordsFetch(tab, f) {
   // The same selection as the frame on screen, so hit i is the same hit.
   const args = tab === "raster"
     ? { view: "raster", drop: m.dropped || [], max_hits: MAX_HITS, words: true, seq: f.frameSeq }
-    : { view: "seeded", words: true, seq: f.frameSeq };
+    : Object.assign({ view: "seeded", words: true, seq: f.frameSeq }, seedArgs());
+  if (tab === "raster" && !m.mupix) args.pixels = false;     // as shown: no MuPix rows
   const frame = await SMAF.fetchFrame(state.client, args, WORDS_MAX_REPLY);
   const shown = state.frames[tab];
   if (!state.paused || !shown || shown.frameSeq !== f.frameSeq) return;   // moved on
@@ -1709,6 +2026,241 @@ async function wordsFetch(tab, f) {
 }
 
 // ---------------------------------------------------------------------------
+// Seed choice, filters and the staleness banner
+// ---------------------------------------------------------------------------
+
+/**
+ * The seeded request's seed/filters/MuPix/pattern args: always sent, "s1", [],
+ * "any" and {} being the default.
+ */
+function seedArgs() {
+  return { seed: state.seedSel.seed, filters: state.seedSel.filters.slice(), mupix: state.seedSel.mupix,
+           pattern: Object.assign({}, state.seedSel.pattern) };
+}
+
+/** A pattern selector object with only valid "present"/"absent" entries for S1..S5. */
+function cleanPattern(o) {
+  const out = {};
+  if (!o || typeof o !== "object" || Array.isArray(o)) return out;
+  for (let k = 1; k <= N_PATTERN; k++) {
+    const v = o[String(k)];
+    if (v === "present" || v === "absent") out[String(k)] = v;
+  }
+  return out;
+}
+
+/**
+ * The counters with a known timestamp fault now: the summary's
+ * timestamp_faults (the rule of the SMAPlots fine/coarse flag), else what the
+ * last seeded reply said it ignored. [{counter, label, mismatch_frac}].
+ */
+function faultedCounters() {
+  const tf = (state.summary || {}).timestamp_faults;
+  if (tf && Array.isArray(tf.counters)) return tf.judged === false ? [] : tf.counters;
+  const inc = ((state.frames.seeded || {}).meta || {}).incomplete;
+  return inc && Array.isArray(inc.ignored) ? inc.ignored : [];
+}
+
+function pctText(f) {
+  const x = 100 * f;
+  return x < 10 ? `${x.toFixed(1)} %` : `${Math.round(x)} %`;
+}
+
+/** The inline warnings of the pattern row: one per counter with a timestamp fault. */
+function updatePatternWarnings() {
+  const bad = {};
+  for (const f of faultedCounters()) bad[f.counter] = f;
+  const r = roles();
+  for (let k = 1; k <= N_PATTERN; k++) {
+    const lab = document.getElementById(`dqm-smaev-pattext-${k}`);
+    if (lab) lab.textContent = labelOf(r.counters.length >= k ? r.counters[k - 1] : k, r);
+    const w = document.getElementById(`dqm-smaev-patwarn-${k}`);
+    if (!w) continue;
+    const f = bad[k];
+    const text = f ? `${f.label || `S${k}`} has a timestamp fault` +
+      (Number.isFinite(f.mismatch_frac) ? ` (${pctText(f.mismatch_frac)} fine/coarse mismatch)` : "") +
+      ": 'absent' will match almost everything, 'present' almost nothing" : "";
+    w.textContent = text;
+    w.style.display = text ? "" : "none";
+    const s = document.getElementById(`dqm-smaev-pat-${k}`);
+    if (s) s.value = state.seedSel.pattern[String(k)] || "any";
+  }
+}
+
+function mupixText(mode) {
+  const m = MUPIX_MODES.find((x) => x[0] === mode);
+  return m ? m[1] : mode;
+}
+
+/** The oddity's words in a reply: "incomplete pattern" carries the analyzer's
+ *  note on the counters it ignored (meta.incomplete.label), the rest filterText. */
+function oddText(frame, name, short) {
+  const inc = ((frame || {}).meta || {}).incomplete;
+  if (name !== "incomplete" || !inc) return filterText(name);
+  if (!short) return inc.label || filterText(name);
+  const ign = (inc.ignored || []).map((f) => f.label || `S${f.counter}`);
+  return ign.length ? `${filterText(name)} (${ign.join(", ")} ignored)` : filterText(name);
+}
+
+function filterText(name) {
+  const f = FILTERS.find((x) => x[0] === name);
+  if (!f) return name;
+  if (name === "tot") {
+    const fr = state.frames.seeded;
+    const cut = fr && fr.meta && fr.meta.tot_corrupt;
+    if (cut) return `ToT ≥ ${cut}`;
+  }
+  return f[1];
+}
+
+/**
+ * The seed list: S1 (default), each other counter, the delayed channels (all by
+ * the summary's labels, i.e. the ODB roles), then "any counter". RF and the
+ * current channel are no seeds worth offering. A stored choice that the roles
+ * no longer list stays selectable rather than silently changing.
+ */
+function seedOptions() {
+  const r = roles();
+  const out = [["s1", `${labelOf(r.counters.length ? r.counters[0] : 1, r)} (default)`]];
+  for (const c of r.counters.slice(1)) out.push([`ch${c}`, `${labelOf(c, r)} (ch ${c})`]);
+  for (const c of r.delayed) {
+    if (r.counters.indexOf(c) < 0) out.push([`ch${c}`, `${labelOf(c, r)} (ch ${c})`]);
+  }
+  out.push(["any", "any counter (S1..S5 clusters)"]);
+  const cur = state.seedSel.seed;
+  if (!out.some((o) => o[0] === cur)) out.push([cur, cur]);
+  return out;
+}
+
+function seedLabel(seed) {
+  if (seed === "any") return "any counter";
+  const o = seedOptions().find((x) => x[0] === seed);
+  return o ? o[1].replace(/ \(default\)$/, "") : seed;
+}
+
+function seededTabLabel() {
+  return state.seedSel.seed === "s1" ? TABS[0][1] : `Seeded events: ${seedLabel(state.seedSel.seed)}`;
+}
+
+/** An age in seconds as the banner says it: tenths below 10 s. */
+function ageText(s) {
+  if (!Number.isFinite(s)) return "";
+  return s < 10 ? `${s.toFixed(1)} s` : `${Math.round(s)} s`;
+}
+
+/** Rebuild the seed list when the roles (the summary) change; the choice is kept. */
+function updateSeedOptions() {
+  const sel = document.getElementById("dqm-smaev-seedsel");
+  if (!sel) return;
+  const opts = seedOptions();
+  const key = JSON.stringify(opts);
+  if (sel._optsKey !== key) {
+    sel._optsKey = key;
+    sel.innerHTML = "";
+    for (const [v, label] of opts) sel.appendChild(el("option", { value: v }, label));
+  }
+  sel.value = state.seedSel.seed;
+  const tab = document.getElementById("dqm-smaev-tab-seeded");
+  if (tab) tab.textContent = seededTabLabel();
+  const tl = document.getElementById("dqm-smaev-filtertext-tot");
+  if (tl) tl.textContent = filterText("tot");
+  const ms = document.getElementById("dqm-smaev-mupixsel");
+  if (ms) ms.value = state.seedSel.mupix;
+  updatePatternWarnings();
+}
+
+/**
+ * The seed or a filter changed: ask again at once. Live, that is the next poll
+ * started now; frozen, the frozen frame is asked for again by its seq with the
+ * new choice, so what is on screen stays the frame that was frozen.
+ */
+function seedChoiceChanged() {
+  saveSeedSel();
+  updateSeedOptions();
+  if (state.tab !== "seeded") return;
+  if (!state.paused) { startPolling(); return; }
+  const f = state.frames.seeded;
+  if (!f) return;
+  const prev = state.inflight;
+  track((async function () {
+    if (prev) { try { await prev; } catch (e) { /* its owner reports it */ } }
+    const args = Object.assign({ view: "seeded", seq: f.frameSeq }, seedArgs());
+    const frame = await SMAF.fetchFrame(state.client, args);
+    if (!state.paused || state.tab !== "seeded") return;
+    state.frames.seeded = frame;
+    render("seeded");
+  })()).catch(function (e) {
+    if (typeof console !== "undefined") console.warn("dqm-sma-events reselect", e);
+    singleNote(`frame seq ${f.frameSeq}: ${BRPC.errorText(e)}`);
+  });
+}
+
+function saveSeedSel() {
+  try { window.sessionStorage.setItem(SS_SEED, JSON.stringify(state.seedSel)); } catch (e) { /* no storage */ }
+}
+
+function restoreSeedSel() {
+  try {
+    const o = JSON.parse(window.sessionStorage.getItem(SS_SEED) || "{}");
+    if (typeof o.seed === "string" && /^(s1|any|ch\d{1,2})$/.test(o.seed)) state.seedSel.seed = o.seed;
+    if (Array.isArray(o.filters)) {
+      state.seedSel.filters = FILTERS.map((f) => f[0]).filter((f) => o.filters.indexOf(f) >= 0);
+    }
+    if (MUPIX_MODES.some((m) => m[0] === o.mupix)) state.seedSel.mupix = o.mupix;
+    state.seedSel.pattern = cleanPattern(o.pattern);
+  } catch (e) { /* none kept, or unreadable: the default */ }
+}
+
+/** "matching seeds: n of m candidates in frame seq X", for a chosen seed or filters. */
+function selectHeader(frame, holder) {
+  const sel = (frame.meta || {}).select;
+  if (!sel) return;
+  const f = sel.filters && sel.filters.length
+    ? ` with ${sel.filters.map((n) => oddText(frame, n)).join(" or ")}` : "";
+  const pt = sel.pattern_label ? ` and ${sel.pattern_label}` : "";
+  const mp = sel.mupix && sel.mupix !== "any" ? ` and ${sel.mupix_label || mupixText(sel.mupix)}` : "";
+  holder.appendChild(badge(`seed: ${sel.seed_label}${f}${pt}${mp}`, "blue"));
+  const inc = (frame.meta || {}).incomplete;
+  if (inc && inc.judged === false && sel.filters && sel.filters.indexOf("incomplete") >= 0) {
+    holder.appendChild(badge(`incomplete pattern cannot be judged: ${inc.note.replace(/^cannot judge: /, "")}`,
+                             "yellow"));
+  }
+  const capped = sel.capped ? ` (the latest ${num(sel.examined)} examined)` : "";
+  holder.appendChild(badge(`matching seeds: ${num(sel.matching)} of ${num(sel.candidates)} candidates ` +
+                           `in frame seq ${frame.frameSeq}${capped}`,
+                           sel.matching ? "" : "yellow"));
+}
+
+/**
+ * The banner above the seed panels: the frame shown is not the newest analysed
+ * good frame (and why), or nothing matched at all. Hidden otherwise.
+ */
+function renderBanner(frame) {
+  const b = document.getElementById("dqm-smaev-banner");
+  if (!b) return;
+  const m = (frame && frame.meta) || {};
+  const nm = m.search && m.search.no_match;
+  const sv = m.stale_view;
+  let text = "", cls = "";
+  if (nm) {
+    const span = Number.isFinite(nm.span_s) ? ` (${ageText(nm.span_s)})` : "";
+    text = `No match: ${nm.text}${span}. Showing the newest analysed frame, seq ${frame.frameSeq}, ` +
+           "without seeds; the search goes on with every new frame.";
+    cls = "red";
+  } else if (sv) {
+    const age = Number.isFinite(sv.age_s) ? `${ageText(sv.age_s)} ago` : "earlier";
+    const n = sv.good_since;
+    text = `Showing frame seq ${sv.shown_seq} from ${age}: ${sv.reason} in the ${num(n)} good ` +
+           `frame${n === 1 ? "" : "s"} analysed since (newest seq ${sv.newest_seq}).`;
+    if (m.raw_held === false) text += " Its raw event is no longer held: use the tag.";
+    cls = "yellow";
+  }
+  b.textContent = text;
+  b.className = text ? `dqm-smaev-banner dqm-diagnosis ${cls}` : "dqm-smaev-banner";
+  b.style.display = text ? "" : "none";
+}
+
+// ---------------------------------------------------------------------------
 // Chrome
 // ---------------------------------------------------------------------------
 
@@ -1716,12 +2268,9 @@ function build() {
   const r = document.getElementById("dqm-root");
   r.innerHTML = "";
 
-  const bar = el("div", { class: "dqm-strip" });
-  for (const [id, label] of TABS) {
-    const b = el("button", { class: "mbutton dqm-sma-tab", id: `dqm-smaev-tab-${id}` }, label);
-    b.onclick = function () { showTab(id); };
-    bar.appendChild(b);
-  }
+  // The page's controls on a row of their own above the tab strip, so they
+  // do not read as more tabs.
+  const bar = el("div", { class: "dqm-strip dqm-sma-toolbar", id: "dqm-smaev-toolbar" });
   const freeze = el("button", { class: "mbutton", id: "dqm-smaev-freeze" }, "Freeze");
   freeze.onclick = function () { setPaused(!state.paused); };
   bar.appendChild(freeze);
@@ -1739,26 +2288,72 @@ function build() {
   note.style.display = "none";
   bar.appendChild(note);
   r.appendChild(bar);
+  r.appendChild(tabStrip(TABS.map(([id, label]) => [id, id === "seeded" ? seededTabLabel() : label]),
+                         "dqm-smaev", "SMA event views", () => state.tab, showTab));
 
   // Seeded pane
-  const seeded = el("div", { id: "dqm-smaev-pane-seeded" });
+  const seeded = el("div", { id: "dqm-smaev-pane-seeded", role: "tabpanel",
+                             "aria-labelledby": "dqm-smaev-tab-seeded" });
   const sbar = el("div", { class: "dqm-strip" });
   sbar.appendChild(labelled("window", select(
     [["full", "full (-200 ns .. +3 us)"], ["prompt", "prompt (±150 ns)"]], state.zoom,
     function (v) { state.zoom = v; save(); if (state.frames.seeded) render("seeded"); })));
+  const seedSel = select(seedOptions(), state.seedSel.seed, function (v) {
+    state.seedSel.seed = v;
+    seedChoiceChanged();
+  });
+  seedSel.id = "dqm-smaev-seedsel";
+  seedSel.title = "Which hits seed the events: S1 (the default), another channel, or any " +
+                  "counter (the first hit of each S1..S5 cluster: events without S1 too)";
+  sbar.appendChild(labelled("seed", seedSel));
+  const fbox = el("span", { class: "dqm-chip dqm-smaev-filters", id: "dqm-smaev-filters",
+                            title: "Show only seeds with any of the checked oddities in their " +
+                                   "window; the analyzer searches back through its last good " +
+                                   "frames for them" }, el("span", {}, "only seeds with"));
+  for (const [name, label, why] of FILTERS) {
+    const box = el("input", { type: "checkbox", id: `dqm-smaev-filter-${name}` });
+    box.checked = state.seedSel.filters.indexOf(name) >= 0;
+    box.onchange = function () {
+      const on = new Set(state.seedSel.filters);
+      if (this.checked) on.add(name); else on.delete(name);
+      state.seedSel.filters = FILTERS.map((f) => f[0]).filter((f) => on.has(f));
+      seedChoiceChanged();
+    };
+    const lab = el("label", { for: `dqm-smaev-filter-${name}`, title: why },
+                   el("span", { id: `dqm-smaev-filtertext-${name}` }, label));
+    lab.insertBefore(box, lab.firstChild);
+    fbox.appendChild(lab);
+  }
+  sbar.appendChild(fbox);
+  const mupixSel = select(MUPIX_MODES, state.seedSel.mupix, function (v) {
+    state.seedSel.mupix = v;
+    seedChoiceChanged();
+  });
+  mupixSel.id = "dqm-smaev-mupixsel";
+  mupixSel.title = "MuPix is a selection, not an oddity: it is AND-ed with the boxes. " +
+                   "'L1+L2 in time': a pixel hit on both planes in the in-time window around " +
+                   "the seed; 'none in time': on neither (seeds outside the MuPix data of the " +
+                   "frame match only 'any')";
+  sbar.appendChild(labelled("MuPix:", mupixSel));
   sbar.appendChild(el("span", { class: "dqm-footnote" },
     "bars: t to t+ToT · hatched red: fine/coarse mismatch · magenta ▼: ToT ≥ 250 · " +
-    "dashed red: the S1 seed · black tick on RF: the pulse the phase is taken from · " +
+    "dashed red: the seed · black tick on RF: the pulse the phase is taken from · " +
+    "MuPix lanes: one tick per pixel hit, coloured by pixel ToT; green band: the in-time window · " +
     "black box + number: a tagged hit"));
   seeded.appendChild(sbar);
+  seeded.appendChild(patternRow());
   seeded.appendChild(el("div", { id: "dqm-smaev-note-seeded" }));
   seeded.appendChild(makeTagBar("seeded"));
   seeded.appendChild(el("div", { class: "dqm-strip dqm-sma-header", id: "dqm-smaev-seededhead" }));
+  const banner = el("div", { class: "dqm-smaev-banner", id: "dqm-smaev-banner", role: "status" });
+  banner.style.display = "none";
+  seeded.appendChild(banner);
   seeded.appendChild(el("div", { id: "dqm-smaev-seeds" }));
   r.appendChild(seeded);
 
   // Raster pane
-  const raster = el("div", { id: "dqm-smaev-pane-raster" });
+  const raster = el("div", { id: "dqm-smaev-pane-raster", role: "tabpanel",
+                            "aria-labelledby": "dqm-smaev-tab-raster" });
   const rbar = el("div", { class: "dqm-strip" });
   const box = el("input", { type: "checkbox", id: "dqm-smaev-hidecur" });
   box.checked = state.hideCurrent;
@@ -1772,6 +2367,18 @@ function build() {
   const lab = el("label", { for: "dqm-smaev-hidecur", class: "dqm-chip" }, "hide the current channel");
   lab.insertBefore(box, lab.firstChild);
   rbar.appendChild(lab);
+  const pbox = el("input", { type: "checkbox", id: "dqm-smaev-hidepix" });
+  pbox.checked = state.hidePixels;
+  pbox.onchange = function () {
+    state.hidePixels = !!this.checked;
+    save();
+    if (!state.paused) startPolling();
+  };
+  const plab = el("label", { for: "dqm-smaev-hidepix", class: "dqm-chip",
+                             title: "Leave the MuPix rows out (the analyzer then sends no pixel hits)" },
+                  "hide MuPix");
+  plab.insertBefore(pbox, plab.firstChild);
+  rbar.appendChild(plab);
   rbar.appendChild(el("span", { class: "dqm-footnote" },
     "drag to zoom in time, double-click for the whole frame, click a hit to tag it " +
     "(a live frame is frozen first, for its word data)"));
@@ -1790,6 +2397,40 @@ function build() {
   renderTags();
 }
 
+/**
+ * The per-counter pattern selector: S1..S5 each any / present / absent (a hit
+ * within the coincidence window of the seed, or none), AND-ed with the seed
+ * choice, the boxes and MuPix. Explicit, so nothing is ignored here; a counter
+ * with a known timestamp fault gets a warning beside it instead.
+ */
+function patternRow() {
+  const row = el("div", { class: "dqm-strip dqm-smaev-patternrow", id: "dqm-smaev-patternrow" });
+  row.appendChild(el("span", {
+    class: "dqm-smaev-patternhead",
+    title: "Per counter: a hit within the coincidence window of the seed (present) or none " +
+           "(absent). AND-ed with the seed, the oddity boxes and MuPix.",
+  }, "and counters:"));
+  const r = roles();
+  for (let k = 1; k <= N_PATTERN; k++) {
+    const s = select(PATTERN_STATES, state.seedSel.pattern[String(k)] || "any", function (v) {
+      const p = Object.assign({}, state.seedSel.pattern);
+      if (v === "present" || v === "absent") p[String(k)] = v; else delete p[String(k)];
+      state.seedSel.pattern = cleanPattern(p);
+      seedChoiceChanged();
+    });
+    s.id = `dqm-smaev-pat-${k}`;
+    const lab = el("label", { class: "dqm-chip dqm-smaev-pat", for: s.id },
+                   el("span", { id: `dqm-smaev-pattext-${k}` },
+                      labelOf(r.counters.length >= k ? r.counters[k - 1] : k, r)), s);
+    row.appendChild(lab);
+    const w = el("span", { class: "dqm-chip yellow dqm-smaev-patwarn", id: `dqm-smaev-patwarn-${k}`,
+                           role: "note" });
+    w.style.display = "none";
+    row.appendChild(w);
+  }
+  return row;
+}
+
 function legend() {
   const stops = [0, 50, 100, 150, 200, 249].map((t) => `${totColour(t)} ${Math.round(t / 249 * 100)}%`);
   const ramp = el("span", { class: "dqm-sma-ramp" });
@@ -1797,19 +2438,23 @@ function legend() {
   const corrupt = el("span", { class: "dqm-sma-badge" }, "≥ 250");
   corrupt.style.background = "#c0c";
   corrupt.style.color = "#fff";
+  const pstops = [0, 8, 16, 24, 31].map((t) => `${pixColour(t)} ${Math.round(t / 31 * 100)}%`);
+  const pramp = el("span", { class: "dqm-sma-ramp dqm-sma-ramp-short" });
+  pramp.style.background = `linear-gradient(to right, ${pstops.join(", ")})`;
   return el("div", { class: "dqm-sma-legend" }, el("span", {}, "ToT code  0"), ramp,
-            el("span", {}, "249"), corrupt);
+            el("span", {}, "249"), corrupt,
+            el("span", { class: "dqm-sma-legend-gap" }, "MuPix ToT  0"), pramp,
+            el("span", {}, "31 (× 256 ns)"));
 }
 
 function showTab(tab) {
   state.tab = tab;
   save();
   for (const [id] of TABS) {
-    const b = document.getElementById(`dqm-smaev-tab-${id}`);
     const pane = document.getElementById(`dqm-smaev-pane-${id}`);
-    if (b) b.className = id === tab ? "mbutton dqm-sma-tab active" : "mbutton dqm-sma-tab";
     if (pane) pane.style.display = id === tab ? "" : "none";
   }
+  markTabs(TABS, "dqm-smaev", tab);
   const holder = document.getElementById("dqm-smaev-rate");
   holder.innerHTML = "";
   holder.appendChild(labelled("update", select(RATES[tab], String(state.intervals[tab]),
@@ -1859,11 +2504,54 @@ function num(x) {
   return x === null || x === undefined ? "—" : Number(x).toLocaleString();
 }
 
+/**
+ * A tab strip (role=tablist) of one role=tab button per [id, label] in `tabs`,
+ * with ids `${prefix}-tab-${id}` controlling the panes `${prefix}-pane-${id}`.
+ * Left/Right (wrapping), Home and End select and focus the neighbouring tab.
+ * `current()` says which tab is shown; `select(id)` shows one. markTabs()
+ * then sets the selection state, so the strip always follows showTab().
+ */
+function tabStrip(tabs, prefix, label, current, select) {
+  const bar = el("div", { class: "dqm-sma-tablist", role: "tablist", "aria-label": label });
+  for (const [id, text] of tabs) {
+    const b = el("button", {
+      type: "button", class: "dqm-sma-tab", id: `${prefix}-tab-${id}`, role: "tab",
+      "aria-selected": "false", "aria-controls": `${prefix}-pane-${id}`, tabindex: "-1",
+    }, text);
+    b.onclick = function () { select(id); };
+    bar.appendChild(b);
+  }
+  bar.addEventListener("keydown", function (ev) {
+    const n = tabs.length;
+    const i = tabs.findIndex(([id]) => id === current());
+    const to = { ArrowRight: (i + 1) % n, ArrowLeft: (i - 1 + n) % n, Home: 0, End: n - 1 }[ev.key];
+    if (to === undefined) return;
+    if (ev.preventDefault) ev.preventDefault();
+    const id = tabs[to][0];
+    if (id !== current()) select(id);
+    const b = document.getElementById(`${prefix}-tab-${id}`);
+    if (b) b.focus();
+  });
+  return bar;
+}
+
+/** The selection state of a tabStrip(): only the shown tab is selected and in the tab order. */
+function markTabs(tabs, prefix, shown) {
+  for (const [id] of tabs) {
+    const b = document.getElementById(`${prefix}-tab-${id}`);
+    if (!b) continue;
+    const on = id === shown;
+    b.setAttribute("aria-selected", on ? "true" : "false");
+    b.setAttribute("tabindex", on ? "0" : "-1");
+    b.className = on ? "dqm-sma-tab active" : "dqm-sma-tab";
+  }
+}
+
 function save() {
   try {
     window.localStorage.setItem(LS, JSON.stringify({
       client: state.client, tab: state.tab, zoom: state.zoom,
-      hideCurrent: state.hideCurrent, intervals: state.intervals,
+      hideCurrent: state.hideCurrent, hidePixels: state.hidePixels, intervals: state.intervals,
     }));
   } catch (e) { /* private browsing or quota */ }
 }
@@ -1875,6 +2563,7 @@ function restore() {
     if (o.tab && TABS.some(([id]) => id === o.tab)) state.tab = o.tab;
     if (o.zoom === "full" || o.zoom === "prompt") state.zoom = o.zoom;
     if (o.hideCurrent !== undefined) state.hideCurrent = !!o.hideCurrent;
+    if (o.hidePixels !== undefined) state.hidePixels = !!o.hidePixels;
     if (o.intervals) {
       for (const tab of ["seeded", "raster"]) {
         const v = Number(o.intervals[tab]);

@@ -109,12 +109,13 @@ function makeContext2D() {
       return this.ops.filter((o) => o[0] === name && (style === undefined || o[2] === style)).length;
     },
     texts() { return this.ops.filter((o) => o[0] === "fillText").map((o) => String(o[1][0])); },
+    createImageData: (w, h) => ({ width: w, height: h, data: new Uint8ClampedArray(w * h * 4) }),
   };
   const fills = ["fillRect", "fill", "fillText"];
   const strokes = ["strokeRect", "stroke"];
   for (const m of [...fills, ...strokes, "clearRect", "beginPath", "closePath", "moveTo",
                    "lineTo", "rect", "arc", "clip", "save", "restore", "setTransform",
-                   "setLineDash", "translate", "scale"]) {
+                   "setLineDash", "translate", "scale", "rotate", "drawImage", "putImageData"]) {
     ctx[m] = function (...args) {
       const style = fills.includes(m) ? ctx.fillStyle : strokes.includes(m) ? ctx.strokeStyle : undefined;
       ctx.ops.push([m, args, style]);

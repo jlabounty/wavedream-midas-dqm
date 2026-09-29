@@ -13,11 +13,12 @@ const assert = require("node:assert");
 const fs = require("node:fs");
 const path = require("node:path");
 
-const { runPage } = require("./domstub.js");
+const { El, runPage } = require("./domstub.js");
 
 const PAGES = path.join(__dirname, "..", "..", "pages", "js");
 globalThis.DQM = require(path.join(PAGES, "dqm-common.js"));
 globalThis.BRPC = require(path.join(PAGES, "dqm-brpc.js"));
+globalThis.DQMHeatmap = require(path.join(PAGES, "dqm-heatmap.js"));
 
 const SMA = path.join(PAGES, "dqm-sma.js");
 const FX = JSON.parse(fs.readFileSync(path.join(__dirname, "sma-summary-fixture.json"), "utf8"));
@@ -47,7 +48,8 @@ function analyzer(over = {}) {
                                       axes: [{ title: "x axis" }, { title: "y axis" }] }),
     "dqm::histogram": (name) => {
       const dims = FX.hist_dims[name];
-      const hex = dims === 2 ? FX.hists["sma/tot_vs_ch_lsb0"] : FX.hists["sma/words_per_ch"];
+      const hex = FX.hists[name] ||
+        (dims === 2 ? FX.hists["sma/tot_vs_ch_lsb0"] : FX.hists["sma/words_per_ch"]);
       return envelope("hist", Buffer.from(hex, "hex"));
     },
     "dqm::clear": () => json({ cleared: 45 }),
@@ -207,6 +209,67 @@ test("only the visible tab is polled", async () => {
     "the summary keeps polling whatever the tab");
 });
 
+test("the tab strip is a tablist: aria-selected follows the tab, arrows move it", async () => {
+  const page = await boot();
+  const ids = ["health", "tot", "timing", "rf", "mupix", "trends"];
+  const tab = (id) => byId(page, `dqm-sma-tab-${id}`);
+  const strip = tab("health").parent;
+  assert.strictEqual(strip.getAttribute("role"), "tablist");
+  assert.ok(!strip.find((e) => e.id === "dqm-sma-clear"), "the controls are not in the tab strip");
+  for (const id of ids) {
+    assert.strictEqual(tab(id).getAttribute("role"), "tab");
+    assert.strictEqual(tab(id).getAttribute("aria-controls"), `dqm-sma-pane-${id}`);
+    assert.ok(!tab(id).classList.contains("mbutton"), "a tab is not styled as a midas button");
+    const pane = byId(page, `dqm-sma-pane-${id}`);
+    assert.strictEqual(pane.getAttribute("role"), "tabpanel");
+    assert.strictEqual(pane.getAttribute("aria-labelledby"), `dqm-sma-tab-${id}`);
+  }
+  const selected = () => ids.filter((id) => tab(id).getAttribute("aria-selected") === "true");
+  const inOrder = () => ids.filter((id) => tab(id).getAttribute("tabindex") === "0");
+  assert.deepStrictEqual(selected(), ["health"]);
+  assert.deepStrictEqual(inOrder(), ["health"], "only the selected tab is in the tab order");
+
+  tab("rf").onclick();
+  await settle(page);
+  assert.deepStrictEqual(selected(), ["rf"]);
+  assert.deepStrictEqual(inOrder(), ["rf"]);
+
+  const key = (k) => { let prevented = false;
+    strip.dispatch("keydown", { key: k, target: page.doc.getElementById("dqm-sma-tab-rf"),
+                                preventDefault() { prevented = true; } });
+    return prevented; };
+  assert.ok(key("ArrowRight"));
+  assert.deepStrictEqual(selected(), ["mupix"]);
+  assert.strictEqual(El.focused, tab("mupix"), "the new tab has the focus");
+  key("ArrowRight"); key("ArrowRight");
+  assert.deepStrictEqual(selected(), ["health"], "Right wraps past the last tab");
+  key("ArrowLeft");
+  assert.deepStrictEqual(selected(), ["trends"], "Left wraps past the first tab");
+  key("Home");
+  assert.deepStrictEqual(selected(), ["health"]);
+  key("End");
+  assert.deepStrictEqual(selected(), ["trends"]);
+  assert.ok(!key("a"), "other keys are left alone");
+  assert.deepStrictEqual(selected(), ["trends"]);
+  assert.strictEqual(JSON.parse(globalThis.localStorage._d["dqm-sma-settings"]).tab, "trends",
+                     "the keyboard choice is remembered like a click");
+
+  // Keyboard switching polls only the tab it lands on.
+  key("Home"); key("ArrowRight"); key("ArrowRight");      // -> timing
+  await settle(page);
+  assert.deepStrictEqual(selected(), ["timing"]);
+  assert.strictEqual(byId(page, "dqm-sma-pane-timing").style.display, "");
+  assert.strictEqual(byId(page, "dqm-sma-pane-health").style.display, "none");
+  const mark = page.an.calls.length;
+  await settle(page);
+  const polled = histCalls(page, mark);
+  assert.ok(polled.length > 0, "the Timing tab is polled");
+  for (const n of polled) {
+    assert.ok(/^sma\/(dt_S\d_S1|pattern|s1_coinc|s1_partner_hits|s1_spacing_us)$/.test(n),
+      `${n} polled while the Timing tab is shown`);
+  }
+});
+
 test("the ToT pairs are overlaid, one graph per channel", async () => {
   const page = await boot();
   byId(page, "dqm-sma-tab-tot").onclick();
@@ -219,22 +282,90 @@ test("the ToT pairs are overlaid, one graph per channel", async () => {
   assert.notStrictEqual(s1.param.plot[0].line.color, s1.param.plot[1].line.color);
 });
 
-test("log z is applied to 2D plots and log y to 1D, with a floor", async () => {
+test("2D plots are heatmaps with log z by default; 1D plots are mplot with log y on request", async () => {
   const page = await boot();
-  const plots = byId(page, "dqm-sma-grid-health").byClass("dqm-plot").map((d) => d.mpg);
-  const twoD = plots.find((g) => g.param.plot[0].type === "colormap");
-  const oneD = plots.find((g) => g.param.plot[0].type === "histogram");
+  const divs = byId(page, "dqm-sma-grid-health").byClass("dqm-plot");
+  const twoD = divs.find((d) => d.heatmap);
+  const oneD = divs.find((d) => d.mpg && d.mpg.param.plot[0].type === "histogram");
   assert.ok(twoD && oneD);
-  assert.strictEqual(twoD.param.zAxis.log, true, "log z is the default");
-  assert.strictEqual(twoD.param.zAxis.min, 0.5);
-  assert.strictEqual(oneD.param.yAxis.log, false);
+  assert.ok(!twoD.mpg, "no mplot colormap");
+  const hm = twoD.heatmap;
+  assert.strictEqual(hm.logZ, true, "log z is the default");
+  assert.strictEqual(hm.scale.min, 0.5, "one count sits just above the bottom of the scale");
+  assert.strictEqual(hm.image.width, 16, "one pixel per in-range bin, under/overflow not drawn");
+  assert.strictEqual(oneD.mpg.param.yAxis.log, false);
 
   const box = byId(page, "dqm-sma-logy");
   box.checked = true;
   box.onchange.call(box);
   await settle(page);
-  assert.strictEqual(oneD.param.yAxis.log, true);
-  assert.strictEqual(oneD.param.yAxis.min, 0.5, "a log axis from 0 would clamp to 1e-20");
+  assert.strictEqual(oneD.mpg.param.yAxis.log, true);
+  assert.strictEqual(oneD.mpg.param.yAxis.min, 0.5, "a log axis from 0 would clamp to 1e-20");
+
+  const draws = hm.draws;
+  const z = byId(page, "dqm-sma-logz");
+  z.checked = false;
+  z.onchange.call(z);
+  await settle(page);
+  assert.strictEqual(hm.logZ, false);
+  assert.strictEqual(hm.scale.min, 0);
+  assert.strictEqual(hm.draws, draws + 1, "redrawn once for the new scale");
+});
+
+test("an unchanged histogram is fetched but not redrawn", async () => {
+  const page = await boot();
+  const divs = byId(page, "dqm-sma-grid-health").byClass("dqm-plot");
+  const hm = divs.find((d) => d.heatmap).heatmap;
+  const g = divs.find((d) => d.mpg).mpg;
+  const before = [hm.draws, g.draws, g.data.length && g.data[0]];
+  const mark = page.an.calls.length;
+  await settle(page, 3);
+  assert.ok(histCalls(page, mark).length > 0, "still polled");
+  assert.strictEqual(hm.draws, before[0], "same bins: the heatmap draws nothing");
+  assert.strictEqual(g.draws, before[1], "same bins: mplot is not asked to draw");
+});
+
+test("plots scrolled out of view are not polled once drawn", async () => {
+  const observers = [];
+  const page = await boot(undefined, undefined, function () {
+    globalThis.IntersectionObserver = class {
+      constructor(cb) { this.cb = cb; this.targets = []; observers.push(this); }
+      observe(t) { this.targets.push(t); }
+      unobserve(t) { this.targets = this.targets.filter((x) => x !== t); }
+    };
+  });
+  try {
+    const io = observers[0];
+    assert.ok(io && io.targets.length > 5, "every plot is watched");
+    const wraps = byId(page, "dqm-sma-grid-health").byClass("dqm-sma-plotwrap");
+    const name = (w) => /\[(.*)\]/.exec(w.byClass("dqm-histtitle")[0].textContent)[1];
+    // Only the first two on screen.
+    io.cb(wraps.map((w, i) => ({ target: w, isIntersecting: i < 2 })));
+    const mark = page.an.calls.length;
+    await settle(page, 2);
+    const asked = new Set(histCalls(page, mark).map((n) => n.replace(/^sma\//, "")));
+    assert.deepStrictEqual([...asked].sort(), wraps.slice(0, 2).map(name).sort());
+    // Scrolled: the next one comes into view and is polled again.
+    io.cb([{ target: wraps[5], isIntersecting: true }]);
+    const mark2 = page.an.calls.length;
+    await settle(page, 1);
+    assert.ok(histCalls(page, mark2).includes(`sma/${name(wraps[5])}`));
+
+    // Back from another tab: the pane was hidden, so its plots are observed
+    // afresh (which makes the observer report their current state) and all
+    // polled until it has.
+    byId(page, "dqm-sma-tab-timing").onclick();
+    await settle(page, 1);
+    const seen = io.targets.length;
+    const mark3 = page.an.calls.length;
+    byId(page, "dqm-sma-tab-health").onclick();
+    assert.strictEqual(io.targets.length, seen, "re-observed, not observed twice");
+    assert.strictEqual(io.targets.slice(-wraps.length).every((t) => wraps.includes(t)), true);
+    await settle(page, 1);
+    assert.deepStrictEqual([...new Set(histCalls(page, mark3))].sort(), wraps.map((w) => `sma/${name(w)}`).sort());
+  } finally {
+    delete globalThis.IntersectionObserver;
+  }
 });
 
 test("every plot shows its entries", async () => {
@@ -276,7 +407,9 @@ test("the trends tab plots rates, live fraction, efficiency and RF valid", async
   await settle(page);
   assert.ok(page.an.calls.some((c) => c.cmd === "sma::trend"));
   const graphs = byId(page, "dqm-sma-grid-trends").byClass("dqm-plot").map((d) => d.mpg);
-  assert.strictEqual(graphs.length, 4);
+  assert.strictEqual(graphs.length, 5);
+  assert.deepStrictEqual(graphs[4].param.plot.map((p) => p.label),
+                         ["L1", "L2", "L1+L2", "L1+L2 raw", "L1+L2 sideband"], "the MuPix in-time trend");
   const roleChans = FX.summary.channels.filter((c) => c.role).length;
   assert.strictEqual(graphs[0].param.plot.length, roleChans, "one rate line per channel with a role");
   assert.strictEqual(graphs[0].param.plot[0].label, FX.summary.channels.find((c) => c.role).label);
@@ -562,4 +695,94 @@ test("with nothing offered in the window (a stopped run), the share since start 
   assert.ok(/^Counts are from the analysed sample: 45 % of frames since start \(CPU budget 20 % of a core\)/
     .test(byId(page, "dqm-sma-sampling").textContent));
   assert.ok(!/—/.test(chipText(page, /^analysed /).textContent), "never 'analysed — of frames'");
+});
+
+// -- the MuPix tab ------------------------------------------------------------------------
+
+test("the MuPix tab: in-time fractions per plane, the sync state, and its plots", async () => {
+  const page = await boot();
+  await settle(page);
+  byId(page, "dqm-sma-tab-mupix").onclick();
+  const mark = page.an.calls.length;
+  await settle(page);
+  const mp = FX.summary.mupix;
+  const box = byId(page, "dqm-sma-mupix");
+  const rows = box.byTag("tr").slice(1).map((tr) => tr.byTag("td").map((td) => td.textContent));
+  const p = (x) => `${(x * 100).toFixed(1)} %`;
+  assert.deepStrictEqual(rows[0], [`L1 (chips ${mp.planes.L1.join(", ")})`, p(mp.fractions.L1.in),
+                                   p(mp.fractions.L1.side), p(mp.fractions.L1.corr)]);
+  assert.deepStrictEqual(rows[2].slice(1), [p(mp.fractions.both.in), p(mp.fractions.both.side),
+                                            p(mp.fractions.both.corr)]);
+  const sync = byId(page, "dqm-sma-mpsync").byClass("dqm-chip")[0];
+  assert.ok(/time sync: in sync · L1\+L2 \d+\.\d %/.test(sync.textContent), sync.textContent);
+  assert.ok(sync.classList.contains("green"));
+  assert.ok(/\[-150, 450\) ns; sideband \[-2400, -1800\) ns/.test(box.textContent), box.textContent);
+
+  // Only the MuPix histograms, dt first, and the occupancy drawn per plane, one line per chip.
+  const grid = byId(page, "dqm-sma-grid-mupix");
+  const titles = grid.byClass("dqm-histtitle").map((t) => t.textContent);
+  assert.ok(/\[mupix_dt_L1\]$/.test(titles[0]) && /\[mupix_dt_L2\]$/.test(titles[1]), titles.join(" | "));
+  const occ = titles.filter((t) => /occupancy, L[12] \(chips/.test(t));
+  assert.strictEqual(occ.length, 4, "column and row, L1 and L2");
+  const graphs = grid.byClass("dqm-plot").map((d) => d.mpg);
+  const dt = graphs[0];
+  assert.deepStrictEqual(dt.param.plot.map((q) => q.label), ["mupix_dt_L1", "in time", "sideband"]);
+  assert.deepStrictEqual(dt.data[1].x, [-150, -150, 450, 450], "the window outlined");
+  assert.deepStrictEqual(dt.data[2].x, [-2400, -2400, -1800, -1800]);
+  assert.ok(dt.data[1].y[1] >= Math.max(...dt.data[0].y), "as high as the peak");
+  const col = graphs[titles.indexOf(occ[0])];
+  assert.deepStrictEqual(col.param.plot.map((q) => q.label), mp.planes.L1.map((c) => `chip ${c}`));
+  assert.ok(col.data[0].y.length === 258 && col.data[0].y.some((v) => v > 0),
+            "chip 0's columns, from the 2D histogram");
+  const match = grid.byClass("dqm-sma-plotwrap").find((w) => /mupix_s1_match/.test(w.textContent));
+  assert.ok(/since the last clear, of [\d,]+ S1 hits: in time L1 \d+\.\d %/.test(match.textContent), match.textContent);
+  assert.ok(page.an.calls.slice(mark + 1).filter((c) => c.cmd === "dqm::histogram")
+    .every((c) => /^sma\/mupix_/.test(c.args)),
+            "only the MuPix tab's histograms are asked for");
+});
+
+test("a lost MuPix time sync is a red chip and a warning flag", async () => {
+  const page = await boot({ "sma::summary": () => json(FX.summary_mupix_sync) });
+  byId(page, "dqm-sma-tab-mupix").onclick();
+  await settle(page);
+  const sync = byId(page, "dqm-sma-mpsync").byClass("dqm-chip")[0];
+  assert.ok(/SYNC LOST\?/.test(sync.textContent) && sync.classList.contains("red"), sync.textContent);
+  const flag = byId(page, "dqm-sma-flags").byClass("dqm-sma-flag").find((f) => f.attrs["data-code"] === "mupix_sync");
+  assert.ok(flag && flag.classList.contains("yellow"), "a warning");
+  assert.ok(/lost sync/.test(flag.textContent));
+});
+
+test("a plane-map edit lays the MuPix tab out again", async () => {
+  let s = FX.summary;
+  const page = await boot({ "sma::summary": () => json(s) });
+  byId(page, "dqm-sma-tab-mupix").onclick();
+  await settle(page);
+  const titles = () => byId(page, "dqm-sma-grid-mupix").byClass("dqm-histtitle").map((t) => t.textContent);
+  assert.ok(titles().some((t) => /occupancy, L1 \(chips 0, 1, 2, 3\)/.test(t)));
+  s = clone(FX.summary);
+  s.mupix.planes = { L1: [1, 2, 3, 4], L2: [5, 6, 7, 0] };
+  await settle(page);
+  assert.ok(titles().some((t) => /occupancy, L1 \(chips 1, 2, 3, 4\)/.test(t)), titles().join(" | "));
+  assert.ok(!titles().some((t) => /chips 0, 1, 2, 3/.test(t)));
+});
+
+test("a reply that grows between the truncated call and its retry still arrives", async () => {
+  // The 10-minute trend is ~270 kB, over the 256 kB first guess, and gains a
+  // few bytes every second: a retry asking for exactly the size in the first
+  // header came back truncated again, and the Trends tab never loaded.
+  let n = 0;
+  const asked = [];
+  const saved = globalThis.mjsonrpc_call;
+  globalThis.mjsonrpc_call = (method, params) => {
+    asked.push(params.max_reply_length);
+    const full = json({ rows: "x".repeat(270000 + 40 * n++) });
+    return Promise.resolve(full.slice(0, Math.min(full.byteLength, params.max_reply_length + 23)));
+  };
+  try {
+    const reply = await BRPC.json("sma_analyzer", "sma::trend", "");
+    assert.ok(reply.rows.length >= 270000);
+    assert.strictEqual(asked.length, 2);
+  } finally {
+    globalThis.mjsonrpc_call = saved;
+  }
 });

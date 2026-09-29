@@ -178,6 +178,43 @@ SETTINGS_DEFAULTS: dict[str, object] = {
         "rf period max ns": 60,
         "delayed bins": 220,
         "partner max": 9,
+        #: t(pixel) - t(S1), all pairs: the range reaches back to the default
+        #: sideband so that it is seen to be flat.
+        "mupix dt min ns": -2560,
+        "mupix dt max ns": 2000,
+        "mupix dt bin ns": 8,
+        "mupix hits per chip max": 4000,
+    },
+    #: The MuPix pixel words of the same bank (bit 63 clear). Editing any of
+    #: these rebuilds the histograms, as the Cuts do.
+    "MuPix": {
+        #: Chip ids (the pixel word's 5-bit field, a global ASIC id set by
+        #: /Equipment/Quads/Settings/DAQ/Links/Mapping) of each plane. The
+        #: identity Mapping of runs >= 200 gives L1 = 0-3, L2 = 4-7; runs up to
+        #: 186 had L1 = 1-4, L2 = 5, 6, 7, 0. A chip in neither list is shown
+        #: as "chip N (no plane)".
+        "L1 chips": list(W.L1_CHIPS),
+        "L2 chips": list(W.L2_CHIPS),
+        #: log2(ckdivend2 + 1): ToT = (TS2 - ((time >> shift) & 31)) & 31, in
+        #: 2^shift ticks of 8 ns (256 ns at 5).
+        "ts2 shift": W.TS2_SHIFT,
+        #: t(pixel) - t(S1) called in time, half open: the time walk spreads
+        #: real hits over about -150..+450 ns. No time-walk correction.
+        "window lo ns": W.MUPIX_WINDOW_NS[0],
+        "window hi ns": W.MUPIX_WINDOW_NS[1],
+        #: The accidental rate, from a window before the prompt one (it must
+        #: end at or before "window lo ns": after it are decays and delayed
+        #: hits). Of the same width by default; another width is scaled.
+        "sideband lo ns": W.MUPIX_SIDEBAND_NS[0],
+        "sideband hi ns": W.MUPIX_SIDEBAND_NS[1],
+        #: Pixel hits examined per frame (the latest); more are counted and
+        #: skipped. Bounds the cost of a dense frame. 0 = MuPix analysis off
+        #: (pixel words are still counted).
+        "max pixel hits per frame": W.MAX_PIXELS,
+        #: S1 hits per frame matched against the pixels (in-time fractions,
+        #: t(pixel) - t(S1)), an evenly spread subset of those the S1-seeded
+        #: analyses use. 0 = all of them.
+        "max S1 per frame": W.MUPIX_MAX_S1,
     },
     "Self check": {
         #: Shift verdict over this many seconds of good frames.
@@ -200,6 +237,21 @@ SETTINGS_DEFAULTS: dict[str, object] = {
         #: trend (10 min), per counter.
         "efficiency window s": 30.0,
         "efficiency drop": 0.1,
+        #: Good frames arrive but none has had an S1 seed for this long: the
+        #: S1-seeded view is showing an old frame (flag ``no_seeds``).
+        "no seeds s": 10.0,
+        #: The SMA <-> MuPix time-sync monitor (flag ``mupix_sync``): the share
+        #: of S1 hits with an L1 AND an L2 pixel hit in time, accidentals taken
+        #: out, over the last "mupix sync window s", below "mupix sync min
+        #: fraction" for more than "mupix sync hold s" while S1 fires (at least
+        #: "mupix sync min S1" analysed S1 hits in the window). It clears above
+        #: min fraction + "mupix sync clear margin". Run 1008 sits at 0.88 and
+        #: run 682 at 0.84; a lost time sync gives ~0.
+        "mupix sync min fraction": 0.3,
+        "mupix sync hold s": 30.0,
+        "mupix sync window s": 10.0,
+        "mupix sync min S1": 200,
+        "mupix sync clear margin": 0.05,
         #: Only these channels raise mismatch / ToT flags (S1, the counters
         #: and the RF by default); the others are still in the summary table.
         #: Here and not under Cuts, so editing it never resets a plot.
@@ -217,10 +269,28 @@ SETTINGS_DEFAULTS: dict[str, object] = {
         #: The raw bytes of the last analysed frames, for "Download raw event"
         #: (sma::raw), at most this many MB in all. 0: none kept.
         "raw ring MB": 16.0,
+        #: The last good frames kept for the event display's other seed
+        #: choices and filters (sma::frame "seed"/"filters"), which search
+        #: back through them when the newest frame has no matching seed. At
+        #: most this many frames and this many MB (estimated array bytes); the
+        #: newest good frame is always kept.
+        "seed ring frames": 8,
+        "seed ring MB": 24.0,
     },
 }
 
 TREND_S = 600
+#: The largest `Sampling/seed ring frames` accepted: bounds a no-match search.
+SEED_RING_MAX = 64
+#: Cached frame payloads and seed selections, at most (LRU on top of the
+#: per-frame purge): bounds what many viewers' seed/filter choices can hold.
+BLOB_CACHE_MAX = 64
+SEL_CACHE_MAX = 256
+#: CPU (process time) one sma::frame request may spend on new seed selections
+#: while searching back; the rest of the ring is searched by the next polls
+#: (selections already made are cached and cost nothing). One selection of a
+#: 40000-word frame is ~2-6 ms.
+SEARCH_BUDGET_S = 0.02
 #: Frame classes, in the order of the ``frame_class`` bins.
 CLASSES = ("good", "stale", "empty", "suspect")
 
@@ -233,6 +303,12 @@ def _num(x, digits=6):
     if not math.isfinite(x):
         return None
     return float(f"{x:.{digits}g}")
+
+
+def _pct(frac) -> str:
+    """A fraction as the page says it: "93 %", "6.2 %" below 10 %."""
+    x = 100.0 * float(frac)
+    return f"{x:.1f} %" if x < 10 else f"{x:.0f} %"
 
 
 def _ratio(a, b, digits=6):
@@ -261,6 +337,9 @@ class Config:
     max_gap_ns: int = 10 * 10**9
     max_overlap_ns: int = 10 * 10**6
     raw_ring_bytes: int = 16 << 20
+    seed_ring_frames: int = 8
+    seed_ring_bytes: int = 24 << 20
+    mupix: W.MuPixCuts = field(default_factory=W.MuPixCuts)
     binning: dict = field(default_factory=dict)
     check: dict = field(default_factory=dict)
     errors: list = field(default_factory=list)
@@ -372,7 +451,14 @@ def parse_settings(settings: dict | None) -> Config:
         "period max": get(B, "rf period max ns", int, pos),
         "delayed bins": get(B, "delayed bins", int, pos),
         "partner max": get(B, "partner max", int, pos),
+        "mupix dt min": get(B, "mupix dt min ns", int),
+        "mupix dt max": get(B, "mupix dt max ns", int),
+        "mupix dt bin": get(B, "mupix dt bin ns", int, pos),
+        "mupix chip max": get(B, "mupix hits per chip max", int, pos),
     }
+    if binning["mupix dt max"] <= binning["mupix dt min"]:
+        errors.append("Binning/mupix dt max ns <= mupix dt min ns; using the defaults")
+        binning["mupix dt min"], binning["mupix dt max"] = -2560, 2000
     if binning["gap max"] <= binning["gap min"]:
         errors.append("Binning/gap max ms <= gap min ms; using the defaults")
         binning["gap min"], binning["gap max"] = -5.0, 45.0
@@ -382,6 +468,37 @@ def parse_settings(settings: dict | None) -> Config:
     if binning["rate max"] <= binning["rate min"]:
         errors.append("Binning/rate log10 Hz max <= min; using the defaults")
         binning["rate min"], binning["rate max"] = 0.0, 7.0
+
+    M = "MuPix"
+
+    def chip_ids(v):
+        v = [int(x) for x in (v if isinstance(v, list | tuple) else [v])]
+        if any(not 0 <= x < W.N_CHIP_IDS for x in v):
+            raise ValueError("not a chip id 0-31")
+        return tuple(v)
+
+    l1, l2 = get(M, "L1 chips", chip_ids), get(M, "L2 chips", chip_ids)
+    if set(l1) & set(l2):
+        errors.append(f"MuPix/L1 chips and L2 chips share chip(s) {sorted(set(l1) & set(l2))}; "
+                      "using the defaults")
+        l1, l2 = W.L1_CHIPS, W.L2_CHIPS
+    window = (get(M, "window lo ns", int), get(M, "window hi ns", int))
+    sideband = (get(M, "sideband lo ns", int), get(M, "sideband hi ns", int))
+    if window[1] <= window[0]:
+        errors.append("MuPix/window hi ns <= window lo ns; using the defaults")
+        window = W.MUPIX_WINDOW_NS
+    if sideband[1] <= sideband[0] or sideband[1] > window[0]:
+        errors.append("MuPix/sideband must be a window before the in-time window (sideband lo "
+                      "< sideband hi <= window lo ns); using the defaults")
+        sideband = W.MUPIX_SIDEBAND_NS
+        if sideband[1] > window[0]:
+            window = W.MUPIX_WINDOW_NS
+    mupix = W.MuPixCuts(
+        l1=l1, l2=l2,
+        ts2_shift=get(M, "ts2 shift", int, lambda v: 0 <= v <= W.MAX_TS2_SHIFT),
+        window_ns=window, sideband_ns=sideband,
+        max_pixels=get(M, "max pixel hits per frame", int, lambda v: v >= 0),
+        max_s1=get(M, "max S1 per frame", int, lambda v: v >= 0) or None)
 
     S = "Self check"
     check = {k: get(S, k, float) for k in d[S] if k != "mismatch flag channels"}
@@ -397,13 +514,17 @@ def parse_settings(settings: dict | None) -> Config:
         flag_channels=flag_channels,
         max_words=get(C, "max words per frame", int, lambda v: v >= 0) or None,
         raw_ring_bytes=int(get("Sampling", "raw ring MB", float, lambda v: v >= 0) * (1 << 20)),
+        seed_ring_frames=get("Sampling", "seed ring frames", int,
+                             lambda v: 0 <= v <= SEED_RING_MAX),
+        seed_ring_bytes=int(get("Sampling", "seed ring MB", float,
+                                lambda v: 0 <= v <= 1024) * (1 << 20)),
         max_gap_ns=int(get(C, "max gap s", float, pos) * 1e9),
         max_overlap_ns=int(get(C, "max overlap ms", float, lambda v: v >= 0) * 1e6),
-        binning=binning, check=check, errors=errors)
+        mupix=mupix, binning=binning, check=check, errors=errors)
 
 
 def shape_fingerprint(settings: dict) -> str:
-    """What changes the histograms: shift, roles (but not labels), cuts, binning.
+    """What changes the histograms: shift, roles (but not labels), cuts, binning, MuPix.
 
     Labels are left out on purpose -- renaming a channel must never reset an
     afternoon of plots. The self-check and sampling settings change no plot.
@@ -411,7 +532,8 @@ def shape_fingerprint(settings: dict) -> str:
     s = _merge(SETTINGS_DEFAULTS, settings)
     roles = {k: v for k, v in s["Channel roles"].items() if k != "labels"}
     return json.dumps({"shift": s["Coarse shift"], "roles": roles, "Cuts": s["Cuts"],
-                       "Binning": s["Binning"]}, sort_keys=True, default=str)
+                       "Binning": s["Binning"], "MuPix": s["MuPix"]}, sort_keys=True,
+                      default=str)
 
 
 # ---------------------------------------------------------------------------
@@ -505,7 +627,8 @@ class _Second:
                  "cover_ns", "delta_ns", "live_ns", "hits", "rate_hits", "oversize",
                  "mismatch", "tot_bad",
                  "stale_words", "n_s1", "n_s1_kept", "eff", "rf_valid", "rf_vetoed", "scan",
-                 "shift_counts", "shift_n")
+                 "shift_counts", "shift_n", "mp_frames", "mp_pix", "mp_examined", "mp_skipped",
+                 "mp_n", "mp_in", "mp_side", "mp_chip", "mp_rows", "mp_unsorted")
 
     def __init__(self, t: int, epoch: int, n_counters: int, scan: tuple):
         self.t = t
@@ -530,8 +653,29 @@ class _Second:
         self.scan = scan
         self.shift_counts = np.zeros(len(scan), dtype=np.int64)
         self.shift_n = 0
+        #: MuPix, good frames: frames analysed with MuPix, their pixel words,
+        #: those examined and skipped (the cap), S1 hits judged, of them with
+        #: L1 / L2 / both in time and in the sideband, examined hits per chip,
+        #: rows >= 250, frames whose pixel stream was out of time order.
+        self.mp_frames = self.mp_pix = self.mp_examined = self.mp_skipped = 0
+        self.mp_n = self.mp_rows = self.mp_unsorted = 0
+        self.mp_in = np.zeros(3, dtype=np.int64)
+        self.mp_side = np.zeros(3, dtype=np.int64)
+        self.mp_chip = np.zeros(W.N_CHIP_IDS, dtype=np.int64)
 
-    def row(self, counters=(), mismatch_max: float | None = None) -> dict:
+    def mupix_row(self, widths=(1.0, 1.0)) -> dict | None:
+        """The trend's MuPix entry: in-time, sideband and accidental-corrected
+        fractions of the judged S1 hits, [L1, L2, L1+L2]; None without any."""
+        if not self.mp_n:
+            return None
+        fin = [_ratio(x, self.mp_n, 4) for x in self.mp_in]
+        fside = [_ratio(x, self.mp_n, 4) for x in self.mp_side]
+        return {"n_s1": self.mp_n, "in": fin, "side": fside,
+                "corr": [_num(W.accidental_corrected(a, b, *widths), 4)
+                         for a, b in zip(fin, fside, strict=True)],
+                "pix_per_frame": _ratio(self.mp_pix, self.mp_frames, 5)}
+
+    def row(self, counters=(), mismatch_max: float | None = None, widths=(1.0, 1.0)) -> dict:
         """One trend row. With `counters` and `mismatch_max`, a counter whose
         fine/coarse mismatch fraction this second exceeds `mismatch_max` gets
         a null efficiency -- the rule `summary` applies to its window: with a
@@ -558,6 +702,7 @@ class _Second:
             # Counters after S1 only: S1's own entry is 1 by definition.
             "eff": eff,
             "rf_valid": _ratio(self.rf_valid, self.n_s1, 4),
+            "mupix": self.mupix_row(widths),
         }
 
 
@@ -650,6 +795,30 @@ class _Snapshot:
     event_id: int = W.EVID_READOUT
     timestamp: int = 0
     trigger_mask: int = 0
+    #: When it was analysed (the plugin's clock) and how many good frames had
+    #: been analysed by then (itself included): the seeded view's staleness.
+    at: float = 0.0
+    good_n: int = 0
+
+
+def snapshot_bytes(snap: _Snapshot) -> int:
+    """Estimated bytes a held snapshot keeps alive: its frame's and analysis's arrays."""
+    n = 0
+    for obj in (snap.fr, snap.an):
+        if obj is None:
+            continue
+        for v in vars(obj).values():
+            if isinstance(v, W.Pixels):
+                n += v.nbytes()
+            elif isinstance(v, np.ndarray):
+                n += v.nbytes
+            elif isinstance(v, list | tuple):
+                n += sum(x.nbytes for x in v if isinstance(x, np.ndarray))
+            elif isinstance(v, dict):
+                for x in v.values():
+                    if isinstance(x, tuple):
+                        n += sum(y.nbytes for y in x if isinstance(y, np.ndarray))
+    return n
 
 
 # ---------------------------------------------------------------------------
@@ -709,7 +878,20 @@ class SmaPlugin:
         self._last: _Snapshot | None = None
         self._last_good: _Snapshot | None = None
         self._last_seeded: _Snapshot | None = None
-        self._frame_cache: dict = {}
+        self._frame_cache: OrderedDict = OrderedDict()
+        self.frames_good = 0
+        #: The last good frames, oldest first, for the seed choices and filters
+        #: (Sampling/seed ring frames and MB); the newest is always there.
+        self._ring: deque[_Snapshot] = deque()
+        self._ring_bytes = 0
+        self._ring_sizes: dict[int, int] = {}
+        #: (seq, seed mode, filters) -> sma_words.SeedSelection, see _selection.
+        self._sel_cache: OrderedDict = OrderedDict()
+        #: Since when good frames have had no S1 seed (None: the last had one),
+        #: why the newest one had none, and when the last good frame came.
+        self._noseed_since: float | None = None
+        self._noseed_reason = ""
+        self._last_good_at: float | None = None
         #: seq -> _RawEntry of the last analysed frames, bounded by
         #: Sampling/raw ring MB (see _keep_raw).
         self._raw: OrderedDict[int, _RawEntry] = OrderedDict()
@@ -717,6 +899,13 @@ class SmaPlugin:
         self.raw_not_kept = 0
         self._seconds: deque[_Second] = deque(maxlen=TREND_S + 1)
         self._cur: _Second | None = None
+        #: The MuPix time-sync monitor (see _mupix_sync): since when the
+        #: L1+L2 in-time fraction has been low, whether it is flagged, the last
+        #: value judged and when it was last evaluated.
+        self._mp_low_since: float | None = None
+        self._mp_flagged = False
+        self._mp_last: dict = {"state": "insufficient"}
+        self._mp_eval_t: int | None = None
         self._build()
 
     # -- settings --------------------------------------------------------------
@@ -743,6 +932,8 @@ class SmaPlugin:
 
     def _new_epoch(self) -> None:
         self.epoch += 1
+        self._mp_low_since = None
+        self._mp_flagged = False
         self._roll(force=True)
 
     # -- histograms ------------------------------------------------------------
@@ -854,6 +1045,39 @@ class SmaPlugin:
                                     Axis(scan[-1] - scan[0] + 1, scan[0] - 0.5, scan[-1] + 0.5,
                                          "coarse shift"),
                                     "Consistent S1 words per trial shift (entries = S1 words)")
+        self._build_mupix()
+
+    def _build_mupix(self) -> None:
+        """The MuPix histograms (good frames; see _fill_mupix)."""
+        cfg, b, h = self.cfg, self.cfg.binning, self.h
+        m = cfg.mupix
+        lo, hi, w = b["mupix dt min"], b["mupix dt max"], b["mupix dt bin"]
+        nb = max(1, -(-(hi - lo) // w))
+        dax = Axis(nb, lo, lo + nb * w, "t(pixel) - t(S1) (ns)")
+        (wlo, whi), (slo, shi) = m.window_ns, m.sideband_ns
+        chips = {W.PLANE_L1: m.l1, W.PLANE_L2: m.l2}
+        h["mupix_dt"] = {
+            p: self._h1(f"mupix_dt_{W.PLANE_NAMES[p]}", dax,
+                        f"MuPix {W.PLANE_NAMES[p]} (chips {','.join(map(str, chips[p]))}) minus "
+                        f"S1, all pairs; in time [{wlo}, {whi}) ns, sideband [{slo}, {shi}) ns")
+            for p in (W.PLANE_L1, W.PLANE_L2)}
+        h["mupix_s1_match"] = self._h1(
+            "mupix_s1_match", Axis(7, -0.5, 6.5, "0 S1 judged, 1 L1 in time, 2 L2, 3 L1+L2, "
+                                   "4 L1 sideband, 5 L2 sideband, 6 L1+L2 sideband"),
+            "S1 hits with a MuPix hit in time and in the sideband (entries = S1 hits judged)")
+        tax = Axis(32, -0.5, 31.5, f"pixel ToT ({m.tot_ns} ns counts)")
+        h["mupix_tot"] = {p: self._h1(f"mupix_tot_{W.PLANE_NAMES[p]}", tax,
+                                      f"Pixel ToT, {W.PLANE_NAMES[p]}, all pixel hits")
+                          for p in (W.PLANE_L1, W.PLANE_L2)}
+        cax = Axis(W.N_CHIP_IDS, -0.5, W.N_CHIP_IDS - 0.5, "chip id")
+        h["mupix_hits_chip"] = self._h2(
+            "mupix_hits_chip", cax, Axis(100, 0, b["mupix chip max"], "pixel hits per frame"),
+            "Pixel hits per frame, per chip")
+        h["mupix_col_chip"] = self._h2("mupix_col_chip", cax, Axis(256, -0.5, 255.5, "column"),
+                                       "Column occupancy per chip, all pixel hits")
+        h["mupix_row_chip"] = self._h2("mupix_row_chip", cax, Axis(256, -0.5, 255.5, "row"),
+                                       f"Row occupancy per chip (rows >= {W.PIXEL_ROWS} are not on "
+                                       "the sensor)")
 
     # -- per event -------------------------------------------------------------
 
@@ -932,7 +1156,7 @@ class SmaPlugin:
             return False
         fr = W.prepare_frame(data, cfg.shift, c.stale_gap_ns, c.latch_margin_ns,
                              rescue_shifts=cfg.scan, rescue_min_words=c.rescue_min_words,
-                             rescue_min_fraction=c.rescue_min_fraction)
+                             rescue_min_fraction=c.rescue_min_fraction, mupix=cfg.mupix)
         n_s1, scan_counts = kept_s1_scan(fr, cfg)
         s1_all = fr.ch == cfg.roles.s1
         n_s1_all = int(np.count_nonzero(s1_all))
@@ -988,7 +1212,8 @@ class SmaPlugin:
             gap = self._fill_good(fr, sec, now)
             # The all-S1 shift scan was done above to classify the frame.
             an = W.analyse_frame(fr, cfg.roles, cfg.cuts, shift_counts=scan_all)
-            self._fill_analysis(fr, an, sec)
+            sampled = self._fill_analysis(fr, an, sec)
+            self._fill_mupix(fr, sampled.t_s1, sec)
 
         hdr = event.header
         snap = _Snapshot(seq=self.frames, run=int(self.run_number or 0), serial=serial,
@@ -998,16 +1223,50 @@ class SmaPlugin:
                          event_id=int(getattr(hdr, "event_id", W.EVID_READOUT)),
                          timestamp=int(getattr(hdr, "timestamp", 0) or 0),
                          trigger_mask=int(getattr(hdr, "trigger_mask", 0) or 0))
+        snap.at = now
         self._keep_raw(snap, event, data)
         self._last = snap
         if cls == "good":
+            self.frames_good += 1
+            snap.good_n = self.frames_good
             self._last_good = snap
+            self._last_good_at = now
             if an.seeds.size:
                 self._last_seeded = snap
-        live = {self._last.seq, self._seeded_snap().seq if self._seeded_snap() else None}
+                self._noseed_since = None
+            else:
+                if self._noseed_since is None:
+                    self._noseed_since = now
+                n1 = an.n_s1_kept
+                self._noseed_reason = (f"no {self.labels()[cfg.roles.s1]} hits" if n1 == 0 else
+                                       f"none of {n1} {self.labels()[cfg.roles.s1]} hits has a "
+                                       "complete window")
+            self._push_ring(snap)
+        if int(now) != self._mp_eval_t:
+            self._mupix_sync(now)
+        live = self._held_seqs()
         for key in [k for k in self._frame_cache if k[0] not in live]:
             del self._frame_cache[key]
+        for key in [k for k in self._sel_cache if k[0] not in live]:
+            del self._sel_cache[key]
         return True
+
+    def _held_seqs(self) -> set:
+        seeded = self._seeded_snap()
+        return ({self._last.seq if self._last else None, seeded.seq if seeded else None}
+                | set(self._ring_sizes))
+
+    def _push_ring(self, snap: _Snapshot) -> None:
+        """Keep a good frame for the seed choices, within Sampling/seed ring frames and MB."""
+        size = snapshot_bytes(snap)
+        self._ring.append(snap)
+        self._ring_sizes[snap.seq] = size
+        self._ring_bytes += size
+        cfg = self.cfg
+        while len(self._ring) > 1 and (len(self._ring) > cfg.seed_ring_frames
+                                       or self._ring_bytes > cfg.seed_ring_bytes):
+            old = self._ring.popleft()
+            self._ring_bytes -= self._ring_sizes.pop(old.seq, 0)
 
     def reset_serial_baseline(self) -> None:
         """After a MIDAS reconnect: the serial gap is outage, not frames offered."""
@@ -1053,7 +1312,7 @@ class SmaPlugin:
         Rebuilt with the current settings, without touching any histogram;
         its gap to the previous frame is unknown (None).
         """
-        for snap in (self._last, self._last_good, self._last_seeded):
+        for snap in (self._last, self._last_good, self._last_seeded, *self._ring):
             if snap is not None and snap.seq == seq:
                 return snap
         entry = self._raw.get(int(seq))
@@ -1070,7 +1329,7 @@ class SmaPlugin:
         cfg, c = self.cfg, self.cfg.cuts
         fr = W.prepare_frame(bank.data, cfg.shift, c.stale_gap_ns, c.latch_margin_ns,
                              rescue_shifts=cfg.scan, rescue_min_words=c.rescue_min_words,
-                             rescue_min_fraction=c.rescue_min_fraction)
+                             rescue_min_fraction=c.rescue_min_fraction, mupix=cfg.mupix)
         n_s1, scan_counts = kept_s1_scan(fr, cfg)
         s1_all = fr.ch == cfg.roles.s1
         scan_all = W.shift_scan(fr.coarse[s1_all], fr.fine[s1_all], cfg.scan, c.latch_margin_ns)
@@ -1213,7 +1472,9 @@ class SmaPlugin:
         h["fine_bit_occupancy"].add_counts(occ, entries=int(hits.sum()))
         return gap
 
-    def _fill_analysis(self, fr: W.Frame, an: W.FrameAnalysis, sec: _Second) -> None:
+    def _fill_analysis(self, fr: W.Frame, an: W.FrameAnalysis,
+                       sec: _Second) -> W.FrameAnalysis:
+        """The S1-seeded fills; returns the rows filled (the S1 sample)."""
         h = self.h
         # The S1 spacing needs every kept S1 hit; the rest is filled from the
         # S1 sample when the frame has more than Cuts/max S1 per frame (the
@@ -1224,7 +1485,7 @@ class SmaPlugin:
         n1 = int(an.t_s1.size)
         sec.n_s1 += n1
         if n1 == 0:
-            return
+            return an
 
         for ch, (_i, dt) in an.dt.items():
             hh = h["dt"].get(ch)
@@ -1258,6 +1519,128 @@ class SmaPlugin:
             hh = h["delayed"].get(ch)
             if hh is not None and dt.size:
                 _fill_values(hh, dt * 1e-3)
+        return an
+
+    def _fill_mupix(self, fr: W.Frame, t_s1, sec: _Second) -> None:
+        """MuPix of a good frame: occupancy, ToT, and the S1 matching.
+
+        Occupancy and ToT use every examined pixel hit (noise included). The
+        matching uses the S1 rows the S1-seeded analyses use (the sample under
+        Cuts/max S1 per frame), at most MuPix/max S1 per frame of them, evenly
+        spread (sma_words.even_sample): which have an L1 / L2 hit in the in-time window
+        and in the sideband (only S1 hits whose windows lie in the pixel data
+        are judged, sma_words.mupix_match), and every t(pixel) - t(S1) pair in
+        the histogram range (bounded by MuPixCuts.max_pairs).
+        """
+        px = fr.px
+        if px is None:
+            return
+        h, m = self.h, self.cfg.mupix
+        sec.mp_frames += 1
+        sec.mp_pix += px.n_words
+        sec.mp_examined += px.n
+        sec.mp_skipped += px.n_skipped
+        sec.mp_unsorted += 0 if px.was_sorted else 1
+        chip = px.chip.astype(np.intp)
+        per_chip = np.bincount(chip, minlength=W.N_CHIP_IDS)[:W.N_CHIP_IDS]
+        sec.mp_chip += per_chip
+        sec.mp_rows += int(np.count_nonzero(px.row >= W.PIXEL_ROWS))
+        # Hits per frame of every chip that has hits or a plane (a dead chip
+        # of the map fills its 0 bin).
+        show = np.flatnonzero((per_chip > 0) | (m.planes > 0))
+        hc = h["mupix_hits_chip"]
+        _fill_2d_index(hc, show + 1, (per_chip[show] * hc.y.n) // int(hc.y.hi) + 1)
+        if px.n:
+            _fill_2d_index(h["mupix_col_chip"], chip + 1, px.col.astype(np.intp) + 1)
+            _fill_2d_index(h["mupix_row_chip"], chip + 1, px.row.astype(np.intp) + 1)
+            tot = np.bincount(px.plane.astype(np.intp) * 32 + px.tot.astype(np.intp),
+                              minlength=96)
+            for p in (W.PLANE_L1, W.PLANE_L2):
+                c = np.zeros(34, dtype=np.int64)
+                c[1:33] = tot[32 * p: 32 * p + 32]
+                h["mupix_tot"][p].add_counts(c, entries=int(c.sum()))
+        t_s1 = np.asarray(t_s1, dtype=np.int64)
+        if not t_s1.size or not px.n:
+            return
+        if m.max_s1 is not None and t_s1.size > m.max_s1:
+            t_s1 = t_s1[W.even_sample(t_s1.size, m.max_s1)]
+        mt = W.mupix_match(t_s1, px, m.window_ns, m.sideband_ns)
+        n, fin, fside = mt.counts()
+        sec.mp_n += n
+        sec.mp_in += fin
+        sec.mp_side += fside
+        c = np.zeros(9, dtype=np.int64)
+        c[1], c[2:5], c[5:8] = n, fin, fside
+        h["mupix_s1_match"].add_counts(c, entries=n)
+        b = self.cfg.binning
+        for p in (W.PLANE_L1, W.PLANE_L2):
+            dt, _used = W.mupix_pairs(t_s1, px.times(p), b["mupix dt min"], b["mupix dt max"],
+                                      m.max_pairs)
+            if dt.size:
+                hh = h["mupix_dt"][p]
+                _fill_1d_index(hh, (dt - int(hh.x.lo)) // b["mupix dt bin"] + 1)
+
+    def _mupix_widths(self) -> tuple[float, float]:
+        m = self.cfg.mupix
+        return (float(m.window_ns[1] - m.window_ns[0]), float(m.sideband_ns[1] - m.sideband_ns[0]))
+
+    def _mupix_sync(self, now: float) -> dict:
+        """The SMA <-> MuPix time-sync monitor, evaluated once per second.
+
+        Over the last ``mupix sync window s``: with S1 firing (at least ``mupix
+        sync min S1`` analysed S1 hits) the share of judged S1 hits with an L1
+        and an L2 hit in time, accidentals taken out, is compared with ``mupix
+        sync min fraction``. Below it for more than ``mupix sync hold s``: the
+        flag ``mupix_sync`` is raised, and it clears once the share is above
+        min fraction + ``mupix sync clear margin`` (hysteresis). No pixel words
+        at all while S1 fires counts as 0. Too few S1 hits (beam off) or too
+        few judged ones: no verdict, and the flag and its timer are cleared.
+        """
+        chk = self.cfg.check
+        self._mp_eval_t = int(now)
+        secs = self._window(chk["mupix sync window s"], now)
+        n_s1 = sum(x.n_s1 for x in secs)
+        n = sum(x.mp_n for x in secs)
+        pix = sum(x.mp_pix for x in secs)
+        both = sum(int(x.mp_in[2]) for x in secs)
+        side = sum(int(x.mp_side[2]) for x in secs)
+        thr = chk["mupix sync min fraction"]
+        out = {"state": "insufficient", "value": None, "n_s1": n, "pixels": pix,
+               "threshold": _num(thr, 4), "window_s": chk["mupix sync window s"],
+               "hold_s": chk["mupix sync hold s"]}
+        if not self.cfg.mupix.enabled:
+            out["state"] = "off"
+            f = None
+        elif n_s1 < chk["mupix sync min S1"]:
+            f = None
+        elif pix == 0:
+            f = 0.0
+            out["absent"] = True
+        elif n < chk["mupix sync min S1"]:
+            f = None
+        else:
+            f = W.accidental_corrected(both / n, side / n, *self._mupix_widths())
+        if f is None:
+            self._mp_low_since = None
+            self._mp_flagged = False
+        else:
+            out["value"] = _num(f, 4)
+            if f < thr:
+                if self._mp_low_since is None:
+                    self._mp_low_since = now
+                if now - self._mp_low_since > chk["mupix sync hold s"]:
+                    self._mp_flagged = True
+            elif f >= thr + chk["mupix sync clear margin"]:
+                self._mp_low_since = None
+                self._mp_flagged = False
+            elif not self._mp_flagged:
+                self._mp_low_since = None
+            out["state"] = ("flagged" if self._mp_flagged else
+                            "low" if self._mp_low_since is not None else "ok")
+        out["low_for_s"] = (None if self._mp_low_since is None
+                            else _num(now - self._mp_low_since, 4))
+        self._mp_last = out
+        return out
 
     # -- seconds ---------------------------------------------------------------
 
@@ -1454,10 +1837,116 @@ class SmaPlugin:
             "rf": {"n_s1": n_s1, "valid_frac": _ratio(total("rf_valid"), n_s1, 4),
                    "vetoed_frac": _ratio(total("rf_vetoed"), n_s1, 4)},
             "shift": shift,
+            #: Counters with a known fine/coarse fault (the ``mismatch`` flags'
+            #: rule); SMAEvents' "incomplete pattern" leaves them out.
+            "timestamp_faults": self._timestamp_faults(hits, mism, shift["verdict"]),
+            "mupix": self._mupix_summary(secs, now),
             "settings_errors": list(cfg.errors),
         }
         out["flags"] = self._flags(out, now, run_active)
         return out
+
+    def _timestamp_faults(self, hits, mism, verdict: str) -> dict:
+        """The counters (S1..S5) with a known timestamp fault, by the rule the
+        summary's per-channel ``mismatch`` flags use (`_flags`): a flagged
+        channel with at least ``min hits`` hits whose fine/coarse mismatch
+        fraction over the summary window is above ``mismatch warn fraction``,
+        and only while the shift verdict is ok (otherwise every channel's
+        mismatch describes the setting, not the board: nothing is judged).
+
+        ``{"verdict", "judged", "counters": [{"counter": k (1 = S1), "ch",
+        "label", "mismatch_frac"}]}``.
+        """
+        chk, cfg = self.cfg.check, self.cfg
+        labels = self.labels()
+        out = {"verdict": verdict, "judged": verdict == "ok", "counters": []}
+        if verdict != "ok":
+            return out
+        for k, c in enumerate(cfg.roles.counters):
+            m = _ratio(mism[c], hits[c], 4)
+            if (c in cfg.flag_channels and hits[c] >= chk["min hits"] and m is not None
+                    and m > chk["mismatch warn fraction"]):
+                out["counters"].append({"counter": k + 1, "ch": int(c), "label": labels[c],
+                                        "mismatch_frac": m})
+        return out
+
+    def timestamp_faults(self, now: float | None = None) -> dict:
+        """`_timestamp_faults` now, over the summary window (what ``sma::summary``
+        says as ``timestamp_faults``), without building the rest of the summary."""
+        now = self._clock() if now is None else now
+        secs = self._window(self.cfg.check["summary window s"], now)
+
+        def vec(attr):
+            return sum((getattr(s, attr) for s in secs if len(getattr(s, attr)) == NCH),
+                       np.zeros(NCH, dtype=np.int64))
+
+        return self._timestamp_faults(vec("hits"), vec("mismatch"),
+                                      self.shift_verdict(now)["verdict"])
+
+    def incomplete_rule(self, faults: dict) -> dict:
+        """How the ``incomplete`` oddity judges seeds, given `timestamp_faults`:
+        which counters it ignores (0-based ``ignore``), whether it can judge at
+        all, and the words the page shows for it."""
+        nc = len(self.cfg.roles.counters)
+        ign = [f for f in faults["counters"] if 1 <= f["counter"] <= nc]
+        judged = nc - len(ign) >= 2
+        base = self.filter_label("incomplete")
+        if not faults["judged"]:
+            note = f"no counter ignored: shift check {faults['verdict']}"
+        elif not ign:
+            note = ""
+        elif not judged:
+            names = ", ".join(f["label"] for f in ign)
+            note = (f"cannot judge: {names} {'has a' if len(ign) == 1 else 'have'} "
+                    "timestamp fault" + ("" if len(ign) == 1 else "s"))
+        else:
+            note = "ignoring " + ", ".join(
+                f"{f['label']}: timestamp fault {_pct(f['mismatch_frac'])}" for f in ign)
+        return {"ignore": tuple(f["counter"] - 1 for f in ign) if faults["judged"] else (),
+                "judged": judged or not faults["judged"],
+                "out": {"judged": judged or not faults["judged"],
+                        "verdict": faults["verdict"],
+                        "ignored": [dict(f) for f in ign] if faults["judged"] else [],
+                        "note": note,
+                        "label": f"{base} ({note})" if note else base}}
+
+    def _mupix_summary(self, secs: list, now: float) -> dict:
+        """The MuPix part of sma::summary, over the summary window."""
+        m = self.cfg.mupix
+        if int(now) != self._mp_eval_t:
+            self._mupix_sync(now)
+        tot = lambda a: sum(getattr(x, a) for x in secs)  # noqa: E731
+        n, frames = tot("mp_n"), tot("mp_frames")
+        fin = sum((x.mp_in for x in secs), np.zeros(3, dtype=np.int64))
+        fside = sum((x.mp_side for x in secs), np.zeros(3, dtype=np.int64))
+        per_chip = sum((x.mp_chip for x in secs), np.zeros(W.N_CHIP_IDS, dtype=np.int64))
+        widths = self._mupix_widths()
+        fractions = {}
+        for k, name in enumerate(("L1", "L2", "both")):
+            a, b = _ratio(fin[k], n, 4), _ratio(fside[k], n, 4)
+            fractions[name] = {"in": a, "side": b,
+                               "corr": _num(W.accidental_corrected(a, b, *widths), 4)}
+        planes = m.planes
+        chips = [{"chip": int(c), "plane": W.PLANE_NAMES[int(planes[c])] if planes[c] else None,
+                  "hits": int(per_chip[c]), "per_frame": _ratio(per_chip[c], frames, 5)}
+                 for c in range(W.N_CHIP_IDS) if per_chip[c] or planes[c]]
+        pix = tot("mp_pix")
+        return {
+            "enabled": bool(m.enabled),
+            "planes": {"L1": list(m.l1), "L2": list(m.l2)},
+            "window_ns": list(m.window_ns), "sideband_ns": list(m.sideband_ns),
+            "ts2_shift": m.ts2_shift, "tot_ns": m.tot_ns,
+            "frames": frames, "n_s1": n, "pixels": pix,
+            "pixels_per_frame": _ratio(pix, frames, 5),
+            "skipped_frac": _ratio(tot("mp_skipped"), pix, 4),
+            "max_pixels": m.max_pixels,
+            "unmapped": int(per_chip[planes == 0].sum()),
+            "rows_off_sensor": tot("mp_rows"),
+            "unsorted_frames": tot("mp_unsorted"),
+            "chips": chips,
+            "fractions": fractions,
+            "sync": dict(self._mp_last),
+        }
 
     def _flags(self, s: dict, now: float, run_active) -> list[dict]:
         chk = self.cfg.check
@@ -1504,6 +1993,20 @@ class SmaPlugin:
             add("error", "no_frames", f"No SMA frames for {age:.0f} s while a run is active")
         elif age is None and run_active:
             add("warn", "no_frames", "No SMA frame received yet while a run is active")
+        if self._noseed_since is not None and self._last_good_at is not None:
+            # Good frames keep coming but none has an S1 seed: S1 is missing
+            # from the data (absent, dead, mis-cabled, or the s1 role points at
+            # the wrong channel). The S1-seeded view then shows an old frame.
+            quiet = now - self._noseed_since
+            if quiet > chk["no seeds s"] and now - self._last_good_at <= chk["no frames s"]:
+                c1 = self.cfg.roles.s1
+                lab = self.labels()[c1]
+                add("warn", "no_seeds",
+                    f"No {lab} seed for {quiet:.0f} s although good frames arrive "
+                    f"({self._noseed_reason}): {lab} (ch {c1}) is absent, dead or mis-cabled, "
+                    "or /DQM/SMA/Channel roles/s1 is wrong. SMAEvents shows an older frame; "
+                    "its seed choice 'any counter' shows events without it")
+        self._mupix_flags(s, add)
         if w.get("oversize"):
             add("warn", "oversize",
                 f"{w['oversize']} frame(s) in the last {s['window_s']:.0f} s had more than "
@@ -1556,6 +2059,41 @@ class SmaPlugin:
             add("warn", "settings", "; ".join(s["settings_errors"]))
         return flags
 
+    def _mupix_flags(self, s: dict, add) -> None:
+        mp = s.get("mupix") or {}
+        sy = mp.get("sync") or {}
+        chk = self.cfg.check
+        lab = self.labels()[self.cfg.roles.s1]
+        if sy.get("state") == "flagged":
+            low = sy.get("low_for_s") or 0
+            if sy.get("absent"):
+                add("warn", "mupix_sync",
+                    f"No MuPix pixel words in the SMA frames for {low:.0f} s while {lab} fires: "
+                    "the MuPix readout, its link or its chips are off (or the H000 bank no "
+                    "longer carries them)")
+            else:
+                add("warn", "mupix_sync",
+                    f"MuPix L1+L2 in time with {lab} for only {sy['value']:.0%} of {lab} hits "
+                    f"(accidentals taken out) for {low:.0f} s, below "
+                    f"{chk['mupix sync min fraction']:.0%}: the SMA and MuPix time bases may "
+                    "have lost sync (wrong coarse shift, a time-base fault on either side), a "
+                    "plane is dead, or the beam does not reach MuPix (degrader, stopping run). "
+                    "The MuPix tab's t(pixel) - t(S1) peak sits near 0 when they agree")
+        if mp.get("unmapped"):
+            bad = [c["chip"] for c in mp.get("chips", []) if c["plane"] is None and c["hits"]]
+            add("warn", "mupix_unmapped",
+                f"{mp['unmapped']} pixel hits in the last {s['window_s']:.0f} s on chip(s) "
+                f"{', '.join(map(str, bad))}, in neither /DQM/SMA/MuPix/L1 chips "
+                f"({','.join(map(str, mp['planes']['L1']))}) nor L2 chips "
+                f"({','.join(map(str, mp['planes']['L2']))}): the plane map does not match the "
+                "FEB Mapping")
+        sk = mp.get("skipped_frac")
+        if sk:
+            add("info", "mupix_skipped",
+                f"MuPix: {sk:.0%} of the pixel hits were skipped (at most "
+                f"{mp['max_pixels']} examined per frame, MuPix/max pixel hits per frame); "
+                "fractions use only S1 hits inside the examined part")
+
     def _efficiency_flags(self, now: float, skip=frozenset()) -> list[dict]:
         chk, cfg = self.cfg.check, self.cfg
         nc = len(cfg.roles.counters)
@@ -1600,7 +2138,8 @@ class SmaPlugin:
                 by_t.setdefault(s.t, []).append(s)
         warn = self.cfg.check["mismatch warn fraction"]
         counters = self.cfg.roles.counters
-        rows = [(v[0] if len(v) == 1 else _merge_seconds(v)).row(counters, warn)
+        widths = self._mupix_widths()
+        rows = [(v[0] if len(v) == 1 else _merge_seconds(v)).row(counters, warn, widths)
                 for _t, v in sorted(by_t.items())]
         return {"t": now, "labels": self.labels(),
                 # The columns of each row's "eff": the counters after S1.
@@ -1610,43 +2149,224 @@ class SmaPlugin:
     # -- event display -------------------------------------------------------------
 
     def frame_blob(self, view: str = "seeded", drop=(), max_hits: int | None = None,
-                   words: bool | None = None, seq: int | None = None) -> bytes | None:
+                   words: bool | None = None, seq: int | None = None, seed=None,
+                   filters=None, mupix=None, pixels: bool | None = None,
+                   pattern=None) -> bytes | None:
         """A frame as an ``smaf`` payload, encoded once per (frame, view, drop, words).
 
         The seeded view shows the last frame that had seeds (`_seeded_snap`); the
         raster shows the last frame of any class, flagged if stale or suspect.
-        With `seq`, that frame instead, if still held (a live snapshot or the
-        raw ring), else None. `words`: ship each hit's raw word and bank index
-        (smaf v2); default yes for seeded, no for the raster (see framing).
+        With `seq`, that frame instead, if still held (a live snapshot, the seed
+        ring or the raw ring), else None. `words`: ship each hit's raw word and
+        bank index (smaf v2); default yes for seeded, no for the raster (see
+        framing).
+
+        Seeded view only: `seed` (``"s1"``, ``"any"`` or ``"ch<N>"``) and
+        `filters` (names from ``sma_words.FILTERS``, OR-ed) choose the seeds at
+        request time (`_chosen`). ``"s1"`` without filters is the default and
+        sends exactly the payload the analysis made, plus -- only when the frame
+        shown is not the newest good one -- a ``stale_view`` entry saying why.
+        `mupix` (``"any"``, ``"both"``, ``"either"``, ``"none"``): the MuPix
+        selector, AND-ed with the filters. `pattern` (``{"1": "present", "3":
+        "absent"}``, counters S1..S5 by number, "any" = no condition): the
+        per-counter pattern selector, AND-ed too (`sma_words.parse_pattern`).
+        The ``incomplete`` oddity leaves out counters with a known timestamp
+        fault (`incomplete_rule`); the pattern selector never does.
+
+        `pixels` (default yes): ship the frame's MuPix pixel hits too, as the
+        smaf pixel block (framing, "pixel block"): the seed windows' in the
+        seeded view, every examined one (at most `max_hits`, the latest) in
+        the raster. No changes nothing else in the payload.
         """
         if view not in ("seeded", "raster"):
             raise ValueError(f"view must be 'seeded' or 'raster', got {view!r}")
+        mode = W.parse_seed(seed)
+        filt = W.parse_filters(filters)
+        mp = W.parse_mupix(mupix)
+        req = W.parse_pattern(pattern, len(self.cfg.roles.counters))
+        words = (view == "seeded") if words is None else bool(words)
+        pixels = True if pixels is None else bool(pixels)
+        drop = tuple(sorted({int(c) for c in drop}))
+        max_hits = None if max_hits is None else max(0, int(max_hits))
+        if view == "seeded" and (mode != W.SEED_S1 or filt or mp != "any" or req):
+            return self._chosen(mode, filt, mp, drop, max_hits, words, seq, pixels, req)
         if seq is not None:
             snap = self._snapshot_for(int(seq))
         else:
             snap = self._seeded_snap() if view == "seeded" else self._last
         if snap is None:
             return None
-        words = (view == "seeded") if words is None else bool(words)
-        drop = tuple(sorted({int(c) for c in drop}))
-        max_hits = None if max_hits is None else max(0, int(max_hits))
-        key = (snap.seq, view, drop, max_hits, words)
-        blob = self._frame_cache.get(key)
-        if blob is None:
-            blob = self._encode(snap, view, drop, max_hits, words)
-            self._frame_cache[key] = blob
+        key = (snap.seq, view, drop, max_hits, words, pixels)
+        blob = self._cached(key, lambda: self._encode(snap, view, drop, max_hits, words,
+                                                      pixels=pixels))
+        if view == "seeded" and seq is None:
+            newest = self._last_good
+            if newest is not None and newest.seq != snap.seq:
+                blob = framing.smaf_update_meta(blob, {"stale_view": self._stale_view(
+                    snap, newest, self._noseed_reason)})
         return blob
 
-    def _encode(self, snap: _Snapshot, view, drop, max_hits, words=False) -> bytes:
+    def _cached(self, key, make) -> bytes:
+        blob = self._frame_cache.get(key)
+        if blob is None:
+            blob = make()
+            self._frame_cache[key] = blob
+            while len(self._frame_cache) > BLOB_CACHE_MAX:
+                self._frame_cache.popitem(last=False)
+        else:
+            self._frame_cache.move_to_end(key)
+        return blob
+
+    def _stale_view(self, snap: _Snapshot, newest: _Snapshot, reason: str) -> dict:
+        """Why the seeded view shows `snap` and not the newest good frame."""
+        return {"shown_seq": snap.seq, "newest_seq": newest.seq,
+                "age_s": _num(max(0.0, self._clock() - snap.at), 4),
+                "good_since": max(0, self.frames_good - snap.good_n), "reason": reason}
+
+    def _selection(self, snap: _Snapshot, mode: str, filt: tuple,
+                   mp: str = "any", req: tuple = (), ignore: tuple = ()) -> W.SeedSelection:
+        """The seeds of one held frame for a choice, computed once (`sma_words.select_seeds_by`).
+
+        Only good frames have seeds, as in the default view.
+        """
+        key = (snap.seq, mode, filt, mp, req, ignore)
+        sel = self._sel_cache.get(key)
+        if sel is not None:
+            self._sel_cache.move_to_end(key)
+            return sel
+        cfg = self.cfg
+        fr = snap.fr if snap.cls == "good" else _EMPTY_FRAME
+        sel = W.select_seeds_by(fr, cfg.roles, cfg.cuts, mode, filt, mupix=mp, mcuts=cfg.mupix,
+                                require=req, ignore=ignore)
+        self._sel_cache[key] = sel
+        while len(self._sel_cache) > SEL_CACHE_MAX:
+            self._sel_cache.popitem(last=False)
+        return sel
+
+    def seed_label(self, mode: str) -> str:
+        if mode == W.SEED_ANY:
+            return "any counter"
+        c = self.cfg.roles.s1 if mode == W.SEED_S1 else int(mode[2:])
+        return f"{self.labels()[c]} (ch {c})"
+
+    def filter_label(self, name: str) -> str:
+        return {"incomplete": "incomplete pattern", "mismatch": "fine/coarse mismatch",
+                "tot": f"ToT \u2265 {self.cfg.cuts.tot_corrupt_min}",
+                "rf": "RF not valid or vetoed"}[name]
+
+    def pattern_label(self, req: tuple) -> str:
+        """``((1, "present"), (3, "absent"))`` -> "S1 present, S3 absent"."""
+        labels, counters = self.labels(), self.cfg.roles.counters
+        return ", ".join(f"{labels[counters[k - 1]]} {st}" for k, st in req)
+
+    @staticmethod
+    def mupix_label(mp: str) -> str:
+        return {"any": "any MuPix", "both": "L1+L2 in time", "either": "L1 or L2 in time",
+                "none": "no MuPix hit in time"}[mp]
+
+    def _chosen(self, mode, filt, mp, drop, max_hits, words, seq, pixels=True,
+                req=()) -> bytes | None:
+        """The seeded view for a seed choice and filters.
+
+        Newest good frame first, then back through the seed ring
+        (`Sampling/seed ring frames`) to the first frame with a matching seed;
+        with `seq`, that frame only. Each frame's selection is computed once and
+        cached, so a poll costs one new frame's selection. When no frame
+        matches, the newest searched frame is sent without seeds and with
+        ``search.no_match`` -- an explicit state, not an empty display.
+
+        The ``incomplete`` oddity's rule (`incomplete_rule`: the counters it
+        ignores for a timestamp fault, or that it cannot judge) goes with every
+        reply as meta ``incomplete``, outside the cached payload: its numbers
+        move while the selections stay valid.
+        """
+        now = self._clock()
+        rule = self.incomplete_rule(self.timestamp_faults(now))
+        ign = rule["ignore"]
+        if seq is not None:
+            snap = self._snapshot_for(int(seq))
+            frames = [snap] if snap is not None else []
+        else:
+            frames = list(reversed(self._ring))
+        if not frames:
+            return None
+        match = None
+        searched = made = 0
+        t_cpu = time.process_time()
+        for k, snap in enumerate(frames):
+            if (snap.seq, mode, filt, mp, req, ign) not in self._sel_cache:
+                # At least one new selection per request, so the search always
+                # moves on; more only while the request is within its budget.
+                if made and time.process_time() - t_cpu > SEARCH_BUDGET_S:
+                    break                           # out of time: the next poll goes on
+                made += 1
+            found = self._selection(snap, mode, filt, mp, req, ign)
+            searched = k + 1
+            if found.idx.size:
+                match, pick, sel = k, snap, found
+                break
+        if match is None:
+            pick = frames[0]
+            sel = self._selection(pick, mode, filt, mp, req, ign)
+        select = {"seed": mode, "seed_label": self.seed_label(mode), "filters": list(filt),
+                  "filter_labels": [self.filter_label(f) for f in filt],
+                  "candidates": sel.n_candidates, "examined": sel.n_examined,
+                  "matching": sel.n_matching, "capped": bool(sel.capped)}
+        if mp != "any":
+            select["mupix"] = mp
+            select["mupix_label"] = self.mupix_label(mp)
+        if req:
+            select["pattern"] = {str(k): st for k, st in req}
+            select["pattern_label"] = self.pattern_label(req)
+        key = (pick.seq, "seeded", drop, max_hits, words, mode, filt, mp, pixels, req, ign)
+        blob = self._cached(key, lambda: self._encode(pick, "seeded", drop, max_hits, words,
+                                                      chosen=sel, extra={"select": select},
+                                                      pixels=pixels))
+        inc = rule["out"]
+        flabel = {f: (inc["label"] if f == "incomplete" else self.filter_label(f)) for f in filt}
+        what = ("seeds on any counter" if mode == W.SEED_ANY
+                else f"{self.seed_label(mode)} seeds") + (
+            f" with {' or '.join(flabel[f] for f in filt)}" if filt else "") + (
+            f" and {self.pattern_label(req)}" if req else "") + (
+            f" and {self.mupix_label(mp)}" if mp != "any" else "")
+        search = {"frames_searched": searched, "newest_seq": frames[0].seq,
+                  "ring_frames": len(self._ring)}
+        extra = {"search": search, "incomplete": inc}
+        if match is None:
+            oldest = frames[searched - 1]
+            partial = searched < len(frames)
+            search["no_match"] = {
+                "frames": searched, "oldest_seq": oldest.seq, "partial": partial,
+                "span_s": _num(max(0.0, now - oldest.at), 4) if oldest.at else None,
+                "text": (f"no {what} in frame seq {oldest.seq}" if seq is not None else
+                         f"no {what} in the last {searched} good frame"
+                         f"{'' if searched == 1 else 's'}"
+                         + (f" (of {len(frames)} held; searching on)" if partial else ""))}
+        elif match > 0:
+            extra["stale_view"] = self._stale_view(pick, frames[0], f"no {what}")
+        return framing.smaf_update_meta(blob, extra)
+
+    def _encode(self, snap: _Snapshot, view, drop, max_hits, words=False,
+                chosen: W.SeedSelection | None = None, extra: dict | None = None,
+                pixels: bool = True) -> bytes:
+        """`chosen`: request-time seeds (`_chosen`) instead of the analysis's S1 seeds;
+        `extra`: more meta keys, appended after the default ones; `pixels`: add
+        the MuPix pixel block and its ``mupix`` meta (after every other key, so
+        that dropping both gives the payload without MuPix byte for byte)."""
         fr, an = snap.fr, snap.an
         o = fr.order
         n = int(o.size)
         s_t = fr.s_t
         in_seed = np.zeros(n, dtype=bool)
         windows = []
-        seeds = an.seeds if an is not None else np.zeros(0, dtype=np.intp)
+        if chosen is not None:
+            seeds = np.arange(chosen.idx.size)
+            seed_t = chosen.t
+        else:
+            seeds = an.seeds if an is not None else np.zeros(0, dtype=np.intp)
+            seed_t = an.t_s1 if an is not None else None
         for i in seeds:
-            ts = int(an.t_s1[i])
+            ts = int(seed_t[i])
             a = int(np.searchsorted(s_t, ts - snap.pre_ns, side="left"))
             b = int(np.searchsorted(s_t, ts + snap.post_ns, side="right"))
             in_seed[a:b] = True
@@ -1685,7 +2405,9 @@ class SmaPlugin:
 
         seed_meta = []
         widx = fr.word_index[o[idx]] if fr.word_index is not None else None
-        for i, (a, b) in zip(seeds, windows, strict=True):
+        if chosen is not None:
+            seed_meta = self._chosen_meta(fr, chosen, windows, idx, t0)
+        for i, (a, b) in zip(seeds if chosen is None else (), windows, strict=False):
             seed_meta.append({
                 "t_rel": int(an.t_s1[i]) - t0,          # ns, never shifted
                 "s1_tot": int(an.s1_tot[i]),
@@ -1724,12 +2446,105 @@ class SmaPlugin:
             "raw_held": snap.seq in self._raw,
             "words": bool(words and widx is not None),
         }
+        if extra:
+            meta.update(extra)
+        block = None
+        if pixels and fr.px is not None:
+            seed_times = [int(seed_t[i]) for i in seeds]
+            meta["mupix"], block = self._pixel_block(snap, view, seed_times, max_hits, words)
         return framing.encode_sma_frame(
             meta, t_rel, ch, tot, flags, frame_seq=snap.seq, run_number=snap.run,
             seeded=view == "seeded", stale=snap.cls == "stale", truncated=truncated,
             suspect=snap.cls == "suspect", time_shift=k,
             raw_words=fr.raw[o[idx]] if words and fr.raw is not None else None,
-            word_index=widx if words and fr.raw is not None else None)
+            word_index=widx if words and fr.raw is not None else None, pixels=block)
+
+    def _pixel_block(self, snap: _Snapshot, view: str, seed_times: list, max_hits, words):
+        """``(meta, block)``: the ``mupix`` meta of a frame and its smaf pixel block.
+
+        Seeded view: the pixel hits inside the seed windows, and per seed its
+        range in the shipped pixels (``pix``), its in-time L1 / L2 hits and
+        whether its in-time window lies wholly in the pixel data (``covered``:
+        without it a count of 0 says nothing). Raster: every examined pixel hit, the
+        latest `max_hits` at most. Pixel times are ns from ``t0_ns`` (the first
+        shipped pixel, absolute on the frame's time basis) in 2^time_shift ns.
+        """
+        px, m = snap.fr.px, self.cfg.mupix
+        wlo, whi = m.window_ns
+        t = px.t
+        in_seed = np.zeros(px.n, dtype=bool)
+        wins = []
+        for ts in seed_times:
+            a = int(np.searchsorted(t, ts - snap.pre_ns, side="left"))
+            b = int(np.searchsorted(t, ts + snap.post_ns, side="right"))
+            in_seed[a:b] = True
+            wins.append((a, b))
+        sel = in_seed if view == "seeded" else np.ones(px.n, dtype=bool)
+        pidx = np.flatnonzero(sel)
+        n_sel = int(pidx.size)
+        truncated = max_hits is not None and pidx.size > max_hits
+        if truncated:
+            pidx = pidx[pidx.size - max_hits:]
+        t0 = int(t[pidx[0]]) if pidx.size else int(px.first)
+        span = int(t[pidx[-1]]) - t0 if pidx.size else 0
+        k = 0
+        while (span >> k) > 0xFFFFFFFF:
+            k += 1
+        pflags = (px.plane[pidx] & np.uint8(framing.PIX_PLANE_MASK)
+                  | (px.row[pidx] >= W.PIXEL_ROWS).astype(np.uint8) * framing.PIX_OFF_SENSOR
+                  | in_seed[pidx].astype(np.uint8) * framing.PIX_IN_SEED)
+        block = {"t_rel": ((t[pidx] - t0) >> k).astype("<u4"), "time_shift": k,
+                 "chip": px.chip[pidx], "col": px.col[pidx], "row": px.row[pidx],
+                 "tot": px.tot[pidx], "flags": pflags}
+        if words:
+            block["raw_words"] = px.raw[pidx]
+            block["word_index"] = px.word_index[pidx]
+        meta = {"t0_ns": t0, "time_shift": k, "n_words": px.n_words, "n_examined": px.n,
+                "n_skipped": px.n_skipped, "n_selected": n_sel, "truncated": bool(truncated),
+                "per_plane": [int(x.size) for x in px.planes],
+                "planes": {"L1": list(m.l1), "L2": list(m.l2)},
+                "window_ns": [wlo, whi], "sideband_ns": list(m.sideband_ns),
+                "ts2_shift": m.ts2_shift, "tot_ns": m.tot_ns, "rows": W.PIXEL_ROWS}
+        if seed_times:
+            ts = np.asarray(seed_times, dtype=np.int64)
+            cov = W.mupix_coverage(ts, px, wlo, whi)
+            n1, n2 = W.mupix_in_window(ts, px, wlo, whi)
+            tsh = t[pidx]
+            meta["seeds"] = [{
+                "pix": [int(np.searchsorted(tsh, x - snap.pre_ns, side="left")),
+                        int(np.searchsorted(tsh, x + snap.post_ns, side="right"))],
+                "l1": int(n1[j]), "l2": int(n2[j]), "covered": bool(cov[j])}
+                for j, x in enumerate(seed_times)]
+        return meta, block
+
+    def _chosen_meta(self, fr: W.Frame, sel: W.SeedSelection, windows, idx, t0) -> list:
+        """Per-seed meta of request-time seeds: the default keys (``s1_tot``, RF,
+        ``pattern``, ``hits``, ``word_range``, ``s1_word``) plus the seed's own
+        channel, ToT and word, ``s1_dt`` (the S1 hit the RF is borrowed from,
+        minus the seed), ``rf_na`` (no S1 near the seed) and ``odd`` (every
+        oddity the seed has, asked for or not)."""
+        o = fr.order
+        wi = fr.word_index
+        out = []
+        for j, (a, b) in enumerate(windows):
+            has = bool(sel.has_s1[j])
+            s1 = int(sel.s1_idx[j])
+            out.append({
+                "t_rel": int(sel.t[j]) - t0,
+                "s1_tot": int(fr.s_tot[s1]) if has else None,
+                "rf_phase": _num(sel.rf_phase[j]), "rf_period": _num(sel.rf_period[j]),
+                "rf_n": int(sel.rf_n[j]) if has else None, "rf_valid": bool(sel.rf_valid[j]),
+                "rf_vetoed": bool(sel.rf_vetoed[j]), "pattern": int(sel.pattern[j]),
+                "hits": [int(np.searchsorted(idx, a)), int(np.searchsorted(idx, b))],
+                "word_range": ([int(wi[o[a:b]].min()), int(wi[o[a:b]].max())]
+                               if wi is not None and b > a else None),
+                "s1_word": int(wi[o[s1]]) if wi is not None and has else None,
+                "seed_ch": int(sel.ch[j]), "seed_tot": int(sel.tot[j]),
+                "seed_word": int(wi[o[int(sel.idx[j])]]) if wi is not None else None,
+                "s1_dt": int(sel.s1_dt[j]) if has else None, "rf_na": not has,
+                "odd": [f for f in W.FILTERS if int(sel.odd[j]) & W.FILTER_BITS[f]],
+            })
+        return out
 
     # -- commands ----------------------------------------------------------------
 
@@ -1740,8 +2555,12 @@ class SmaPlugin:
 
         * summary: ``{"run_active": bool}`` -- the page knows the run state;
         * trend: ``{"since": unix_s}`` -- only rows after it, for incremental polls;
-        * frame: ``{"view": "seeded"|"raster", "drop": [ch...], "max_hits": N}``;
-          no frame yet gives ``json {"no_frame": true}``.
+        * frame: ``{"view": "seeded"|"raster", "drop": [ch...], "max_hits": N,
+          "words": bool, "seq": N, "pixels": bool}``, and for the seeded view
+          ``"seed": "s1" | "ch<N>" | "any"``, ``"filters": ["incomplete",
+          "mismatch", "tot", "rf"]``, ``"mupix": "any" | "both" | "either" |
+          "none"`` and ``"pattern": {"1": "present", "3": "absent"}`` (see
+          `frame_blob`); no frame yet gives ``json {"no_frame": true}``.
         """
         return {"sma::summary": self._cmd_summary, "sma::trend": self._cmd_trend,
                 "sma::frame": self._cmd_frame, "sma::raw": self._cmd_raw}
@@ -1776,7 +2595,10 @@ class SmaPlugin:
         seq = a.get("seq")
         blob = self.frame_blob(str(a.get("view", "seeded")), a.get("drop") or (),
                                a.get("max_hits"), a.get("words"),
-                               None if seq is None else int(seq))
+                               None if seq is None else int(seq),
+                               seed=a.get("seed"), filters=a.get("filters"),
+                               mupix=a.get("mupix"), pixels=a.get("pixels"),
+                               pattern=a.get("pattern"))
         if blob is None:
             if seq is not None:
                 return framing.envelope(framing.TAG_ERROR, (f"frame {int(seq)} no longer held — use the tag").encode())
@@ -1814,6 +2636,12 @@ class SmaPlugin:
             "raw_ring": {"frames": len(self._raw), "bytes": self._raw_bytes,
                          "limit_bytes": self.cfg.raw_ring_bytes,
                          "oldest_seq": next(iter(self._raw), None), "not_kept": self.raw_not_kept},
+            "seed_ring": {"frames": len(self._ring), "bytes": self._ring_bytes,
+                          "limit_frames": self.cfg.seed_ring_frames,
+                          "limit_bytes": self.cfg.seed_ring_bytes,
+                          "oldest_seq": self._ring[0].seq if self._ring else None,
+                          "selections_cached": len(self._sel_cache),
+                          "frames_cached": len(self._frame_cache)},
             "coarse_shift": self.cfg.shift,
             "rebuilds": self.rebuilds,
             "settings_errors": list(self.cfg.errors),
@@ -1828,6 +2656,10 @@ class SmaPlugin:
 # ---------------------------------------------------------------------------
 # helpers
 # ---------------------------------------------------------------------------
+
+#: No hits at all: what a non-good frame is searched as (it has no seeds).
+_EMPTY_FRAME = W.prepare_frame(np.zeros(0, dtype="<u8"))
+
 
 def _json_default(o):
     if isinstance(o, np.integer):
@@ -1844,11 +2676,15 @@ def _merge_seconds(secs: list[_Second]) -> _Second:
     for s in secs:
         for a in ("frames", "offered", "stale", "empty", "suspect", "span_ns", "cover_ns",
                   "delta_ns", "live_ns", "n_s1", "n_s1_kept", "rf_valid", "rf_vetoed",
-                  "oversize"):
+                  "oversize", "mp_frames", "mp_pix", "mp_examined", "mp_skipped", "mp_n",
+                  "mp_rows", "mp_unsorted"):
             setattr(out, a, getattr(out, a) + getattr(s, a))
         out.hits += s.hits
         out.rate_hits += s.rate_hits
         out.mismatch += s.mismatch
+        out.mp_in += s.mp_in
+        out.mp_side += s.mp_side
+        out.mp_chip += s.mp_chip
         if s.eff.size == out.eff.size:
             out.eff += s.eff
     return out
@@ -1888,6 +2724,13 @@ def _fill_value(h: Hist1D, value) -> None:
 def _fill_index(h: Hist1D, i: int) -> None:
     h.counts[i] += np.uint64(1)
     h.entries += 1
+
+
+def _fill_1d_index(h: Hist1D, i) -> None:
+    """Fill from full bin indices (0 underflow .. n+1 overflow), clipped."""
+    i = np.clip(np.asarray(i, dtype=np.intp).ravel(), 0, h.x.n + 1)
+    if i.size:
+        h.add_counts(np.bincount(i, minlength=h.x.n + 2), entries=i.size)
 
 
 def _fill_2d_index(h: Hist2D, ix, iy) -> None:

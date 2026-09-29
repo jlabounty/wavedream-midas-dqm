@@ -439,6 +439,31 @@ def decode_scope_frame(payload: bytes) -> dict:
 # (``{"words": true}``): 19 instead of 7 bytes a hit is +170 %, 0.6 MB instead
 # of 0.23 MB for a 40000-word frame at 2 Hz, so the page asks for it once, for a
 # frozen frame.
+#
+# The pixel block (header flag SMAF_PIXELS) carries the frame's MuPix pixel hits
+# after the trigger-hit arrays, in either version. It is an addition at the end
+# that the version byte does not announce, so a v1/v2 decoder that knows nothing
+# of it reads the same trigger hits and ignores the tail. P is the end of the
+# hit arrays rounded up to a multiple of 8::
+#
+#     P       u32 n_pix       m
+#     P + 4   u16 pix_shift   kp: a pixel's time is meta["mupix"]["t0_ns"] + t * 2^kp
+#     P + 6   u8  block version = 1
+#     P + 7   u8  block flags  PIXB_WORDS: raw words and word indices follow
+#     Q = P + 8
+#     without words                    with words (PIXB_WORDS)
+#     Q        u32 t_rel[m]            Q         u64 raw_word[m]
+#     Q + 4m   u8  chip[m]             Q + 8m    u32 t_rel[m]
+#     Q + 5m   u8  col[m]              Q + 12m   u32 word_index[m]
+#     Q + 6m   u8  row[m]              Q + 16m   u8 chip, col, row, tot, flags [m each]
+#     Q + 7m   u8  tot[m]
+#     Q + 8m   u8  pix_flags[m]
+#     9 bytes a pixel hit              21 bytes a pixel hit
+#
+# ``tot`` is the real ToT (0-31, meta["mupix"]["tot_ns"] ns a count), not the
+# raw TS2 field. ``pix_flags``: bits 1:0 the plane (PIX_PLANE_MASK: 0 none, 1
+# L1, 2 L2), PIX_OFF_SENSOR (row >= 250), PIX_IN_SEED. t_rel ascending. The
+# pixel words carry the same word indices as the trigger words (one bank).
 
 SMAF_HEADER = struct.Struct("<BBHIQIIQ")
 """32 bytes: version, flags, timeShift, nHits, frameSeq, run, jsonLen, reserved."""
@@ -452,6 +477,18 @@ SMAF_STALE = 1 << 1         # the frame was classified stale (replayed/old buffe
 SMAF_TRUNCATED = 1 << 2     # more hits than max_hits; the latest ones were kept
 SMAF_SUSPECT = 1 << 3       # no usable time base (most hits outside the time clusters)
 SMAF_WORDS = 1 << 4         # v2: raw words and word indices follow (see above)
+SMAF_PIXELS = 1 << 5        # a MuPix pixel block follows the hit arrays (see above)
+
+#: Pixel block flags and version.
+PIXB_VERSION = 1
+PIXB_WORDS = 1 << 0
+PIXB_HEADER = struct.Struct("<IHBB")
+"""8 bytes: n_pix, pix_shift, block version, block flags."""
+
+#: Per-pixel flag bits.
+PIX_PLANE_MASK = 0x3        # bits 1:0: 0 no plane, 1 L1, 2 L2
+PIX_OFF_SENSOR = 1 << 2     # row >= 250: not a row of the sensor
+PIX_IN_SEED = 1 << 3        # inside at least one seed window
 
 #: Per-hit flag bits.
 HIT_MISMATCH = 1 << 0       # fine and coarse disagree beyond one coarse tick + margin
@@ -477,11 +514,14 @@ def encode_sma_frame(
     time_shift: int = 0,
     raw_words=None,
     word_index=None,
+    pixels: dict | None = None,
 ) -> bytes:
     """Encode one SMA frame; the arrays must all have the same length.
 
     With `raw_words` and `word_index` (both or neither) the payload is version
-    2 (`SMAF_WORDS`), else version 1.
+    2 (`SMAF_WORDS`), else version 1. `pixels`: the pixel block, ``{t_rel,
+    time_shift, chip, col, row, tot, flags}`` and optionally ``raw_words`` and
+    ``word_index`` (both or neither), all of one length (`SMAF_PIXELS`).
 
     `meta` must be JSON-serialisable without NaN (JavaScript's ``JSON.parse``
     rejects the ``NaN`` Python would write); the plugin maps NaN to null.
@@ -509,7 +549,7 @@ def encode_sma_frame(
         raise ValueError(f"time_shift must be 0..32, got {time_shift}")
     flags = ((SMAF_SEEDED if seeded else 0) | (SMAF_STALE if stale else 0)
              | (SMAF_TRUNCATED if truncated else 0) | (SMAF_SUSPECT if suspect else 0)
-             | (SMAF_WORDS if words else 0))
+             | (SMAF_WORDS if words else 0) | (SMAF_PIXELS if pixels is not None else 0))
     version = SMAF_VERSION_WORDS if words else SMAF_VERSION
     buf = bytearray(SMAF_HEADER.pack(version, flags, int(time_shift), n, int(frame_seq),
                                      int(run_number) & 0xFFFFFFFF, len(blob), 0))
@@ -524,6 +564,128 @@ def encode_sma_frame(
     buf.extend(c.tobytes())
     buf.extend(k.tobytes())
     buf.extend(f.tobytes())
+    if pixels is not None:
+        _align(buf, 8)
+        buf.extend(_pixel_block(pixels))
+    return bytes(buf)
+
+
+def _pixel_block(px: dict) -> bytes:
+    t = np.ascontiguousarray(px["t_rel"], dtype="<u4")
+    m = t.size
+    cols = [np.ascontiguousarray(px[k], dtype=np.uint8) for k in ("chip", "col", "row", "tot",
+                                                                   "flags")]
+    if any(x.size != m for x in cols):
+        raise ValueError(f"pixel arrays differ in length: {m}, {[x.size for x in cols]}")
+    has_rw, has_wi = px.get("raw_words") is not None, px.get("word_index") is not None
+    if has_rw != has_wi:
+        raise ValueError("pixel raw_words and word_index go together")
+    shift = int(px.get("time_shift", 0))
+    if not 0 <= shift <= 32:
+        raise ValueError(f"pixel time_shift must be 0..32, got {shift}")
+    out = bytearray(PIXB_HEADER.pack(m, shift, PIXB_VERSION, PIXB_WORDS if has_rw else 0))
+    if has_rw:
+        rw = np.ascontiguousarray(px["raw_words"], dtype="<u8")
+        wi = np.ascontiguousarray(px["word_index"], dtype="<u4")
+        if not rw.size == wi.size == m:
+            raise ValueError(f"pixel word arrays differ in length: {m}, {rw.size}, {wi.size}")
+        out.extend(rw.tobytes())
+        out.extend(t.tobytes())
+        out.extend(wi.tobytes())
+    else:
+        out.extend(t.tobytes())
+    for x in cols:
+        out.extend(x.tobytes())
+    return bytes(out)
+
+
+def _pixel_block_offset(payload: bytes) -> tuple[int, int] | None:
+    """``(start of the pixel block, end of the hit arrays)``; None without a block."""
+    (version, flags, _ts, n, _seq, _run, json_len, _r) = SMAF_HEADER.unpack_from(payload, 0)
+    if not flags & SMAF_PIXELS:
+        return None
+    off = SMAF_HEADER.size + json_len
+    off += (-off) % 8
+    end = off + (19 if version == SMAF_VERSION_WORDS else 7) * n
+    return end + (-end) % 8, end
+
+
+def smaf_drop_pixels(payload: bytes) -> bytes:
+    """`payload` without its pixel block: the flag cleared and the block cut off.
+
+    With the ``mupix`` meta key dropped too (``smaf_drop_meta``), a payload made
+    with pixels is byte for byte the one made without.
+    """
+    at = _pixel_block_offset(payload)
+    if at is None:
+        return bytes(payload)
+    buf = bytearray(payload[:at[1]])
+    buf[1] &= ~SMAF_PIXELS & 0xFF
+    return bytes(buf)
+
+
+def decode_pixel_block(payload: bytes, at: int) -> dict:
+    """The pixel block at payload offset `at` (a Python mirror of the page's decoder)."""
+    if len(payload) < at + PIXB_HEADER.size:
+        raise ValueError(f"short smaf payload: no room for the pixel block at {at}")
+    m, shift, version, bflags = PIXB_HEADER.unpack_from(payload, at)
+    if version != PIXB_VERSION:
+        raise ValueError(f"unknown smaf pixel block version {version}")
+    words = bool(bflags & PIXB_WORDS)
+    q = at + PIXB_HEADER.size
+    need = (21 if words else 9) * m
+    if len(payload) < q + need:
+        raise ValueError(f"short smaf pixel block: {len(payload) - q} bytes for {m} pixel hits")
+    rw = wi = None
+    if words:
+        rw = np.frombuffer(payload, dtype="<u8", count=m, offset=q)
+        t = np.frombuffer(payload, dtype="<u4", count=m, offset=q + 8 * m)
+        wi = np.frombuffer(payload, dtype="<u4", count=m, offset=q + 12 * m)
+        b0 = q + 16 * m
+    else:
+        t = np.frombuffer(payload, dtype="<u4", count=m, offset=q)
+        b0 = q + 4 * m
+    cols = {k: np.frombuffer(payload, dtype=np.uint8, count=m, offset=b0 + j * m)
+            for j, k in enumerate(("chip", "col", "row", "tot", "flags"))}
+    return {"n": m, "time_shift": shift, "offset": at, "words": words, "t_rel": t,
+            "raw_words": rw, "word_index": wi, **cols}
+
+
+def smaf_update_meta(payload: bytes, extra: dict) -> bytes:
+    """`payload` with `extra` merged into its JSON metadata; the hit arrays untouched.
+
+    The binary layout is unchanged: only ``json_len`` and the NUL padding move,
+    and the arrays are copied as they are. New keys go after the existing ones,
+    so ``smaf_update_meta(smaf_update_meta(p, {"k": v}), {})`` with "k" removed
+    again gives back `p` byte for byte (see ``smaf_drop_meta``). Used for what
+    changes per request (the seeded view's staleness) on a payload encoded once.
+    """
+    return _smaf_rewrite_meta(payload, lambda meta: meta.update(extra))
+
+
+def smaf_drop_meta(payload: bytes, keys) -> bytes:
+    """`payload` without the metadata `keys` (the inverse of `smaf_update_meta`)."""
+    def drop(meta):
+        for k in keys:
+            meta.pop(k, None)
+    return _smaf_rewrite_meta(payload, drop)
+
+
+def _smaf_rewrite_meta(payload: bytes, edit) -> bytes:
+    import json
+
+    head = SMAF_HEADER.unpack_from(payload, 0)
+    json_len = head[6]
+    off = SMAF_HEADER.size
+    meta = json.loads(bytes(payload[off:off + json_len]).decode())
+    arrays = off + json_len
+    arrays += (-arrays) % 8
+    edit(meta)
+    blob = json.dumps(meta, separators=(",", ":"), allow_nan=False).encode()
+    buf = bytearray(SMAF_HEADER.pack(*head[:6], len(blob), head[7]))
+    buf.extend(blob)
+    _align(buf, 8)
+    buf.extend(memoryview(payload)[arrays:])
     return bytes(buf)
 
 
@@ -559,6 +721,10 @@ def decode_sma_frame(payload: bytes) -> dict:
     c = np.frombuffer(payload, dtype=np.uint8, count=n, offset=b0)
     k = np.frombuffer(payload, dtype=np.uint8, count=n, offset=b0 + n)
     f = np.frombuffer(payload, dtype=np.uint8, count=n, offset=b0 + 2 * n)
+    pix = None
+    if flags & SMAF_PIXELS:
+        end = b0 + 3 * n
+        pix = decode_pixel_block(payload, end + (-end) % 8)
     return {
         "version": version, "flags": flags, "n_hits": n, "frame_seq": frame_seq,
         "run_number": run_number, "json_len": json_len, "arrays_offset": off,
@@ -566,5 +732,5 @@ def decode_sma_frame(payload: bytes) -> dict:
         "truncated": bool(flags & SMAF_TRUNCATED),
         "suspect": bool(flags & SMAF_SUSPECT), "time_shift": time_shift,
         "meta": meta, "t_rel_ns": t, "ch": c, "tot": k, "hit_flags": f,
-        "words": words, "raw_words": rw, "word_index": wi,
+        "words": words, "raw_words": rw, "word_index": wi, "pixels": pix,
     }

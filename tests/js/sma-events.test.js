@@ -12,7 +12,7 @@ const assert = require("node:assert");
 const fs = require("node:fs");
 const path = require("node:path");
 
-const { runPage } = require("./domstub.js");
+const { El, runPage } = require("./domstub.js");
 
 const PAGES = path.join(__dirname, "..", "..", "pages", "js");
 globalThis.DQM = require(path.join(PAGES, "dqm-common.js"));
@@ -129,6 +129,55 @@ test("the seeded view draws one panel per seed, with lanes and a pattern", async
   assert.strictEqual(byId(page, "dqm-smaev-seq").textContent, `frame seq ${SEEDED.frameSeq}`);
 });
 
+test("the tab strip is a tablist: aria-selected follows the tab, arrows move it", async () => {
+  const page = await boot();
+  const tab = (id) => byId(page, `dqm-smaev-tab-${id}`);
+  const strip = tab("seeded").parent;
+  assert.strictEqual(strip.getAttribute("role"), "tablist");
+  for (const id of ["dqm-smaev-freeze", "dqm-smaev-single", "dqm-smaev-rate"]) {
+    assert.ok(!strip.find((e) => e.id === id), `${id} is not in the tab strip`);
+  }
+  for (const id of ["seeded", "raster"]) {
+    assert.strictEqual(tab(id).getAttribute("role"), "tab");
+    assert.strictEqual(tab(id).getAttribute("aria-controls"), `dqm-smaev-pane-${id}`);
+    assert.strictEqual(byId(page, `dqm-smaev-pane-${id}`).getAttribute("role"), "tabpanel");
+  }
+  // The Freeze and Single buttons stay midas buttons.
+  assert.ok(byId(page, "dqm-smaev-freeze").classList.contains("mbutton"));
+  assert.ok(byId(page, "dqm-smaev-single").classList.contains("mbutton"));
+  const sel = () => ["seeded", "raster"].map((id) => tab(id).getAttribute("aria-selected"));
+  assert.deepStrictEqual(sel(), ["true", "false"]);
+  assert.strictEqual(tab("seeded").getAttribute("tabindex"), "0");
+  assert.strictEqual(tab("raster").getAttribute("tabindex"), "-1");
+
+  const key = (k) => strip.dispatch("keydown", { key: k, preventDefault() {} });
+  let mark = page.an.calls.length;
+  key("ArrowRight");
+  await settle(page);
+  assert.deepStrictEqual(sel(), ["false", "true"]);
+  assert.strictEqual(El.focused, tab("raster"));
+  assert.strictEqual(byId(page, "dqm-smaev-pane-seeded").style.display, "none");
+  let asks = frameCalls(page, mark);
+  assert.ok(asks.length > 0 && asks.every((a) => a.view !== "seeded"),
+            `only the raster is asked for: ${JSON.stringify(asks.map((a) => a.view))}`);
+
+  key("ArrowRight");                                   // wraps
+  await settle(page);
+  assert.deepStrictEqual(sel(), ["true", "false"]);
+  key("ArrowLeft");
+  assert.deepStrictEqual(sel(), ["false", "true"]);
+  key("Home");
+  assert.deepStrictEqual(sel(), ["true", "false"]);
+  mark = page.an.calls.length;
+  await settle(page);
+  asks = frameCalls(page, mark);
+  assert.ok(asks.length > 0 && asks.every((a) => a.view === "seeded"), "back to the seeded view only");
+
+  tab("raster").onclick();
+  assert.deepStrictEqual(sel(), ["false", "true"], "a click selects too");
+  assert.strictEqual(JSON.parse(globalThis.localStorage._d["dqm-sma-events-settings"]).tab, "raster");
+});
+
 test("mismatched and ToT-corrupt hits get badges and their own marks", async () => {
   // The stored frame's seeds happen to hold no corrupt word, so three hits of
   // the first seed are flagged in the bytes the analyzer "sends".
@@ -203,10 +252,25 @@ test("the raster decodes and draws the frame, header and per-channel counts", as
   assert.ok(texts.includes(`${per[7].toLocaleString()} (hidden)`),
     "the hidden channel still reports its count");
   assert.ok(texts.includes(per[1].toLocaleString()), "S1's count at the right edge");
-  // Every hit went into a rect, bucketed by ToT colour into a few fills.
-  assert.strictEqual(ctx.count("rect"), RASTER.nHits, "one rect per hit");
-  assert.ok(ctx.count("fill") < 40, "one fill per colour bucket, not per hit");
-  assert.ok(byId(page, "dqm-smaev-pane-raster").byClass("dqm-sma-ramp").length === 1, "ToT legend");
+  // Every hit went into a rect, bucketed by ToT colour into a few fills: the
+  // SMA hits, then the MuPix pixel hits on their two rows.
+  assert.ok(RASTER.pixels && RASTER.pixels.n > 100, "the fixture raster carries pixel hits");
+  // (A pixel hit before the frame's first kept SMA hit is off the axis.)
+  const mp = RASTER.meta.mupix;
+  let nPix = 0;
+  for (let j = 0; j < RASTER.pixels.n; j++) {
+    if (mp.t0_ns - RASTER.meta.frame_first_ns + RASTER.pixels.t[j] >= 0) nPix++;
+  }
+  assert.ok(nPix > 100 && nPix <= RASTER.pixels.n);
+  assert.strictEqual(ctx.count("rect"), RASTER.nHits + nPix, "one rect per hit");
+  assert.ok(ctx.count("fill") < 40 + 32, "one fill per colour bucket, not per hit");
+  assert.strictEqual(byId(page, "dqm-smaev-pane-raster").byClass("dqm-sma-ramp").length, 2,
+                     "the SMA ToT legend and the MuPix ToT legend");
+  // The MuPix rows under the 16 channels, with their plane totals at the right.
+  assert.ok(texts.includes("MuPix L1") && texts.includes("MuPix L2"), texts.join(","));
+  assert.ok(texts.includes(mp.per_plane[1].toLocaleString()), "L1's pixel count");
+  assert.ok(!texts.includes("no plane"), "no third row without an unmapped chip");
+  assert.ok(/MuPix \d+ hits: L1 \d+ · L2 \d+/.test(head), head);
 });
 
 test("a suspect frame says so, with its rescued hits, on a frame-start axis", async () => {
@@ -287,9 +351,10 @@ test("a drag released outside the canvas still ends, and zooms", async () => {
   canvas.dispatch("mousemove", { clientX: 500 });           // no button held any more
   assert.strictEqual(ctx.ops.slice(mark).filter((o) => o[2] === selection).length, 0,
     "no selection is drawn after the release");
-  // Tick labels are the texts below the 16 rows (y > 6 + 16 * 22).
+  // Tick labels are the texts below the 16 channel rows and the 2 MuPix rows.
+  const rows = 16 + 2;
   const ticks = () => lastPaint(ctx).ops
-    .filter((o) => o[0] === "fillText" && o[1][2] > 6 + 16 * 22 && o[1][2] < 6 + 16 * 22 + 12)
+    .filter((o) => o[0] === "fillText" && o[1][2] > 6 + rows * 22 && o[1][2] < 6 + rows * 22 + 12)
     .map((o) => Number(o[1][0]));
   const zoomed = ticks();
   assert.ok(zoomed.length > 2 && zoomed[0] > 0, `zoomed away from the frame start: ${zoomed}`);
@@ -921,9 +986,12 @@ test("Copy seed words copies the tag, the S1 word, the window's range and every 
   assert.ok(seed.word_range && Number.isInteger(seed.s1_word), "the fixture seed carries words");
   const [a, b] = seed.hits;
   const words = Array.from(SEEDED.wordIndex.slice(a, b)).sort((x, y) => x - y);
+  const [pa, pb] = SEEDED.meta.mupix.seeds[1].pix;
+  const pwords = Array.from(SEEDED.pixels.wordIndex.slice(pa, pb)).sort((x, y) => x - y);
+  assert.ok(pwords.length > 0, "the fixture seed has MuPix hits");
   const want = `${SEEDED.meta.tag} · seed 2: S1 word ${seed.s1_word} · ` +
                `words ${seed.word_range[0]}–${seed.word_range[1]} (${b - a} hits in window) · ` +
-               `hit words ${words.join(", ")}`;
+               `hit words ${words.join(", ")} · MuPix pixel words ${pwords.join(", ")}`;
   const panel = byId(page, "dqm-smaev-seeds").byClass("dqm-sma-seed")[1];
   assert.ok(panel.textContent.includes(`words ${seed.word_range[0]}–${seed.word_range[1]}`), "a badge");
   const btn = panel.byClass("dqm-smaev-copyseed")[0];
@@ -1265,4 +1333,569 @@ test("without sessionStorage the page still tags", async () => {
   const [h] = clickableSeedHits(page, 0);
   h.canvas.dispatch("click", h.ev);
   assert.strictEqual(taggedRows(page).length, 1);
+});
+
+// -- seed choice, filters, the staleness banner --------------------------------------
+
+const D = (name) => SMAF.decode(new Uint8Array(Buffer.from(FX[name], "hex")));
+const STALE = D("seeded_stale");
+const NOMATCH = D("seeded_nomatch");
+const ANY_NOS1 = D("seeded_any_nos1");
+const FILTERED = D("seeded_filtered");
+
+/** An analyzer answering the seeded view with a fixture chosen by the request args. */
+function seededBy(pick) {
+  return {
+    "sma::frame": (args) => {
+      const a = JSON.parse(args || "{}");
+      if (a.view === "raster") return envelope("smaf", Buffer.from(FX.raster, "hex"));
+      return envelope("smaf", Buffer.from(FX[pick(a)], "hex"));
+    },
+  };
+}
+
+const session = (d) => ({ _d: d || {}, getItem(k) { return this._d[k] || null; },
+                          setItem(k, v) { this._d[k] = v; } });
+const banner = (page) => byId(page, "dqm-smaev-banner");
+const ageText = (x) => (x < 10 ? `${x.toFixed(1)} s` : `${Math.round(x)} s`);
+
+test("the seeded fixtures carry what the page is tested on", () => {
+  assert.ok(STALE.meta.stale_view && STALE.meta.stale_view.good_since === 12);
+  assert.ok(NOMATCH.meta.search.no_match && NOMATCH.meta.seeds.length === 0);
+  assert.ok(ANY_NOS1.meta.seeds.every((s) => s.rf_na && s.seed_ch !== 1));
+  assert.ok(FILTERED.meta.select && FILTERED.meta.seeds.every((s) => s.odd.length));
+  assert.ok(!SEEDED.meta.stale_view && !SEEDED.meta.select, "the default frame is as before");
+});
+
+test("the default request sends seed s1 and no filters; the dropdown lists the roles", async () => {
+  const page = await boot();
+  for (const a of frameCalls(page)) {
+    assert.strictEqual(a.seed, "s1");
+    assert.deepStrictEqual(a.filters, []);
+  }
+  const sel = byId(page, "dqm-smaev-seedsel");
+  assert.strictEqual(sel.value, "s1");
+  const opts = sel.byTag("option").map((o) => [o.getAttribute("value"), o.textContent]);
+  assert.deepStrictEqual(opts.map((o) => o[0]), ["s1", "ch2", "ch3", "ch4", "ch5", "ch8", "ch9", "ch10", "any"]);
+  assert.strictEqual(opts[0][1], "S1 (default)");
+  assert.strictEqual(opts[1][1], "S2 (ch 2)");
+  assert.ok(!opts.some((o) => o[0] === "ch6" || o[0] === "ch7"), "no RF, no current");
+  assert.strictEqual(byId(page, "dqm-smaev-tab-seeded").textContent, "S1-seeded events");
+  assert.strictEqual(banner(page).style.display, "none", "a fresh frame has no banner");
+});
+
+test("choosing a seed and filters asks at once with them, and they persist per viewer", async () => {
+  const ss = session();
+  const page = await boot(seededBy((a) => (a.seed === "any" ? "seeded_any" : "seeded")),
+                          undefined, undefined, { session: ss });
+  const sel = byId(page, "dqm-smaev-seedsel");
+  let mark = page.an.calls.length;
+  sel.value = "any";
+  sel.onchange.call(sel);
+  await settle(page);
+  let asks = frameCalls(page, mark);
+  assert.ok(asks.length > 0 && asks.every((a) => a.seed === "any"), JSON.stringify(asks));
+  assert.strictEqual(byId(page, "dqm-smaev-tab-seeded").textContent, "Seeded events: any counter");
+  const head = byId(page, "dqm-smaev-seededhead").textContent;
+  const m = D("seeded_any").meta.select;
+  assert.ok(head.includes(`matching seeds: ${m.matching.toLocaleString()} of ${m.candidates.toLocaleString()} ` +
+                          `candidates in frame seq ${D("seeded_any").frameSeq}`), head);
+
+  mark = page.an.calls.length;
+  for (const name of ["rf", "tot"]) {
+    const box = byId(page, `dqm-smaev-filter-${name}`);
+    box.checked = true;
+    box.onchange.call(box);
+  }
+  await settle(page);
+  asks = frameCalls(page, mark);
+  assert.deepStrictEqual(asks[asks.length - 1].filters, ["tot", "rf"], "in the analyzer's order");
+  assert.deepStrictEqual(JSON.parse(ss._d["dqm-sma-events-seed"]),
+                         { seed: "any", filters: ["tot", "rf"], mupix: "any", pattern: {} });
+
+  // A reload in the same tab keeps the choice.
+  const again = await boot(undefined, undefined, undefined, { session: ss });
+  const first = frameCalls(again)[0];
+  assert.strictEqual(first.seed, "any");
+  assert.deepStrictEqual(first.filters, ["tot", "rf"]);
+  assert.strictEqual(byId(again, "dqm-smaev-seedsel").value, "any");
+  assert.ok(byId(again, "dqm-smaev-filter-tot").checked && byId(again, "dqm-smaev-filter-rf").checked);
+  assert.ok(!byId(again, "dqm-smaev-filter-mismatch").checked);
+});
+
+test("a stored choice that is garbage falls back to S1, and no storage is fine", async () => {
+  const page = await boot(undefined, undefined, undefined,
+                          { session: session({ "dqm-sma-events-seed": '{"seed":"x;y","filters":["odd","tot"]}' }) });
+  const a = frameCalls(page)[0];
+  assert.strictEqual(a.seed, "s1");
+  assert.deepStrictEqual(a.filters, ["tot"]);
+  const broken = { getItem() { throw new Error("SecurityError"); }, setItem() { throw new Error("SecurityError"); } };
+  const p2 = await boot(undefined, undefined, undefined, { session: broken });
+  const box = byId(p2, "dqm-smaev-filter-mismatch");
+  box.checked = true;
+  box.onchange.call(box);
+  await settle(p2);
+  assert.deepStrictEqual(frameCalls(p2).pop().filters, ["mismatch"]);
+});
+
+test("a stale frame gets the banner, a fresh one hides it", async () => {
+  let pick = "seeded_stale";
+  const page = await boot(seededBy(() => pick));
+  const b = banner(page);
+  const sv = STALE.meta.stale_view;
+  assert.notStrictEqual(b.style.display, "none");
+  assert.ok(b.classList.contains("yellow"));
+  assert.strictEqual(b.textContent,
+    `Showing frame seq ${sv.shown_seq} from ${ageText(sv.age_s)} ago: no S1 hits in the 12 good ` +
+    `frames analysed since (newest seq ${sv.newest_seq}).`);
+  pick = "seeded";
+  await settle(page);
+  assert.strictEqual(b.style.display, "none");
+  assert.strictEqual(b.textContent, "");
+});
+
+test("a walked-back frame whose raw event is gone says so in the banner", async () => {
+  const raw = withMeta(FX.seeded_stale, (m) => { m.raw_held = false; });
+  const page = await boot({ "sma::frame": () => envelope("smaf", raw) });
+  assert.ok(/raw event is no longer held: use the tag/.test(banner(page).textContent));
+  assert.ok(byId(page, "dqm-smaev-download-seeded").disabled);
+});
+
+test("no match is its own state: a red banner, no panels, 0 matching", async () => {
+  const page = await boot(seededBy(() => "seeded_nomatch"));
+  const b = banner(page);
+  const nm = NOMATCH.meta.search.no_match;
+  assert.ok(b.classList.contains("red"));
+  assert.ok(b.textContent.startsWith(`No match: ${nm.text} (${ageText(nm.span_s)}). Showing the newest ` +
+                                     `analysed frame, seq ${NOMATCH.frameSeq}`), b.textContent);
+  assert.strictEqual(byId(page, "dqm-smaev-seeds").byClass("dqm-sma-seed").length, 0);
+  assert.ok(/matching seeds: 0 of/.test(byId(page, "dqm-smaev-seededhead").textContent));
+  assert.strictEqual(byId(page, "dqm-smaev-note-seeded").textContent, "", "the banner says it, once");
+  // The tag bar still works on the frame shown.
+  assert.strictEqual(byId(page, "dqm-smaev-tag-seeded").textContent, NOMATCH.meta.tag);
+});
+
+test("a seed without S1 names its channel, says RF n/a, and copies its own word", async () => {
+  const page = await boot(seededBy(() => "seeded_any_nos1"));
+  const panels = byId(page, "dqm-smaev-seeds").byClass("dqm-sma-seed");
+  assert.strictEqual(panels.length, ANY_NOS1.meta.seeds.length);
+  const s0 = ANY_NOS1.meta.seeds[0];
+  const lab = ANY_NOS1.meta.labels[s0.seed_ch];
+  const title = panels[0].byClass("dqm-sma-seedtitle")[0].textContent;
+  assert.ok(title.startsWith(`seed 1: ${lab} (ch ${s0.seed_ch}) at `) && title.endsWith(`ToT ${s0.seed_tot}`), title);
+  assert.ok(panels[0].textContent.includes("RF n/a (no S1)"));
+  assert.ok(panels[0].textContent.includes("odd: incomplete pattern"));
+  assert.ok(!panels[0].byClass("lit").some((b) => b.textContent === "S1"), "S1 not lit");
+  assert.ok(lastPaint(panels[0].byTag("canvas")[0].getContext("2d")).texts().includes("ns from the seed"));
+  const btn = panels[0].byClass("dqm-smaev-copyseed")[0];
+  btn.onclick();
+  await drain();
+  assert.ok(page.copied[0].includes(`seed 1: ${lab} word ${s0.seed_word} · S1 word —`), page.copied[0]);
+});
+
+test("filtered seeds show which oddity they have", async () => {
+  const page = await boot(seededBy(() => "seeded_filtered"));
+  const panels = byId(page, "dqm-smaev-seeds").byClass("dqm-sma-seed");
+  assert.strictEqual(panels.length, FILTERED.meta.seeds.length);
+  FILTERED.meta.seeds.forEach(function (s, k) {
+    assert.ok(/odd: /.test(panels[k].textContent), panels[k].textContent);
+  });
+  const head = byId(page, "dqm-smaev-seededhead").textContent;
+  assert.ok(head.includes("seed: S1 (ch 1) with ToT ≥ 250 or RF not valid / vetoed"), head);
+});
+
+test("Single sends the current seed and filters", async () => {
+  const page = await boot(advancing(), undefined, undefined,
+                          { session: session({ "dqm-sma-events-seed": '{"seed":"ch2","filters":["mismatch"]}' }) });
+  const mark = page.an.calls.length;
+  byId(page, "dqm-smaev-single").onclick();
+  await settle(page, 5);
+  const asks = frameCalls(page, mark);
+  assert.strictEqual(asks.length, 1);
+  assert.strictEqual(asks[0].seed, "ch2");
+  assert.deepStrictEqual(asks[0].filters, ["mismatch"]);
+});
+
+test("changing a filter while frozen re-asks for the frozen frame by its seq", async () => {
+  const page = await boot();
+  byId(page, "dqm-smaev-freeze").onclick();
+  await settle(page);
+  const mark = page.an.calls.length;
+  const box = byId(page, "dqm-smaev-filter-incomplete");
+  box.checked = true;
+  box.onchange.call(box);
+  await settle(page, 5);
+  const asks = frameCalls(page, mark);
+  assert.strictEqual(asks.length, 1, JSON.stringify(asks));
+  assert.strictEqual(asks[0].seq, SEEDED.frameSeq);
+  assert.deepStrictEqual(asks[0].filters, ["incomplete"]);
+  assert.strictEqual(byId(page, "dqm-smaev-live").textContent, "FROZEN", "still frozen");
+});
+
+// -- MuPix: seeded lanes and badges, the selector, raster rows, tagging pixel hits ----------
+
+const IN_TIME_FILL = "rgba(44, 160, 44, 0.16)";
+const MP_BOTH = D("seeded_mupix_both");
+const MP_NONE = D("seeded_mupix_none");
+
+/** The hover line of pixel j, built here from the layout and the spec, not the page. */
+function expectPixelLine(f, j) {
+  const p = f.pixels, mp = f.meta.mupix;
+  const plane = p.flags[j] & 3;
+  const rel = mp.t0_ns - f.meta.t0_ns + p.t[j];
+  const words = p.rawWord
+    ? `word ${p.wordIndex[j]} · 0x${p.rawWord[j].toString(16).padStart(16, "0")}`
+    : "freeze for word index";
+  return `${plane ? `MuPix L${plane} chip ${p.chip[j]}` : `MuPix chip ${p.chip[j]} (no plane)`} · ` +
+         `col ${p.col[j]} · row ${p.row[j]}${p.flags[j] & 4 ? " (not on the sensor)" : ""} · ` +
+         `ToT ${p.tot[j]} (~${mp.tot_ns * p.tot[j]} ns) · t ${f.meta.t0_ns + rel} ns (t_rel ${rel} ns) · ${words}`;
+}
+
+/** The MuPix lanes of a seed canvas, from the labels drawn: {1: lane, 2: lane}. */
+function pixLanes(ctx) {
+  const out = {};
+  for (const o of lastPaint(ctx).ops) {
+    if (o[0] !== "fillText" || o[1][1] !== 84 - 6) continue;
+    const m = /^MuPix L([12])$/.exec(String(o[1][0]));
+    if (m) out[Number(m[1])] = Math.round((o[1][2] - 6 - 10) / 20);
+  }
+  return out;
+}
+
+test("the MuPix fixtures carry what the page is tested on", () => {
+  assert.ok(SEEDED.pixels && SEEDED.pixels.words && SEEDED.pixels.n > 0, "seeded: a pixel block with words");
+  assert.strictEqual(SEEDED.meta.mupix.seeds.length, SEEDED.meta.seeds.length);
+  assert.ok(RASTER.pixels && !RASTER.pixels.words, "the polled raster's pixels have no words");
+  assert.ok(RASTER_WORDS.pixels.words, "the frozen raster's pixels have words");
+  assert.strictEqual(MP_BOTH.meta.select.mupix, "both");
+  assert.ok(MP_BOTH.meta.mupix.seeds.every((s) => s.l1 > 0 && s.l2 > 0));
+  assert.ok(MP_NONE.meta.mupix.seeds.every((s) => s.covered && s.l1 === 0 && s.l2 === 0));
+});
+
+test("every seed panel has MuPix L1 and L2 lanes, one tick per pixel hit, the in-time band and a badge", async () => {
+  const page = await boot();
+  const panels = byId(page, "dqm-smaev-seeds").byClass("dqm-sma-seed");
+  const mps = SEEDED.meta.mupix.seeds;
+  panels.forEach(function (p, k) {
+    const ctx = p.byTag("canvas")[0].getContext("2d");
+    const paint = lastPaint(ctx);
+    const texts = paint.texts();
+    assert.ok(texts.includes("MuPix L1") && texts.includes("MuPix L2"), texts.join(","));
+    assert.strictEqual(paint.count("fillRect", IN_TIME_FILL), 2, "the in-time window on both lanes");
+    const [pa, pb] = mps[k].pix;
+    const ticks = paint.ops.filter((o) => o[0] === "fillRect" && o[1][2] === 2.5);
+    assert.strictEqual(ticks.length, pb - pa, `seed ${k}: a tick per pixel hit`);
+    const lanes = pixLanes(ctx);
+    for (let j = pa; j < pb; j++) {
+      const y = 6 + lanes[SEEDED.pixels.flags[j] & 3] * 20 + 3;
+      assert.ok(ticks.some((o) => o[1][1] === y), `pixel ${j} on its plane's lane`);
+    }
+    const want = mps[k].l1 && mps[k].l2 ? "L1+L2 ✓" : mps[k].l1 ? "L1 ✓" : mps[k].l2 ? "L2 ✓" : "no MuPix in time";
+    const badge = p.byClass("dqm-sma-badge").find((b) => b.textContent === want);
+    assert.ok(badge, `seed ${k}: badge ${want}`);
+    assert.ok(/MuPix hits · words \d+–\d+/.test(p.textContent), "the seed's pixel words");
+  });
+  assert.deepStrictEqual(globalThis.__alerts, []);
+});
+
+test("a seed past the pixel data without a hit says MuPix n/a; with one, a hit is a hit", async () => {
+  const f = withMeta(FX.seeded, (m) => {
+    m.mupix.seeds[0].covered = false; m.mupix.seeds[0].l1 = 0; m.mupix.seeds[0].l2 = 0;
+    m.mupix.seeds[1].l1 = 0; m.mupix.seeds[1].l2 = 0;
+    m.mupix.seeds[2].covered = false; m.mupix.seeds[2].l1 = 1; m.mupix.seeds[2].l2 = 0;
+  });
+  const page = await boot({ "sma::frame": () => envelope("smaf", f) });
+  const panels = byId(page, "dqm-smaev-seeds").byClass("dqm-sma-seed");
+  assert.ok(panels[0].textContent.includes("MuPix n/a (outside the pixel data)"));
+  assert.ok(panels[1].textContent.includes("no MuPix in time"));
+  assert.ok(panels[2].byClass("dqm-sma-badge").some((b) => b.textContent === "L1 ✓"));
+});
+
+test("hovering a MuPix tick shows the pixel hit; a click tags it and Copy all finds its word", async () => {
+  const page = await boot(withRaw());
+  const canvas = byId(page, "dqm-smaev-seeds").byTag("canvas")[0];
+  const ctx = canvas.getContext("2d");
+  const [pa, pb] = SEEDED.meta.mupix.seeds[0].pix;
+  const lanes = pixLanes(ctx);
+  const seed = SEEDED.meta.seeds[0];
+  const X = (t) => 84 + (t + 200) / 3200 * (888 - 84);
+  // A pixel hit alone on its lane within 10 px.
+  let j = -1, ev = null;
+  for (let q = pa; q < pb && j < 0; q++) {
+    const pl = SEEDED.pixels.flags[q] & 3;
+    const x = X(SEEDED.meta.mupix.t0_ns - SEEDED.meta.t0_ns + SEEDED.pixels.t[q] - seed.t_rel);
+    const alone = [...Array(pb - pa).keys()].map((r) => r + pa).every((r) => r === q ||
+      (SEEDED.pixels.flags[r] & 3) !== pl ||
+      Math.abs(X(SEEDED.meta.mupix.t0_ns - SEEDED.meta.t0_ns + SEEDED.pixels.t[r] - seed.t_rel) - x) > 10);
+    if (alone) { j = q; ev = { clientX: x, clientY: 6 + lanes[pl] * 20 + 10 }; }
+  }
+  assert.ok(j >= 0, "an isolated pixel hit in seed 0");
+  const line = expectPixelLine(SEEDED, j);
+  assert.match(line, /^MuPix L[12] chip \d+ · col \d+ · row \d+ · ToT \d+ \(~\d+ ns\) · t \d+ ns \(t_rel -?\d+ ns\) · word \d+ · 0x[0-9a-f]{16}$/);
+  const hover = byId(page, "dqm-smaev-seeds").byClass("dqm-sma-seed")[0].byClass("dqm-smaev-hover")[0];
+  canvas.dispatch("mousemove", ev);
+  assert.strictEqual(hover.textContent, `${line} · ${SEEDED.meta.tag}`);
+  canvas.dispatch("click", ev);
+  const rows = taggedRows(page);
+  assert.strictEqual(rows.length, 1);
+  assert.strictEqual(rowLine(rows[0]), line);
+  assert.strictEqual(lastPaint(ctx).count("strokeRect", "#000"), 1, "the tagged tick is boxed");
+  // With an SMA hit of the same frame: Δt from the first, and the word range spans both.
+  const h = clickableSeedHits(page, 0)[0];
+  h.canvas.dispatch("click", h.ev);
+  const btn = byId(page, "dqm-smaev-tagged-copy");
+  btn.onclick();
+  await drain();
+  const w = [SEEDED.pixels.wordIndex[j], SEEDED.wordIndex[h.i]];
+  const tRelPix = SEEDED.meta.mupix.t0_ns - SEEDED.meta.t0_ns + SEEDED.pixels.t[j];
+  const d = SEEDED.t[h.i] - tRelPix;
+  assert.deepStrictEqual(page.copied, [[
+    SEEDED.meta.tag,
+    `  #1 · ${line}`,
+    `  #2 · ${expectLine(SEEDED, h.i, SEEDED.meta.labels)} · Δt ${d > 0 ? "+" : ""}${d} ns`,
+    `  mdqm-sma-file --serial ${SEEDED.meta.serial} --run 682 --dir <raw dir> --words ${Math.min(...w)}:${Math.max(...w)}`,
+  ].join("\n")]);
+  // Untagged by a second click on it.
+  canvas.dispatch("click", ev);
+  assert.strictEqual(taggedRows(page).length, 1);
+});
+
+test("the MuPix selector: any by default, both asks at once, is AND-ed with the boxes and persists", async () => {
+  const ss = session();
+  const page = await boot(seededBy((a) => (a.mupix === "both" ? "seeded_mupix_both" : "seeded")),
+                          undefined, undefined, { session: ss });
+  assert.strictEqual(frameCalls(page)[0].mupix, "any", "the default is sent explicitly");
+  const sel = byId(page, "dqm-smaev-mupixsel");
+  assert.deepStrictEqual(sel.byTag("option").map((o) => o.textContent),
+                         ["any", "L1+L2 in time", "L1 or L2 in time", "none in time"]);
+  let mark = page.an.calls.length;
+  sel.value = "both";
+  sel.onchange.call(sel);
+  await settle(page);
+  let asks = frameCalls(page, mark);
+  assert.ok(asks.length && asks.every((a) => a.mupix === "both" && a.seed === "s1"), JSON.stringify(asks));
+  const head = byId(page, "dqm-smaev-seededhead").textContent;
+  assert.ok(head.includes("seed: S1 (ch 1) and L1+L2 in time"), head);
+  mark = page.an.calls.length;
+  const box = byId(page, "dqm-smaev-filter-incomplete");
+  box.checked = true;
+  box.onchange.call(box);
+  await settle(page);
+  asks = frameCalls(page, mark);
+  assert.deepStrictEqual([asks[asks.length - 1].filters, asks[asks.length - 1].mupix], [["incomplete"], "both"]);
+  assert.deepStrictEqual(JSON.parse(ss._d["dqm-sma-events-seed"]),
+                         { seed: "s1", filters: ["incomplete"], mupix: "both", pattern: {} });
+  const again = await boot(undefined, undefined, undefined, { session: ss });
+  assert.strictEqual(frameCalls(again)[0].mupix, "both");
+  assert.strictEqual(byId(again, "dqm-smaev-mupixsel").value, "both");
+  const bad = await boot(undefined, undefined, undefined,
+                         { session: session({ "dqm-sma-events-seed": '{"seed":"s1","mupix":"L1"}' }) });
+  assert.strictEqual(frameCalls(bad)[0].mupix, "any", "garbage falls back to any");
+});
+
+test("no match with the MuPix selector keeps its banner", async () => {
+  const nm = withMeta(FX.seeded_nomatch, (m) => { m.select.mupix = "none"; m.select.mupix_label = "no MuPix hit in time"; });
+  const page = await boot({ "sma::frame": () => envelope("smaf", nm) });
+  assert.ok(/^No match/.test(banner(page).textContent), banner(page).textContent);
+  assert.ok(byId(page, "dqm-smaev-seededhead").textContent.includes("and no MuPix hit in time"));
+});
+
+/** The raster frame without its pixel block, as the analyzer sends it with "pixels": false. */
+function rasterWithoutPixels() {
+  const raw = Buffer.from(FX.raster, "hex");
+  const out = Buffer.from(raw.subarray(0, RASTER.offsets.hitFlags + RASTER.nHits));
+  out[1] &= ~SMAF.FLAGS.PIXELS;
+  return withMeta(out.toString("hex"), (m) => { delete m.mupix; });
+}
+
+test("the raster's hide MuPix asks for no pixels, drops the rows and persists", async () => {
+  const bare = rasterWithoutPixels();
+  const page = await boot({
+    "sma::frame": (args) => envelope("smaf", JSON.parse(args).pixels === false ? bare : Buffer.from(FX.raster, "hex")),
+  }, { tab: "raster" });
+  assert.ok(frameCalls(page).every((a) => a.pixels === undefined), "shown by default: nothing extra asked");
+  let texts = lastPaint(byId(page, "dqm-smaev-raster").getContext("2d")).texts();
+  assert.ok(texts.includes("MuPix L1"));
+  const box = byId(page, "dqm-smaev-hidepix");
+  box.checked = true;
+  box.onchange.call(box);
+  const mark = page.an.calls.length;
+  await settle(page);
+  const asks = frameCalls(page, mark);
+  assert.ok(asks.length && asks.every((a) => a.pixels === false && a.drop[0] === 7), JSON.stringify(asks));
+  texts = lastPaint(byId(page, "dqm-smaev-raster").getContext("2d")).texts();
+  assert.ok(!texts.includes("MuPix L1"), "no MuPix rows");
+  assert.strictEqual(JSON.parse(globalThis.localStorage._d["dqm-sma-events-settings"]).hidePixels, true);
+});
+
+test("a pixel hit on the live raster: a click freezes, fetches the words once, and tags it", async () => {
+  const page = await boot(withRaw(), { tab: "raster" });
+  const canvas = byId(page, "dqm-smaev-raster");
+  const f = RASTER, p = RASTER.pixels, mp = RASTER.meta.mupix;
+  const off = f.meta.t0_ns - f.meta.frame_first_ns;
+  const hi = Math.max(f.meta.span_ns / 1e6, (off + f.t[f.nHits - 1]) / 1e6,
+                      (mp.t0_ns - f.meta.frame_first_ns + p.t[p.n - 1]) / 1e6);
+  const X = (j) => 84 + ((mp.t0_ns - f.meta.frame_first_ns + p.t[j]) / 1e6) / hi * (790 - 84) + 0.75;
+  let j = -1;
+  for (let q = 0; q < p.n && j < 0; q++) {
+    if ((p.flags[q] & 3) !== 1 || X(q) < 84) continue;
+    let alone = true;
+    for (let r = 0; r < p.n; r++) if (r !== q && (p.flags[r] & 3) === 1 && Math.abs(X(r) - X(q)) < 10) alone = false;
+    if (alone) j = q;
+  }
+  assert.ok(j >= 0, "an isolated L1 hit on the raster");
+  const ev = { clientX: X(j), clientY: 6 + 16 * 22 + 11 };      // the first row under the 16 channels
+  canvas.dispatch("mousemove", ev);
+  const hover = byId(page, "dqm-smaev-pane-raster").byClass("dqm-smaev-hover")[0];
+  assert.strictEqual(hover.textContent, `${expectPixelLine(RASTER, j)} · ${RASTER.meta.tag}`);
+  canvas.dispatch("mousedown", ev);
+  page.windowEvent("mouseup", ev);
+  assert.strictEqual(byId(page, "dqm-smaev-live").textContent, "FROZEN");
+  await settle(page, 4);
+  const rows = taggedRows(page);
+  assert.strictEqual(rows.length, 1);
+  assert.strictEqual(rowLine(rows[0]), expectPixelLine(RASTER_WORDS, j), "tagged with its word");
+  const paint = lastPaint(canvas.getContext("2d"));
+  assert.ok(paint.count("strokeRect", "#000") >= 1, "boxed on the frozen raster");
+});
+
+// -- the per-counter pattern selector and "incomplete pattern" with faulted counters --------
+
+const PATTERN = D("seeded_pattern");
+const pickPattern = (a) => (a.pattern && Object.keys(a.pattern).length ? "seeded_pattern" : "seeded");
+
+test("the pattern fixture carries what the page is tested on", () => {
+  assert.deepStrictEqual(PATTERN.meta.select.pattern, { 1: "present", 3: "absent" });
+  assert.deepStrictEqual(PATTERN.meta.incomplete.ignored.map((f) => f.counter), [5]);
+  assert.ok(PATTERN.meta.seeds.length && PATTERN.meta.seeds.every((s) => !(s.pattern & 4) && (s.pattern & 1)));
+  assert.deepStrictEqual(FX.summary_1008.timestamp_faults.counters.map((f) => f.counter), [5]);
+});
+
+test("the pattern row: any by default, tri-states ask at once, persist and reload", async () => {
+  const ss = session();
+  const page = await boot(seededBy(pickPattern), undefined, undefined, { session: ss });
+  assert.ok(frameCalls(page).every((a) => JSON.stringify(a.pattern) === "{}"), "the default is sent: {}");
+  const labels = [1, 2, 3, 4, 5].map((k) => byId(page, `dqm-smaev-pattext-${k}`).textContent);
+  assert.deepStrictEqual(labels, ["S1", "S2", "S3", "S4", "S5"]);
+  const s1 = byId(page, "dqm-smaev-pat-1");
+  assert.deepStrictEqual(s1.byTag("option").map((o) => o.getAttribute("value")), ["any", "present", "absent"]);
+  assert.strictEqual(s1.value, "any");
+  let mark = page.an.calls.length;
+  s1.value = "present";
+  s1.onchange.call(s1);
+  const s3 = byId(page, "dqm-smaev-pat-3");
+  s3.value = "absent";
+  s3.onchange.call(s3);
+  await settle(page);
+  let asks = frameCalls(page, mark);
+  assert.deepStrictEqual(asks[asks.length - 1].pattern, { 1: "present", 3: "absent" });
+  assert.strictEqual(asks[asks.length - 1].seed, "s1");
+  assert.deepStrictEqual(JSON.parse(ss._d["dqm-sma-events-seed"]),
+                         { seed: "s1", filters: [], mupix: "any", pattern: { 1: "present", 3: "absent" } });
+  // Back to any: the key goes.
+  mark = page.an.calls.length;
+  s1.value = "any";
+  s1.onchange.call(s1);
+  await settle(page);
+  asks = frameCalls(page, mark);
+  assert.deepStrictEqual(asks[asks.length - 1].pattern, { 3: "absent" });
+  // A reload keeps it; a stored garbage pattern is cleaned.
+  const again = await boot(seededBy(pickPattern), undefined, undefined, { session: ss });
+  assert.deepStrictEqual(frameCalls(again)[0].pattern, { 3: "absent" });
+  assert.strictEqual(byId(again, "dqm-smaev-pat-3").value, "absent");
+  assert.strictEqual(byId(again, "dqm-smaev-pat-1").value, "any");
+  const bad = await boot(undefined, undefined, undefined, { session: session({
+    "dqm-sma-events-seed": '{"seed":"ch2","pattern":{"1":"absent","3":"maybe","9":"present","x":1}}' }) });
+  assert.deepStrictEqual(frameCalls(bad)[0].pattern, { 1: "absent" });
+  assert.strictEqual(frameCalls(bad)[0].seed, "ch2");
+  const arr = await boot(undefined, undefined, undefined, { session: session({
+    "dqm-sma-events-seed": '{"seed":"s1","pattern":["present"]}' }) });
+  assert.deepStrictEqual(frameCalls(arr)[0].pattern, {});
+});
+
+test("the header names the pattern and the counters incomplete ignores; badges agree", async () => {
+  const ss = session({ "dqm-sma-events-seed": JSON.stringify(
+    { seed: "s1", filters: ["incomplete"], mupix: "any", pattern: { 1: "present", 3: "absent" } }) });
+  const page = await boot(Object.assign(seededBy(pickPattern), { "sma::summary": () => json(FX.summary_1008) }),
+                          undefined, undefined, { session: ss });
+  const head = byId(page, "dqm-smaev-seededhead").textContent;
+  assert.ok(head.includes("seed: S1 (ch 1) with incomplete pattern (ignoring S5: timestamp fault 93 %) " +
+                          "and S1 present, S3 absent"), head);
+  const panels = byId(page, "dqm-smaev-seeds").byClass("dqm-sma-seed");
+  assert.strictEqual(panels.length, PATTERN.meta.seeds.length);
+  PATTERN.meta.seeds.forEach(function (s, k) {
+    const t = panels[k].textContent;
+    if (s.odd.indexOf("incomplete") >= 0) assert.ok(t.includes("incomplete pattern (S5 ignored)"), t);
+    const boxes = panels[k].byClass("dqm-sma-pbox");
+    assert.ok(boxes[4].classList.contains("ignored"), "S5 drawn as ignored");
+    assert.ok(!boxes[2].classList.contains("ignored") && !boxes[2].classList.contains("lit"), "S3 absent");
+    assert.ok(boxes[0].classList.contains("lit"), "S1 present");
+  });
+  // Nothing ignored (e.g. the shift is not judged): plain words, no dashed box.
+  const plain = withMeta(FX.seeded_pattern, (m) => {
+    m.incomplete = { judged: true, verdict: "insufficient", ignored: [],
+                     note: "no counter ignored: shift check insufficient",
+                     label: "incomplete pattern (no counter ignored: shift check insufficient)" };
+  });
+  const p2 = await boot({ "sma::frame": () => envelope("smaf", plain) });
+  assert.ok(byId(p2, "dqm-smaev-seededhead").textContent.includes(
+    "with incomplete pattern (no counter ignored: shift check insufficient)"));
+  const pan = byId(p2, "dqm-smaev-seeds").byClass("dqm-sma-seed");
+  assert.ok(pan.every((p) => !p.byClass("ignored").length));
+  assert.ok(pan.every((p) => !p.textContent.includes("ignored)")));
+});
+
+test("incomplete that cannot be judged says so in the header", async () => {
+  const cj = withMeta(FX.seeded_pattern, (m) => {
+    m.incomplete.judged = false;
+    m.incomplete.note = "cannot judge: S2, S3, S4, S5 have timestamp faults";
+    m.incomplete.label = `incomplete pattern (${m.incomplete.note})`;
+    m.seeds = [];
+    m.search.no_match = { frames: 8, oldest_seq: 1, partial: false, span_s: 2.0,
+                          text: `no S1 (ch 1) seeds with ${m.incomplete.label} in the last 8 good frames` };
+  });
+  const page = await boot({ "sma::frame": () => envelope("smaf", cj) });
+  const head = byId(page, "dqm-smaev-seededhead").textContent;
+  assert.ok(head.includes("incomplete pattern cannot be judged: S2, S3, S4, S5 have timestamp faults"), head);
+  assert.ok(/^No match: no S1 \(ch 1\) seeds with incomplete pattern \(cannot judge/.test(banner(page).textContent));
+});
+
+test("a counter with a timestamp fault gets its warning beside its selector", async () => {
+  const page = await boot({ "sma::summary": () => json(FX.summary_1008) });
+  const w5 = byId(page, "dqm-smaev-patwarn-5");
+  assert.notStrictEqual(w5.style.display, "none");
+  assert.strictEqual(w5.textContent, "S5 has a timestamp fault (93 % fine/coarse mismatch): " +
+                     "'absent' will match almost everything, 'present' almost nothing");
+  for (const k of [1, 2, 3, 4]) {
+    assert.strictEqual(byId(page, `dqm-smaev-patwarn-${k}`).style.display, "none", `S${k}`);
+  }
+  // Run 682's summary: S3 (13 %) and S5.
+  const p2 = await boot();
+  assert.deepStrictEqual([1, 2, 3, 4, 5].filter((k) => byId(p2, `dqm-smaev-patwarn-${k}`).style.display !== "none"),
+                         [3, 5]);
+  // The shift not judged: no warnings.
+  const p3 = await boot({ "sma::summary": () => json(FX.summary_shift13) });
+  assert.ok([1, 2, 3, 4, 5].every((k) => byId(p3, `dqm-smaev-patwarn-${k}`).style.display === "none"));
+});
+
+test("Single and a frozen re-ask send the pattern", async () => {
+  const page = await boot(advancing(), undefined, undefined, { session: session({
+    "dqm-sma-events-seed": '{"seed":"ch2","filters":["mismatch"],"mupix":"both","pattern":{"1":"absent"}}' }) });
+  let mark = page.an.calls.length;
+  byId(page, "dqm-smaev-single").onclick();
+  await settle(page, 5);
+  let asks = frameCalls(page, mark);
+  assert.strictEqual(asks.length, 1);
+  assert.deepStrictEqual([asks[0].seed, asks[0].filters, asks[0].mupix, asks[0].pattern],
+                         ["ch2", ["mismatch"], "both", { 1: "absent" }]);
+  mark = page.an.calls.length;
+  const s4 = byId(page, "dqm-smaev-pat-4");
+  s4.value = "present";
+  s4.onchange.call(s4);
+  await settle(page, 5);
+  asks = frameCalls(page, mark);
+  assert.strictEqual(asks.length, 1, JSON.stringify(asks));
+  assert.ok(Number.isInteger(asks[0].seq), "the frozen frame, by its seq");
+  assert.deepStrictEqual(asks[0].pattern, { 1: "absent", 4: "present" });
+  assert.strictEqual(byId(page, "dqm-smaev-live").textContent, "FROZEN");
 });

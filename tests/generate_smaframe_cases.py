@@ -8,7 +8,9 @@ as plain lists.
 
 Most cases come from the real plugin on the stored real frames, so the page is
 tested against what the analyzer actually sends; the synthetic ones pin the
-edges (no hits, a JSON block that is already a multiple of 8, the flags).
+edges (no hits, a JSON block that is already a multiple of 8, the flags). The
+real frames carry the MuPix pixel block (``SMAF_PIXELS``) as the plugin sends
+it by default; ``pixels=False`` cases are the same frames without it.
 """
 
 from __future__ import annotations
@@ -50,6 +52,10 @@ def _plugin_frames():
     p = SmaPlugin(HistStore(), clock=lambda: 1000.0)
     p.process(_Event(words[4], serial=3553), run_number=682)
     out.append(("real 4k-word frame, seeded (v2, words)", p.frame_blob("seeded")))
+    out.append(("real 4k-word frame, seeded (v2, words), no pixel block",
+                p.frame_blob("seeded", pixels=False)))
+    out.append(("real 4k-word frame, raster without ch 7, no pixel block (v1 as before)",
+                p.frame_blob("raster", drop=[7], pixels=False)))
     out.append(("real 4k-word frame, raster without ch 7",
                 p.frame_blob("raster", drop=[7])))
     out.append(("real 4k-word frame, raster without ch 7, with words (v2)",
@@ -61,11 +67,15 @@ def _plugin_frames():
 
     p.process(_Event(words[1], serial=1), run_number=682)
     out.append(("real stale frame (channel 0/15 garbage), raster",
-                p.frame_blob("raster")))
+                p.frame_blob("raster", pixels=False)))
 
     p = SmaPlugin(HistStore(), clock=lambda: 1000.0)
     p.process(_Event(big, serial=206), run_number=1008)
     out.append(("real 40k-word-firmware frame, seeded (v2)", p.frame_blob("seeded")))
+    out.append(("real 40k-word-firmware frame, raster with pixels, latest 600 hits of each kind",
+                p.frame_blob("raster", drop=[7], max_hits=600)))
+    out.append(("real 40k-word-firmware frame, seeded, MuPix selector both",
+                p.frame_blob("seeded", mupix="both")))
 
     # A shift-3 run read at 14: no usable time base, the kept words spread over
     # hundreds of seconds, so time_shift is large.
@@ -124,6 +134,29 @@ def _synthetic_frames():
         frame_seq=4750, run_number=1008, time_shift=0,
         raw_words=words, word_index=np.array([12345, 0, 4294967295, 7], dtype=np.uint32))
     out.append(("v2 synthetic: padded JSON, words past 2^63 and 2^53, max word index", blob))
+
+    # Pixel blocks: after a v1 hit array that ends off 8 (3 hits: 21 bytes, so
+    # 3 bytes of padding precede the block), and after v2; pixel words past 2^53;
+    # a pixel time shift; every pixel flag; an empty block.
+    pix = {"t_rel": [0, 8, 4_000_000_000], "time_shift": 2, "chip": [0, 5, 31],
+           "col": [255, 0, 17], "row": [249, 250, 255], "tot": [31, 0, 7],
+           "flags": [framing.PIX_IN_SEED | 1, 2 | framing.PIX_OFF_SENSOR, 0]}
+    out.append(("v1 with a pixel block (no words), block after 3 bytes of padding",
+                framing.encode_sma_frame({"view": "raster", "mupix": {"t0_ns": 5}},
+                                         [0, 3, 9], [1, 2, 6], [1, 2, 3], [0, 0, 0],
+                                         frame_seq=9, run_number=1008, pixels=pix)))
+    pw = dict(pix, raw_words=np.array([0x7C3A_D2C0_A1B2_C3D4, 0x0020_0000_0000_0001, 0],
+                                      dtype=np.uint64),
+              word_index=np.array([4294967295, 0, 12], dtype=np.uint32))
+    out.append(("v2 with a pixel block with words (past 2^53), a pixel time shift",
+                framing.encode_sma_frame({"view": "seeded"}, [0, 1], [1, 2], [5, 6], [0, 0],
+                                         frame_seq=10, run_number=1008, seeded=True,
+                                         raw_words=[0x8100000000000001, 0x8200000000000002],
+                                         word_index=[1, 2], pixels=pw)))
+    empty_px = {k: [] for k in ("t_rel", "chip", "col", "row", "tot", "flags")}
+    out.append(("an empty pixel block after no hits",
+                framing.encode_sma_frame({"view": "raster"}, [], [], [], [], frame_seq=11,
+                                         pixels=dict(empty_px, time_shift=0))))
     return out
 
 
@@ -151,9 +184,22 @@ def build_cases() -> list[dict]:
                               else [f"{int(x):016x}" for x in d["raw_words"]]),
                 "word_index": (None if d["word_index"] is None
                                else [int(x) for x in d["word_index"]]),
+                "pixels": _pixels_expect(d["pixels"]),
             },
         })
     return cases
+
+
+def _pixels_expect(q):
+    if q is None:
+        return None
+    return {"n": q["n"], "time_shift": q["time_shift"], "words": q["words"],
+            "offset": q["offset"], "t_rel": [int(x) for x in q["t_rel"]],
+            **{k: [int(x) for x in q[k]] for k in ("chip", "col", "row", "tot", "flags")},
+            "raw_words": (None if q["raw_words"] is None
+                          else [f"{int(x):016x}" for x in q["raw_words"]]),
+            "word_index": (None if q["word_index"] is None
+                           else [int(x) for x in q["word_index"]])}
 
 
 def test_generate_smaframe_cases():
@@ -164,11 +210,17 @@ def test_generate_smaframe_cases():
                 "envelope removed, hex). Layout: src/mdqm/dqm/framing.py, 'SMA frames'. A "
                 "hit's time is meta.t0_ns + t_rel_ns * 2**time_shift (header u16 at offset "
                 "2). frame_seq is 2^40+5 in the synthetic case. raw_words are 16-digit hex "
-                "strings (u64).",
+                "strings (u64). pixels: the MuPix pixel block (header flag SMAF_PIXELS, "
+                "'pixel block' in framing.py), null when there is none; a pixel's time is "
+                "meta.mupix.t0_ns + t_rel * 2**time_shift.",
         "cases": cases,
     }, indent=1))
-    assert len(cases) >= 13
+    assert len(cases) >= 20
     assert {c["expect"]["version"] for c in cases} == {1, 2}
+    px = [c for c in cases if c["expect"]["pixels"] is not None]
+    assert {c["expect"]["version"] for c in px} == {1, 2}, "a pixel block after v1 and after v2"
+    assert {c["expect"]["pixels"]["words"] for c in px} == {False, True}
+    assert any(c["expect"]["pixels"]["n"] >= 600 for c in px), "a real raster's pixels"
     assert {c["expect"]["time_shift"] for c in cases} >= {0, 1, 32}
     assert any(c["expect"]["time_shift"] > 1 and c["expect"]["suspect"] for c in cases)
 
@@ -180,4 +232,11 @@ def test_python_decodes_its_own_cases():
         assert d["n_hits"] == len(e["t_rel_ns"]) == len(e["ch"]), case["name"]
         assert d["arrays_offset"] % 8 == 0, case["name"]
         per_hit = 19 if d["words"] else 7
-        assert len(bytes.fromhex(case["payload_hex"])) == d["arrays_offset"] + per_hit * d["n_hits"]
+        end = d["arrays_offset"] + per_hit * d["n_hits"]
+        size = len(bytes.fromhex(case["payload_hex"]))
+        if d["pixels"] is None:
+            assert size == end
+        else:
+            q = d["pixels"]
+            assert q["offset"] % 8 == 0 and 0 <= q["offset"] - end < 8, case["name"]
+            assert size == q["offset"] + 8 + (21 if q["words"] else 9) * q["n"], case["name"]

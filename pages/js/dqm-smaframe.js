@@ -1,5 +1,6 @@
 //
-// dqm-smaframe.js -- the SMA event-display frame ("smaf" v1 and v2), decoded.
+// dqm-smaframe.js -- the SMA event-display frame ("smaf" v1 and v2, with or
+// without the MuPix pixel block), decoded.
 //
 // Mirror of mdqm/dqm/framing.py's encode_sma_frame. Keep the two in step: the
 // cross-language test in tests/js/smaframe.test.js decodes Python's bytes with
@@ -31,6 +32,21 @@
 // board sent it and word_index its position in the H000 bank (in 64-bit words,
 // filler and pixel words included): what finds the hit again in the file.
 //
+// The MuPix pixel block (header flag PIXELS), in either version, after the hit
+// arrays at P = their end rounded up to 8 (an old decoder simply ignores it):
+//
+//     P      u32 n_pix m, u16 pixel time shift kp, u8 block version 1, u8 block flags
+//     Q = P + 8
+//     no words (9 bytes a pixel)        words (block flag WORDS, 21 bytes a pixel)
+//       Q       u32 t_rel[m]              Q        u64 raw_word[m]
+//       Q + 4m  u8 chip, col, row,        Q + 8m   u32 t_rel[m]
+//               tot, flags [m each]       Q + 12m  u32 word_index[m]
+//                                         Q + 16m  u8 chip, col, row, tot, flags [m each]
+//
+// pixel time = meta.mupix.t0_ns + t_rel * 2^kp; tot is the real ToT (0-31,
+// meta.mupix.tot_ns a count); flags: bits 1:0 the plane (0 none, 1 L1, 2 L2),
+// OFF_SENSOR (row >= 250), IN_SEED.
+//
 // The hit arrays are wrapped as typed-array *views* rather than copied or
 // parsed: a whole-frame raster is ~33k hits, and the whole point of the binary
 // format is that the page does not touch each one before drawing it.
@@ -43,7 +59,10 @@ const VERSION = 1;
 const VERSION_WORDS = 2;
 const HEADER_BYTES = 32;
 
-const FLAGS = { SEEDED: 1 << 0, STALE: 1 << 1, TRUNCATED: 1 << 2, SUSPECT: 1 << 3, WORDS: 1 << 4 };
+const FLAGS = { SEEDED: 1 << 0, STALE: 1 << 1, TRUNCATED: 1 << 2, SUSPECT: 1 << 3, WORDS: 1 << 4,
+                PIXELS: 1 << 5 };
+const PIX = { PLANE_MASK: 0x3, OFF_SENSOR: 1 << 2, IN_SEED: 1 << 3 };
+const PIXB = { VERSION: 1, WORDS: 1 << 0, HEADER_BYTES: 8 };
 const HIT = {
   MISMATCH: 1 << 0,       // fine and coarse disagree
   TOT_CORRUPT: 1 << 1,    // ToT >= the corrupt threshold
@@ -157,8 +176,12 @@ function decode(input) {
   const tot = new Uint8Array(buffer, base + offsets.tot, nHits);
   const hitFlags = new Uint8Array(buffer, base + offsets.hitFlags, nHits);
 
+  const end = offsets.hitFlags + nHits;
+  const pixels = flags & FLAGS.PIXELS
+    ? decodePixels(buffer, base, dv, length, end + ((8 - (end % 8)) % 8)) : null;
+
   return {
-    version, flags, timeShift, nHits, frameSeq, run, jsonLen, arraysOffset: at, offsets,
+    version, flags, timeShift, nHits, frameSeq, run, jsonLen, arraysOffset: at, offsets, pixels,
     seeded: !!(flags & FLAGS.SEEDED),
     stale: !!(flags & FLAGS.STALE),
     truncated: !!(flags & FLAGS.TRUNCATED),
@@ -167,6 +190,40 @@ function decode(input) {
     suspect: !!(flags & FLAGS.SUSPECT),
     words,
     meta, t, tRaw, ch, tot, hitFlags, rawWord, wordIndex,
+  };
+}
+
+/**
+ * The pixel block at payload offset `at`: {n, timeShift, words, offset, t (ns
+ * from meta.mupix.t0_ns), tRaw, chip, col, row, tot, flags, rawWord, wordIndex}.
+ */
+function decodePixels(buffer, base, dv, length, at) {
+  if (length < at + PIXB.HEADER_BYTES) {
+    throw new Error(`short smaf payload: no room for the pixel block at ${at}`);
+  }
+  const n = dv.getUint32(at, true);
+  const timeShift = dv.getUint16(at + 4, true);
+  const version = dv.getUint8(at + 6);
+  if (version !== PIXB.VERSION) throw new Error(`unknown smaf pixel block version ${version}`);
+  const words = !!(dv.getUint8(at + 7) & PIXB.WORDS);
+  const q = at + PIXB.HEADER_BYTES;
+  if (length < q + (words ? 21 : 9) * n) {
+    throw new Error(`short smaf pixel block: ${length - q} bytes for ${n} pixel hits`);
+  }
+  const o = words ? { raw: q, t: q + 8 * n, wi: q + 12 * n, b: q + 16 * n } : { t: q, b: q + 4 * n };
+  const tRaw = u32Array(buffer, base, dv, o.t, n);
+  let t = tRaw;
+  if (timeShift) {
+    const f = 2 ** timeShift;
+    t = new Float64Array(n);
+    for (let i = 0; i < n; i++) t[i] = tRaw[i] * f;
+  }
+  const bytes = (j) => new Uint8Array(buffer, base + o.b + j * n, n);
+  return {
+    n, timeShift, words, offset: at, t, tRaw,
+    chip: bytes(0), col: bytes(1), row: bytes(2), tot: bytes(3), flags: bytes(4),
+    rawWord: words ? u64Array(buffer, base, dv, o.raw, n) : null,
+    wordIndex: words ? u32Array(buffer, base, dv, o.wi, n) : null,
   };
 }
 
@@ -205,7 +262,7 @@ async function fetchRaw(client, seq) {
   return payload;
 }
 
-const SMAF = { decode, fetchFrame, fetchRaw, hex64, FLAGS, HIT, VERSION, VERSION_WORDS, HEADER_BYTES };
+const SMAF = { decode, fetchFrame, fetchRaw, hex64, FLAGS, HIT, PIX, VERSION, VERSION_WORDS, HEADER_BYTES };
 root.SMAF = SMAF;
 if (typeof module !== "undefined" && module.exports) module.exports = SMAF;
 

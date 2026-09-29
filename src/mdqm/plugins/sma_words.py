@@ -27,6 +27,15 @@ New here (no reference): the stale-hit cluster rule (with the rescue of far
 consistent clusters), the shift scan, the coincidence windows and the seed
 selection.
 
+MuPix pixel words (the same bank, bit 63 clear): :func:`pixel_decode` follows
+``main/reco_testbeam/pi_midas/include/PIMuPixWord.hh`` (``ChipId``, ``Col``,
+``Row``, ``Ts2``, ``Time``, ``Tot``), which is the ``pixelhit`` of
+``PITMidasMusip.cpp``; ``psm-analysis-josh-2026/sma-tot-vs-wd/mupix_phase.py``
+(``pixel_words``) and ``mupix-timewalk/timewalk_lib.py`` (``pixel_tot``) are the
+Python references. ``tests/test_mupix_golden.py`` pins all three on stored
+real frames. The S1 matching (:func:`mupix_match`), the plane map and the
+per-frame cap are new here.
+
 Conventions
 -----------
 * A word is ``uint64``. Bit 63 set: an SMA trigger word; clear: a MuPix pixel
@@ -41,6 +50,10 @@ Conventions
 * "Stream order" is the order of the trigger words in the bank; "sorted" is
   the kept (non-stale) hits in ascending time, ties in stream order.
 * dt is always ``t_other - t_reference``.
+* A pixel word: chip 62:58 (a global ASIC id, see :class:`MuPixCuts`), column
+  57:50, row 49:42, TS2 41:37, time stamp 36:0 in 8 ns ticks. Its time in ns
+  (tick x 8, 2^40 ns) is the SMA time's epoch; within a frame it is unwrapped
+  around the same reference as the SMA hits, so the two subtract directly.
 """
 
 from __future__ import annotations
@@ -123,6 +136,56 @@ SHIFT_SCAN = (3, 12, 13, 14, 15, 16)
 #: Seeds: channels with fewer hits than this in a frame do not limit the
 #: complete range (a sparse counter would otherwise leave no seed at all).
 SEED_MIN_HITS = 5
+
+# --- MuPix pixel words (PIMuPixWord.hh) ------------------------------------------
+
+PIXEL_TICK_NS = 8
+PIXEL_TIME_BITS = 37
+PIXEL_TIME_MASK = (1 << PIXEL_TIME_BITS) - 1
+TS2_MASK = 0x1F
+#: log2(ckdivend2 + 1): ckdivend2 = 0x1f on every bt2026 run, so one ToT count
+#: is 2^5 ticks = 256 ns (PIMuPixWord::kDefaultTs2Shift).
+TS2_SHIFT = 5
+#: The largest TS2 shift that leaves TS2's 5 bits inside the 37-bit time stamp.
+MAX_TS2_SHIFT = PIXEL_TIME_BITS - 5
+#: The chip field has 5 bits.
+N_CHIP_IDS = 32
+#: Rows of the sensor. Row codes 250-255 occur in the data; they are not
+#: dropped here (the reco drops them, PITMidasMusip.cpp), only flagged.
+PIXEL_ROWS = 250
+PLANE_NONE, PLANE_L1, PLANE_L2 = 0, 1, 2
+PLANE_NAMES = ("no plane", "L1", "L2")
+#: The chip field is the GLOBAL ASIC id the switching board assigns from
+#: /Equipment/Quads/Settings/DAQ/Links/Mapping. From run 200 on that array is
+#: the identity, and chip 0 pairs with 4, 1 with 5, 2 with 6, 3 with 7 (the same
+#: particle in both planes, measured on runs 682 and 1008): L1 = 0-3, L2 = 4-7,
+#: as the readout map bt2026-febmap says for runs >= 200. (Runs up to 186 had
+#: Mapping [1..7, 0]: L1 = 1-4, L2 = 5, 6, 7, 0.)
+L1_CHIPS = (0, 1, 2, 3)
+L2_CHIPS = (4, 5, 6, 7)
+#: t(pixel) - t(S1) of a pixel "in time" with S1, half open [lo, hi): the MuPix
+#: time walk puts real hits from about -150 ns (high ToT) to +450 ns (low ToT)
+#: around S1. No time-walk correction.
+MUPIX_WINDOW_NS = (-150, 450)
+#: The accidental rate is measured in an off-time sideband of the same width
+#: before the prompt window (never after it: decays and delayed hits live there).
+MUPIX_SIDEBAND_NS = (-2400, -1800)
+#: Pixel hits examined per frame, the latest in the stream; more are counted
+#: and skipped (a 40000-word run-1008 frame has ~7300).
+MAX_PIXELS = 20_000
+#: S1 hits per frame matched against the pixels, at most (an evenly spread
+#: subset of the S1 rows the S1-seeded analyses use): 500 a frame at 35
+#: frames/s is ~17k S1 hits a second, plenty for a fraction, at a quarter of
+#: the cost of 2000.
+MUPIX_MAX_S1 = 500
+#: All-pairs t(pixel) - t(S1) entries per frame and plane, at most; a denser
+#: frame uses an evenly spread subset of its S1 rows.
+MAX_MUPIX_PAIRS = 200_000
+#: The MuPix selector of the event display (sma::frame "mupix").
+MUPIX_MODES = ("any", "both", "either", "none")
+#: The per-counter pattern selector of the event display (sma::frame "pattern"):
+#: a hit on that counter within +-coinc of the seed, or none; "any" is no condition.
+PATTERN_STATES = ("any", "present", "absent")
 
 _U = np.uint64
 
@@ -603,6 +666,299 @@ def select_seeds(t_s1, start, end, n_seeds=N_SEEDS, pre_ns=SEED_PRE_NS,
 
 
 # ==============================================================================
+# MuPix pixel words (PIMuPixWord.hh)
+# ==============================================================================
+
+def pixel_tot(ts2, tick, ts2_shift=TS2_SHIFT) -> np.ndarray:
+    """The time over threshold, 0..31 in 2^ts2_shift ticks (``PIMuPixWord::Tot``).
+
+    Bits 41:37 are TS2, a counter latched at the falling edge, not a ToT; the
+    time stamp was latched at the rising edge, so ToT = (TS2 - ((tick >>
+    ts2_shift) & 0x1F)) & 0x1F. uint8.
+    """
+    ts2 = np.asarray(ts2).astype(np.int64)
+    tick = np.asarray(tick, dtype=np.int64)
+    return ((ts2 - ((tick >> int(ts2_shift)) & TS2_MASK)) & TS2_MASK).astype(np.uint8)
+
+
+def pixel_decode(words, ts2_shift=TS2_SHIFT, last: int | None = None) -> dict:
+    """The pixel words (bit 63 clear) of one bank, in stream order, as arrays.
+
+    ``{chip, col, row, ts2, tot (uint8), tick (int64, 8 ns), time (int64 ns,
+    < 2^40), word_index (uint32), raw (uint64), n_words}``. With ``last``, only
+    the last ``last`` pixel words of the stream are decoded; ``n_words`` still
+    counts all of them. The filler word has bit 63 set and is never a pixel.
+    """
+    w = np.asarray(words, dtype=_U)
+    idx = np.flatnonzero(w.view(np.int64) >= 0)
+    n_words = int(idx.size)
+    if last is not None and idx.size > last:
+        idx = idx[idx.size - max(0, int(last)):]
+    p = w[idx]
+    tick = (p & _U(PIXEL_TIME_MASK)).astype(np.int64)
+    ts2 = ((p >> _U(37)) & _U(TS2_MASK)).astype(np.uint8)
+    return {"chip": ((p >> _U(58)) & _U(0x1F)).astype(np.uint8),
+            "col": ((p >> _U(50)) & _U(0xFF)).astype(np.uint8),
+            "row": ((p >> _U(42)) & _U(0xFF)).astype(np.uint8),
+            "ts2": ts2, "tot": pixel_tot(ts2, tick, ts2_shift), "tick": tick,
+            "time": tick * PIXEL_TICK_NS, "word_index": idx.astype(np.uint32), "raw": p,
+            "n_words": n_words}
+
+
+def encode_pixel(chip, col, row, ts2, tick):
+    """Inverse of :func:`pixel_decode`: one pixel word from its fields (test helper).
+
+    Scalars give an ``int``, arrays a ``uint64`` array.
+    """
+    if all(np.isscalar(x) for x in (chip, col, row, ts2, tick)):
+        return (((int(chip) & 0x1F) << 58) | ((int(col) & 0xFF) << 50) | ((int(row) & 0xFF) << 42)
+                | ((int(ts2) & 0x1F) << 37) | (int(tick) & PIXEL_TIME_MASK))
+    chip, col, row, ts2, tick = (np.asarray(x).astype(_U) for x in (chip, col, row, ts2, tick))
+    return (((chip & _U(0x1F)) << _U(58)) | ((col & _U(0xFF)) << _U(50))
+            | ((row & _U(0xFF)) << _U(42)) | ((ts2 & _U(0x1F)) << _U(37))
+            | (tick & _U(PIXEL_TIME_MASK)))
+
+
+def ts2_of(tick, tot, ts2_shift=TS2_SHIFT):
+    """The TS2 a pixel of time stamp ``tick`` and ToT ``tot`` carries (test helper)."""
+    tick = np.asarray(tick, dtype=np.int64)
+    return (((tick >> int(ts2_shift)) + np.asarray(tot, dtype=np.int64)) & TS2_MASK)
+
+
+def plane_lookup(l1=L1_CHIPS, l2=L2_CHIPS) -> np.ndarray:
+    """``uint8[32]``: the plane (:data:`PLANE_L1`, :data:`PLANE_L2`, else
+    :data:`PLANE_NONE`) of every chip id."""
+    out = np.zeros(N_CHIP_IDS, dtype=np.uint8)
+    out[np.asarray(list(l1), dtype=np.intp)] = PLANE_L1
+    out[np.asarray(list(l2), dtype=np.intp)] = PLANE_L2
+    return out
+
+
+@dataclass
+class MuPixCuts:
+    """The MuPix settings (ODB ``/DQM/SMA/MuPix``), defaults as above.
+
+    ``l1``/``l2``: chip ids (the global ASIC ids of the pixel words) of each
+    plane; a chip in neither is shown as "chip N (no plane)". ``window_ns``
+    and ``sideband_ns`` are half open, relative to S1 (or to a display seed).
+    ``max_pixels`` 0 turns the MuPix analysis off (pixel words are still
+    counted); None, no cap.
+    """
+
+    l1: tuple = L1_CHIPS
+    l2: tuple = L2_CHIPS
+    ts2_shift: int = TS2_SHIFT
+    window_ns: tuple = MUPIX_WINDOW_NS
+    sideband_ns: tuple = MUPIX_SIDEBAND_NS
+    max_pixels: int | None = MAX_PIXELS
+    max_pairs: int = MAX_MUPIX_PAIRS
+    #: S1 rows per frame matched (MUPIX_MAX_S1); None: all.
+    max_s1: int | None = MUPIX_MAX_S1
+
+    @property
+    def planes(self) -> np.ndarray:
+        cached = self.__dict__.get("_planes")
+        if cached is None or cached[0] != (tuple(self.l1), tuple(self.l2)):
+            cached = ((tuple(self.l1), tuple(self.l2)), plane_lookup(self.l1, self.l2))
+            self.__dict__["_planes"] = cached
+        return cached[1]
+
+    @property
+    def enabled(self) -> bool:
+        return self.max_pixels is None or self.max_pixels > 0
+
+    @property
+    def tot_ns(self) -> int:
+        """One ToT count in ns."""
+        return PIXEL_TICK_NS << int(self.ts2_shift)
+
+
+@dataclass
+class Pixels:
+    """The examined pixel hits of one frame, sorted by time (:func:`prepare_pixels`).
+
+    ``t`` is in ns on the frame's SMA time basis (unwrapped around the same
+    reference as ``Frame.s_t``). ``planes[p]`` indexes plane p's hits (0 = no
+    plane, 1 = L1, 2 = L2), ascending in time.
+    """
+
+    n_words: int                    # pixel words in the bank
+    n_skipped: int                  # not examined (MuPixCuts.max_pixels)
+    was_sorted: bool                # the examined words were already in time order
+    t: np.ndarray                   # int64
+    chip: np.ndarray                # uint8
+    col: np.ndarray
+    row: np.ndarray
+    ts2: np.ndarray
+    tot: np.ndarray
+    plane: np.ndarray               # uint8
+    word_index: np.ndarray          # uint32
+    raw: np.ndarray                 # uint64
+    planes: list = field(default_factory=list)
+
+    @property
+    def n(self) -> int:
+        return int(self.t.size)
+
+    @property
+    def first(self) -> int:
+        return int(self.t[0]) if self.t.size else 0
+
+    @property
+    def last(self) -> int:
+        return int(self.t[-1]) if self.t.size else 0
+
+    def times(self, plane) -> np.ndarray:
+        return self.t[self.planes[plane]]
+
+    def nbytes(self) -> int:
+        return sum(v.nbytes for v in vars(self).values() if isinstance(v, np.ndarray)) + sum(
+            x.nbytes for x in self.planes)
+
+
+def prepare_pixels(words, cuts: MuPixCuts | None = None, ref_ns: int | None = None,
+                   bits: int = TIME_BITS) -> Pixels:
+    """Decode, cap, unwrap, sort and split the pixel words of one bank.
+
+    At most ``cuts.max_pixels`` pixel words are examined: the latest in the
+    stream (which is close to time order; the rest are counted as skipped).
+    Times are unwrapped modulo 2^``bits`` around ``ref_ns`` (the frame's SMA
+    reference; the pixels' own median without one), so a frame straddling
+    the 2^40 ns wrap still sorts and subtracts correctly, and below coarse
+    shift 12 they land in the SMA time's shorter span. The MuPix stream is not
+    promised to be time-sorted within a frame: it is sorted here (stable), at
+    O(n) cost when it already is.
+    """
+    cuts = cuts or MuPixCuts()
+    last = cuts.max_pixels
+    d = pixel_decode(words, cuts.ts2_shift, last=last)
+    t = d["time"]
+    n = t.size
+    if n:
+        ref = ref_ns if ref_ns is not None else int(np.partition(t, (n - 1) // 2)[(n - 1) // 2])
+        t = unwrap_near(t, ref, bits)
+    was_sorted = bool(n < 2 or np.all(t[1:] >= t[:-1]))
+    keys = ("chip", "col", "row", "ts2", "tot", "word_index", "raw")
+    if not was_sorted:
+        o = np.argsort(t, kind="stable")
+        t = t[o]
+        d = {k: d[k][o] for k in keys} | {"n_words": d["n_words"]}
+    plane = cuts.planes[d["chip"]] if n else np.zeros(0, dtype=np.uint8)
+    return Pixels(n_words=d["n_words"], n_skipped=d["n_words"] - n, was_sorted=was_sorted,
+                  t=np.asarray(t, dtype=np.int64), chip=d["chip"], col=d["col"], row=d["row"],
+                  ts2=d["ts2"], tot=d["tot"], plane=plane, word_index=d["word_index"],
+                  raw=d["raw"], planes=split_by_channel(plane, 3))
+
+
+def mupix_coverage(t_ref, px: Pixels, lo_ns, hi_ns) -> np.ndarray:
+    """Per reference time, whether [t + lo, t + hi) lies inside the examined pixel data.
+
+    The MuPix and SMA parts of a frame do not cover the same time (run 1008:
+    the pixels start ~0.5 ms after the SMA hits), and the per-frame cap
+    examines only the latest pixels: an S1 hit outside says nothing about
+    MuPix and is not judged.
+    """
+    t = np.asarray(t_ref, dtype=np.int64)
+    if px is None or px.n == 0:
+        return np.zeros(t.shape, dtype=bool)
+    return (t + int(lo_ns) >= px.first) & (t + int(hi_ns) <= px.last + 1)
+
+
+def mupix_in_window(t_ref, px: Pixels, lo_ns, hi_ns):
+    """``(n_l1, n_l2)``: pixel hits of each plane in [t + lo, t + hi) per reference (intp)."""
+    t = np.asarray(t_ref, dtype=np.int64)
+    lo, hi = int(lo_ns), int(hi_ns) - 1         # integer ns: [lo, hi) == [lo, hi - 1]
+    return (window_counts(t, px.times(PLANE_L1), lo, hi),
+            window_counts(t, px.times(PLANE_L2), lo, hi))
+
+
+@dataclass
+class MuPixMatch:
+    """In-time and sideband MuPix hits of S1 hits (:func:`mupix_match`).
+
+    Per S1 row: ``judged`` (its window and sideband lie in the pixel data) and,
+    for the judged rows, whether L1 / L2 had a hit in the window (``in_l1``,
+    ``in_l2``) and in the sideband (``side_l1``, ``side_l2``); False elsewhere.
+    """
+
+    judged: np.ndarray
+    in_l1: np.ndarray
+    in_l2: np.ndarray
+    side_l1: np.ndarray
+    side_l2: np.ndarray
+
+    @property
+    def n(self) -> int:
+        return int(np.count_nonzero(self.judged))
+
+    def counts(self) -> tuple[int, np.ndarray, np.ndarray]:
+        """``(n_judged, in [L1, L2, both], side [L1, L2, both])``, int64 counts."""
+        i1, i2, s1, s2 = self.in_l1, self.in_l2, self.side_l1, self.side_l2
+        c = lambda a, b: np.array([np.count_nonzero(a), np.count_nonzero(b),  # noqa: E731
+                                   np.count_nonzero(a & b)], dtype=np.int64)
+        return self.n, c(i1, i2), c(s1, s2)
+
+
+def mupix_match(t_s1, px: Pixels | None, window_ns=MUPIX_WINDOW_NS,
+                sideband_ns=MUPIX_SIDEBAND_NS) -> MuPixMatch:
+    """Which S1 hits have an L1 / L2 pixel hit in the in-time window, and in the sideband.
+
+    ``t_s1`` ascending. Only S1 hits whose window and sideband both lie inside
+    the examined pixel data are judged (:func:`mupix_coverage`). The sideband
+    has the same width as the window by default and measures the accidentals:
+    the fraction of S1 hits with a sideband hit is the chance of a hit in a
+    window of that width with nothing to do with S1.
+    """
+    t = np.asarray(t_s1, dtype=np.int64)
+    z = np.zeros(t.shape, dtype=bool)
+    if px is None or px.n == 0 or t.size == 0:
+        return MuPixMatch(z, z.copy(), z.copy(), z.copy(), z.copy())
+    (wlo, whi), (slo, shi) = window_ns, sideband_ns
+    judged = mupix_coverage(t, px, min(wlo, slo), max(whi, shi))
+    n1, n2 = mupix_in_window(t, px, wlo, whi)
+    m1, m2 = mupix_in_window(t, px, slo, shi)
+    return MuPixMatch(judged, judged & (n1 > 0), judged & (n2 > 0),
+                      judged & (m1 > 0), judged & (m2 > 0))
+
+
+def accidental_corrected(f_in, f_side, width_in=1.0, width_side=1.0):
+    """The in-time fraction with the accidentals taken out.
+
+    With a chance ``a`` of an accidental hit in the window, P(in) = 1 - (1 -
+    p)(1 - a), so p = (P(in) - a) / (1 - a). ``a`` comes from the sideband,
+    scaled to the window's width (Poisson: 1 - (1 - f_side)^(w_in / w_side)).
+    None when either is None or a = 1.
+    """
+    if f_in is None or f_side is None:
+        return None
+    a = 1.0 - (1.0 - float(f_side)) ** (float(width_in) / float(width_side))
+    if a >= 1.0:
+        return None
+    return (float(f_in) - a) / (1.0 - a)
+
+
+def mupix_pairs(t_s1, t_pix, lo_ns, hi_ns, max_pairs=MAX_MUPIX_PAIRS):
+    """``(dt, n_s1_used)``: every t(pixel) - t(S1) in [lo, hi), both inputs ascending.
+
+    At most about ``max_pairs`` pairs: when the frame would give more, an
+    evenly spread subset of the S1 rows is used (every k-th), and
+    ``n_s1_used`` says how many.
+    """
+    t1 = np.asarray(t_s1, dtype=np.int64)
+    tp = np.asarray(t_pix, dtype=np.int64)
+    lo, hi = int(lo_ns), int(hi_ns) - 1
+    if t1.size == 0 or tp.size == 0:
+        return np.zeros(0, dtype=np.int64), int(t1.size)
+    a, b = _bounds(t1, tp, lo, hi)
+    total = int((b - a).sum())
+    if total > max_pairs > 0:
+        k = -(-total // int(max_pairs))
+        t1 = t1[::k]
+    _i, _j, dt = window_pairs(t1, tp, lo, hi)
+    return dt, int(t1.size)
+
+
+# ==============================================================================
 # One frame
 # ==============================================================================
 
@@ -694,6 +1050,9 @@ class Frame:
     #: words, filler and pixel included) and the raw word.
     word_index: np.ndarray | None = None
     raw: np.ndarray | None = None
+    #: The MuPix pixel hits (:func:`prepare_pixels`), on the same time basis as
+    #: ``s_t``; None when the frame was prepared without MuPix.
+    px: Pixels | None = None
 
     @property
     def span_ns(self) -> int:
@@ -731,8 +1090,12 @@ def split_by_channel(ch, n_channels=N_CHANNELS) -> list:
 def prepare_frame(words, shift=DEFAULT_SHIFT, stale_gap_ns=STALE_GAP_NS,
                   latch_margin_ns=LATCH_MARGIN_NS, rescue_shifts=SHIFT_SCAN,
                   rescue_min_words=RESCUE_MIN_WORDS,
-                  rescue_min_fraction=RESCUE_MIN_FRACTION) -> Frame:
+                  rescue_min_fraction=RESCUE_MIN_FRACTION,
+                  mupix: MuPixCuts | None = None) -> Frame:
     """Word counts, decode, fine vs coarse, stale filter, sort, channel split.
+
+    With ``mupix`` (and its analysis enabled) the pixel words too
+    (:func:`prepare_pixels`), unwrapped around the kept SMA hits' median.
 
     Stale filter: the cluster holding the median time (:func:`stale_mask`)
     is kept, and so is any other cluster of at least ``rescue_min_words``
@@ -767,6 +1130,9 @@ def prepare_frame(words, shift=DEFAULT_SHIFT, stale_gap_ns=STALE_GAP_NS,
     consistent = fine_coarse_consistent(diff, shift, latch_margin_ns)
     ct = s_t[consistent[order]]
     t_first, t_last = (int(ct[0]), int(ct[-1])) if ct.size >= 2 else (None, None)
+    px = None
+    if mupix is not None and mupix.enabled:
+        px = prepare_pixels(w, mupix, int(s_t[(s_t.size - 1) // 2]) if s_t.size else None, bits)
     return Frame(
         shift=int(shift), n_words=int(w.size), n_filler=d["n_filler"],
         n_pixel=d["n_pixel"], n_trigger=d["n_trigger"],
@@ -779,7 +1145,7 @@ def prepare_frame(words, shift=DEFAULT_SHIFT, stale_gap_ns=STALE_GAP_NS,
         chan=split_by_channel(s_ch),
         first=int(s_t[0]) if s_t.size else 0, last=int(s_t[-1]) if s_t.size else 0,
         n_rescued=n_rescued, time_bits=bits, t_first=t_first, t_last=t_last,
-        word_index=d["word_index"], raw=d["raw"])
+        word_index=d["word_index"], raw=d["raw"], px=px)
 
 
 @dataclass
@@ -924,3 +1290,358 @@ def analyse_frame(frame: Frame, roles: Roles | None = None, cuts: Cuts | None = 
         rf_n=n, rf_valid=valid, rf_vetoed=vetoed, rf_gap=gap, rf_phase=phase,
         rf_period=period, pattern=pattern, partner_counts=counts, dt=dts,
         delayed_dt=delayed, seeds=seeds, sample=sample, t_s1_all=t_all, s1_rows=rows)
+
+
+# ==============================================================================
+# Seed choice and odd-event filters (the event display, at request time)
+# ==============================================================================
+#
+# analyse_frame picks the display's seeds while filling the histograms: the
+# latest Cuts.n_seeds S1 hits with a complete window. The event display can also
+# ask for other seeds, per viewer and per request: another channel, "any
+# counter", and only seeds with an oddity in their window. Those are computed
+# here from a prepared Frame alone -- vectorised, bounded, never while filling --
+# and with seed "s1" and no filter they give exactly analyse_frame's seeds.
+
+SEED_S1 = "s1"
+SEED_ANY = "any"
+#: The oddities a seed can be asked for; a seed matches when it has ANY of the
+#: ones asked for (OR). Bit k of SeedSelection.odd is FILTERS[k].
+FILTERS = ("incomplete", "mismatch", "tot", "rf")
+FILTER_BITS = {name: 1 << k for k, name in enumerate(FILTERS)}
+#: Candidates examined per frame, latest first: bounds a request on a dense frame.
+MAX_CANDIDATES = 20_000
+
+
+def parse_seed(seed) -> str:
+    """The canonical seed mode: ``"s1"``, ``"any"`` or ``"ch<N>"`` (N 0..15).
+
+    Accepts those strings (any case) and a bare channel number. ValueError otherwise.
+    """
+    if seed is None:
+        return SEED_S1
+    if isinstance(seed, bool):
+        raise ValueError(f"seed {seed!r}")
+    if isinstance(seed, int | np.integer):
+        c = int(seed)
+    else:
+        s = str(seed).strip().lower()
+        if s in (SEED_S1, SEED_ANY):
+            return s
+        if not s.startswith("ch") or not s[2:].isdigit():
+            raise ValueError(f"seed must be 's1', 'any' or 'ch<N>', got {seed!r}")
+        c = int(s[2:])
+    if not 0 <= c < N_CHANNELS:
+        raise ValueError(f"seed channel {c} is not 0-15")
+    return f"ch{c}"
+
+
+def parse_mupix(mode) -> str:
+    """The canonical MuPix selector: one of :data:`MUPIX_MODES` ("any" for None)."""
+    if mode is None:
+        return "any"
+    m = str(mode).strip().lower()
+    if m not in MUPIX_MODES:
+        raise ValueError(f"mupix must be one of {list(MUPIX_MODES)}, got {mode!r}")
+    return m
+
+
+def mupix_selects(mode: str, covered, n_l1, n_l2) -> np.ndarray:
+    """Per seed, whether it passes the MuPix selector (an AND on top of the filters).
+
+    ``both``: an L1 and an L2 hit in the in-time window; ``either``: one of
+    them; ``none``: neither. A hit found is a hit, wherever the pixel data
+    ends; but the absence of one means something only when the whole window
+    lies inside the pixel data (``covered``), so ``none`` needs that.
+    """
+    covered = np.asarray(covered, dtype=bool)
+    if mode == "any":
+        return np.ones(covered.shape, dtype=bool)
+    a, b = np.asarray(n_l1) > 0, np.asarray(n_l2) > 0
+    if mode == "both":
+        return a & b
+    if mode == "either":
+        return a | b
+    if mode == "none":
+        return covered & ~a & ~b
+    raise ValueError(f"mupix mode {mode!r}")
+
+
+def parse_pattern(pattern, n_counters: int = 5) -> tuple:
+    """The canonical per-counter pattern selector: ``((k, state), ...)``, k the
+    counter number (1 = S1 .. n_counters), state "present" or "absent", sorted
+    by k; "any" entries are dropped, so no condition at all is ``()``.
+
+    Accepts a dict ``{"1": "present", "3": "absent"}`` (keys as strings or
+    ints) or None. ValueError on an unknown counter or state.
+    """
+    if pattern is None:
+        return ()
+    if not isinstance(pattern, dict):
+        raise ValueError(f"pattern must be an object {{counter: state}}, got {pattern!r}")
+    out = {}
+    for key, state in pattern.items():
+        if isinstance(key, bool):
+            raise ValueError(f"pattern counter {key!r}")
+        try:
+            k = int(str(key).strip().upper().removeprefix("S"))
+        except ValueError:
+            raise ValueError(f"pattern counter must be 1-{n_counters}, got {key!r}") from None
+        if not 1 <= k <= n_counters:
+            raise ValueError(f"pattern counter must be 1-{n_counters}, got {key!r}")
+        st = str(state).strip().lower() if state is not None else "any"
+        if st not in PATTERN_STATES:
+            raise ValueError(f"pattern state must be one of {list(PATTERN_STATES)}, got {state!r}")
+        if st != "any":
+            out[k] = st
+    return tuple(sorted(out.items()))
+
+
+def pattern_selects(require: tuple, pattern) -> np.ndarray:
+    """Per seed, whether its coincidence pattern (bit k-1 = counter k within
+    +-coinc) passes the pattern selector ``require`` (:func:`parse_pattern`)."""
+    pattern = np.asarray(pattern)
+    ok = np.ones(pattern.shape, dtype=bool)
+    for k, st in require:
+        lit = ((pattern >> (k - 1)) & 1).astype(bool)
+        ok &= lit if st == "present" else ~lit
+    return ok
+
+
+def parse_filters(filters) -> tuple:
+    """The canonical filter tuple (in FILTERS order, no repeats). ValueError on an unknown name."""
+    if filters is None:
+        return ()
+    if isinstance(filters, str):
+        filters = [filters]
+    names = {str(f).strip().lower() for f in filters}
+    bad = sorted(names - set(FILTERS))
+    if bad:
+        raise ValueError(f"unknown filter(s) {bad}; known: {list(FILTERS)}")
+    return tuple(f for f in FILTERS if f in names)
+
+
+@dataclass
+class SeedSelection:
+    """The seeds of one frame for one (seed mode, filters) choice.
+
+    Per-seed arrays hold the chosen seeds only, ascending in time; ``idx``
+    indexes the frame's kept sorted hits (``Frame.s_*``). The RF fields come from
+    the S1 hit the seed borrows (itself for an S1 seed, else the nearest S1 hit
+    within the coincidence window); ``has_s1`` False means there was none, and
+    ``rf_n`` is -1 and the phase NaN.
+    """
+
+    mode: str
+    filters: tuple
+    idx: np.ndarray
+    t: np.ndarray
+    ch: np.ndarray
+    tot: np.ndarray
+    pattern: np.ndarray
+    odd: np.ndarray                 # uint8, FILTER_BITS of every oddity (asked for or not)
+    has_s1: np.ndarray
+    s1_idx: np.ndarray              # into Frame.s_*, -1 without S1
+    s1_dt: np.ndarray               # t(S1) - t(seed), 0 without S1
+    rf_n: np.ndarray
+    rf_valid: np.ndarray
+    rf_vetoed: np.ndarray
+    rf_phase: np.ndarray
+    rf_period: np.ndarray
+    #: Seed candidates of the frame whose window is complete, how many of them
+    #: were examined (the latest MAX_CANDIDATES), and how many of those match.
+    n_candidates: int = 0
+    n_examined: int = 0
+    n_matching: int = 0
+    #: The MuPix selector, and per chosen seed its in-time L1 / L2 hits and
+    #: whether its in-time window lies wholly in the pixel data.
+    mupix: str = "any"
+    mp_l1: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=np.intp))
+    mp_l2: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=np.intp))
+    mp_covered: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=bool))
+    #: The pattern selector (:func:`parse_pattern`); the counters (0-based
+    #: indices into Roles.counters) the ``incomplete`` oddity ignored, and
+    #: whether it could judge at all (False: every seed's ``incomplete`` bit is 0).
+    require: tuple = ()
+    ignore: tuple = ()
+    incomplete_judged: bool = True
+
+    @property
+    def capped(self) -> bool:
+        return self.n_examined < self.n_candidates
+
+
+def _nearest_within(t_ref, t_sorted, window_ns) -> np.ndarray:
+    """Index into ascending ``t_sorted`` of the hit nearest each ``t_ref`` within
+    ``|dt| <= window_ns``, ties to the earlier; -1 where none. int64 times, exact."""
+    t_ref = np.asarray(t_ref, dtype=np.int64)
+    ts = np.asarray(t_sorted, dtype=np.int64)
+    out = np.full(t_ref.shape, -1, dtype=np.intp)
+    if ts.size == 0 or t_ref.size == 0:
+        return out
+    i = np.searchsorted(ts, t_ref, side="left")
+    a = np.clip(i - 1, 0, ts.size - 1)
+    b = np.clip(i, 0, ts.size - 1)
+    big = np.iinfo(np.int64).max
+    da = np.where(i > 0, np.abs(t_ref - ts[a]), big)
+    db = np.where(i < ts.size, np.abs(ts[b] - t_ref), big)
+    pick = np.where(da <= db, a, b)
+    ok = np.minimum(da, db) <= window_ns
+    out[ok] = pick[ok]
+    return out
+
+
+def seed_candidates(frame: Frame, roles: Roles, cuts: Cuts, mode: str) -> np.ndarray:
+    """Indices into ``frame.s_*`` (ascending in time) of every possible seed.
+
+    ``s1``/``ch<N>``: that channel's kept hits. ``any``: the first hit of each
+    time cluster of the counter hits (S1..S5), a cluster being hits chained
+    within ``cuts.coinc_ns`` of the one before.
+    """
+    if mode == SEED_ANY:
+        counters = np.asarray(roles.counters, dtype=frame.s_ch.dtype)
+        idx = np.flatnonzero(np.isin(frame.s_ch, counters))
+        if idx.size == 0:
+            return idx.astype(np.intp)
+        t = frame.s_t[idx]
+        first = np.empty(idx.size, dtype=bool)
+        first[0] = True
+        first[1:] = np.diff(t) > cuts.coinc_ns
+        return idx[first].astype(np.intp)
+    c = roles.s1 if mode == SEED_S1 else int(mode[2:])
+    return np.asarray(frame.chan[c], dtype=np.intp)
+
+
+def select_seeds_by(frame: Frame, roles: Roles | None = None, cuts: Cuts | None = None,
+                    mode: str = SEED_S1, filters=(), max_candidates: int = MAX_CANDIDATES,
+                    mupix: str = "any", mcuts: MuPixCuts | None = None,
+                    require=(), ignore=()) -> SeedSelection:
+    """The display's seeds of one frame for a seed mode and a set of filters.
+
+    The window, its completeness rule and ``n_seeds`` are :func:`analyse_frame`'s:
+    a candidate's [t - pre, t + post] must lie inside :func:`complete_range` of
+    the counters and the RF with at least ``seed_min_hits`` hits. Of those, the
+    latest ``max_candidates`` are examined, and the latest ``n_seeds`` that have
+    any of ``filters`` (all of them without filters) are chosen.
+
+    Oddities, each over the seed's window or its coincidence window:
+
+    * ``incomplete``: not every counter (S1..S5) has a hit within +-coinc of it.
+      Counters in ``ignore`` (0-based indices into ``roles.counters``: those
+      with a known timestamp fault, which are almost never in time) are left
+      out of that; with fewer than two counters left there is nothing to judge
+      and no seed has it (``SeedSelection.incomplete_judged`` False);
+    * ``mismatch``: a kept hit in the window has fine and coarse disagreeing;
+    * ``tot``: a kept hit in the window has ToT >= ``tot_corrupt_min``;
+    * ``rf``: the S1 hit it borrows the RF from has no valid gate, or a vetoed
+      one. A seed with no S1 hit near it has no RF measurement and does not
+      match (``incomplete`` finds those).
+
+    ``mupix`` (:data:`MUPIX_MODES`) is a selection, not an oddity: it is AND-ed
+    with the filters (:func:`mupix_selects`), on L1 / L2 pixel hits in
+    ``mcuts.window_ns`` around the seed. ``require`` (:func:`parse_pattern`) is
+    another AND: per counter, a hit within +-coinc of the seed present or
+    absent (:func:`pattern_selects`); explicit, so nothing is ignored there.
+    """
+    roles = roles or Roles()
+    cuts = cuts or Cuts()
+    mcuts = mcuts or MuPixCuts()
+    mode = parse_seed(mode)
+    filters = parse_filters(filters)
+    mupix = parse_mupix(mupix)
+    nc = len(roles.counters)
+    require = parse_pattern(dict(require), nc)      # a dict or parse_pattern's pairs
+    ignore = tuple(sorted({int(k) for k in ignore if 0 <= int(k) < nc}))
+    s_t = frame.s_t
+    cand = seed_candidates(frame, roles, cuts, mode)
+    t_c = s_t[cand]
+    counters = [frame.times(c) for c in roles.counters]
+    t_rf = frame.times(roles.rf)
+    rng = complete_range([x for x in counters + [t_rf] if len(x) >= cuts.seed_min_hits])
+    if rng is None:
+        lo = hi = 0
+    else:
+        hi = int(np.searchsorted(t_c, rng[1] - cuts.seed_post_ns, side="right"))
+        lo = int(np.searchsorted(t_c, rng[0] + cuts.seed_pre_ns, side="left"))
+        hi = max(lo, hi)
+    n_cand = hi - lo
+    e0 = max(lo, hi - int(max_candidates))
+    ex = cand[e0:hi]
+    te = t_c[e0:hi]
+
+    pattern, _counts = coincidence(te, counters, cuts.coinc_ns)
+    full = (1 << len(counters)) - 1
+    for k in ignore:
+        full &= ~(1 << k)
+    judged = nc - len(ignore) >= 2
+    a = np.searchsorted(s_t, te - cuts.seed_pre_ns, side="left")
+    b = np.searchsorted(s_t, te + cuts.seed_post_ns, side="right")
+    if judged:
+        odd = np.where((pattern & full) != full, FILTER_BITS["incomplete"], 0).astype(np.uint8)
+    else:
+        odd = np.zeros(ex.size, dtype=np.uint8)
+    if ex.size:
+        bad = np.zeros(s_t.size + 1, dtype=np.int64)
+        np.cumsum(~frame.consistent[frame.order], out=bad[1:])
+        odd |= np.where(bad[b] > bad[a], FILTER_BITS["mismatch"], 0).astype(np.uint8)
+        hot = np.zeros(s_t.size + 1, dtype=np.int64)
+        np.cumsum(frame.s_tot >= cuts.tot_corrupt_min, out=hot[1:])
+        odd |= np.where(hot[b] > hot[a], FILTER_BITS["tot"], 0).astype(np.uint8)
+
+    # RF: from S1 -- the seed itself, or the nearest S1 hit within the window.
+    i1 = np.asarray(frame.chan[roles.s1], dtype=np.intp)
+    t1 = s_t[i1]
+    if mode == SEED_S1:
+        j = np.arange(e0, hi, dtype=np.intp)          # candidates are the S1 hits
+    else:
+        j = _nearest_within(te, t1, cuts.coinc_ns)
+    has = j >= 0
+    rf_n = np.full(ex.size, -1, dtype=np.int32)
+    rf_valid = np.zeros(ex.size, dtype=bool)
+    rf_vetoed = np.zeros(ex.size, dtype=bool)
+    rf_phase = np.full(ex.size, np.nan)
+    rf_period = np.full(ex.size, np.nan)
+    if has.any():
+        vetoed_all, _gap = gate_veto(t1, cuts.rf_gate_ns)
+        jj = j[has]
+        n, valid, phase, period, _lo, _pt = burst_phase_many(
+            t_rf, t1[jj], rule=cuts.rf_rule, gate_ns=cuts.rf_gate_ns,
+            min_pulses=cuts.rf_min_pulses, max_pulses=cuts.rf_max_pulses,
+            vetoed=vetoed_all[jj])
+        rf_n[has], rf_valid[has], rf_vetoed[has] = n, valid, vetoed_all[jj]
+        rf_phase[has], rf_period[has] = phase, period
+        odd |= np.where(has & ~(rf_valid & ~rf_vetoed), FILTER_BITS["rf"], 0).astype(np.uint8)
+
+    if filters:
+        mask = np.uint8(sum(FILTER_BITS[f] for f in filters))
+        match = (odd & mask) != 0
+    else:
+        match = np.ones(ex.size, dtype=bool)
+    px = frame.px
+    if px is not None and px.n and ex.size:
+        wlo, whi = mcuts.window_ns
+        mp_cov = mupix_coverage(te, px, wlo, whi)
+        mp1, mp2 = mupix_in_window(te, px, wlo, whi)
+    else:
+        mp_cov = np.zeros(ex.size, dtype=bool)
+        mp1 = mp2 = np.zeros(ex.size, dtype=np.intp)
+    if mupix != "any":
+        match &= mupix_selects(mupix, mp_cov, mp1, mp2)
+    if require:
+        match &= pattern_selects(require, pattern)
+    mi = np.flatnonzero(match)
+    pick = mi[max(0, mi.size - int(cuts.n_seeds)):] if cuts.n_seeds > 0 else mi[:0]
+    s1_idx = np.full(pick.size, -1, dtype=np.intp)
+    hp = has[pick]
+    s1_idx[hp] = i1[j[pick][hp]]
+    s1_dt = np.zeros(pick.size, dtype=np.int64)
+    s1_dt[hp] = s_t[s1_idx[hp]] - te[pick][hp]
+    return SeedSelection(
+        mode=mode, filters=filters, idx=ex[pick], t=te[pick].astype(np.int64),
+        ch=frame.s_ch[ex[pick]], tot=frame.s_tot[ex[pick]], pattern=pattern[pick],
+        odd=odd[pick], has_s1=hp, s1_idx=s1_idx, s1_dt=s1_dt, rf_n=rf_n[pick],
+        rf_valid=rf_valid[pick],
+        rf_vetoed=rf_vetoed[pick], rf_phase=rf_phase[pick], rf_period=rf_period[pick],
+        n_candidates=n_cand, n_examined=int(ex.size), n_matching=int(mi.size),
+        mupix=mupix, mp_l1=mp1[pick], mp_l2=mp2[pick], mp_covered=mp_cov[pick],
+        require=require, ignore=ignore, incomplete_judged=judged)

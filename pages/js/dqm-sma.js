@@ -11,7 +11,10 @@
 //      wrong until it is fixed;
 //   3. a per-channel table (rates, ToT >= 250, fine/coarse mismatch, stale,
 //      S1-conditional efficiency), with the flagged cells coloured;
-//   4. tabs of histograms, and the 10-minute trends.
+//   4. tabs of histograms, and the 10-minute trends. The MuPix tab adds the
+//      in-time fractions of S1 hits (L1, L2, L1+L2, with the sideband and the
+//      accidentals taken out) and the time-sync state above its plots; its
+//      per-chip column/row occupancy is drawn per plane, one line per chip.
 //
 // Everything comes from the sma_analyzer client over brpc. Channel names come
 // from the summary, which takes them from the ODB (/DQM/SMA/Channel roles), so
@@ -19,9 +22,13 @@
 // dqm::list, so a new histogram in the plugin appears on the page (in the
 // Health tab unless tabOf() below says otherwise) without touching this file.
 //
-// Only the visible tab is polled. A hidden tab of forty histograms at 1 Hz
-// would be forty brpc round trips a second through mhttpd for plots nobody is
-// looking at.
+// Only the visible tab is polled, and on it only the plots on screen (after
+// each has been drawn once). A hidden tab of forty histograms at 1 Hz would be
+// forty brpc round trips a second through mhttpd for plots nobody is looking at.
+//
+// 1D histograms are drawn with mplot; 2D ones with DQMHeatmap (dqm-heatmap.js),
+// which draws the bins as one image instead of mplot's fillRect per bin. Either
+// is redrawn only when its histogram changed.
 //
 
 (function () {
@@ -34,6 +41,7 @@ const TABS = [
   ["tot", "ToT / corruption"],
   ["timing", "Timing"],
   ["rf", "RF / delayed"],
+  ["mupix", "MuPix"],
   ["trends", "Trends"],
 ];
 
@@ -52,11 +60,13 @@ const ORDER = {
         /^tot_ge250_per_ch$/, /^tot_vs_ch_lsb/, /^tot_ch\d+/],
   timing: [/^pattern$/, /^s1_coinc$/, /^dt_S\d+_S1$/, /^s1_partner_hits$/, /^s1_spacing_us$/],
   rf: [/^rf_npulses$/, /^rf_phase_s1$/, /^rf_period$/, /^rf_phase_vs_s1_tot$/, /^delayed_dt_ch/],
+  mupix: [/^mupix_dt_L1$/, /^mupix_dt_L2$/, /^mupix_s1_match$/, /^mupix_tot_L1$/, /^mupix_tot_L2$/,
+          /^mupix_col_chip/, /^mupix_row_chip/, /^mupix_hits_chip$/, /^mupix_/],
 };
 
 function tabOf(name) {
   const s = shortName(name);
-  for (const tab of ["tot", "timing", "rf"]) {
+  for (const tab of ["tot", "timing", "rf", "mupix"]) {
     if (ORDER[tab].some((re) => re.test(s))) return tab;
   }
   return "health";
@@ -87,10 +97,12 @@ const state = {
   summaryUpdater: null,
   tabUpdater: null,
   graphs: new Map(),       // group key -> plot entry, reused across relists (see layoutTab)
+  seen: null,              // IntersectionObserver for the plots on screen (null without one)
   table: null,             // {rows, foot}: the table's cells, updated in place
   banners: {},             // banner id -> {wrap, span}
   flagsSig: null,
   lastOkAt: null,
+  mupixSig: null,          // the MuPix plane map the MuPix tab was laid out for
 };
 
 window.addEventListener("load", function () {
@@ -115,6 +127,19 @@ async function refreshSummary() {
   try { status = await BRPC.json(state.client, "dqm::status", ""); } catch (e) { /* optional */ }
   state.summary = summary;
   state.status = status;
+  // The per-plane occupancy plots have one line per chip of the plane: a
+  // plane-map edit in the ODB lays the MuPix tab out again.
+  const sig = JSON.stringify(summary && summary.mupix ? summary.mupix.planes : null);
+  if (state.mupixSig !== null && sig !== state.mupixSig && state.plots.mupix) {
+    delete state.plots.mupix;
+    for (const [k, g] of [...state.graphs]) {
+      if (k.indexOf("#") < 0) continue;
+      if (state.seen) state.seen.unobserve(g.wrap);
+      state.graphs.delete(k);
+    }
+    if (state.tab === "mupix") layoutTab("mupix");
+  }
+  state.mupixSig = sig;
 
   // A histogram rebuild (a shift, cut or binning edit in the ODB) starts a new
   // epoch and can change the set of names -- dt_Sk_S1 follows the counter
@@ -154,13 +179,19 @@ function showTab(tab) {
   state.tab = tab;
   save();
   for (const [id] of TABS) {
-    const b = document.getElementById(`dqm-sma-tab-${id}`);
     const pane = document.getElementById(`dqm-sma-pane-${id}`);
-    if (b) b.className = id === tab ? "mbutton dqm-sma-tab active" : "mbutton dqm-sma-tab";
     if (pane) pane.style.display = id === tab ? "" : "none";
   }
+  markTabs(TABS, "dqm-sma", tab);
   if (tab === "trends") layoutTrends();
   else layoutTab(tab);
+  // The pane was hidden, so every plot reads as off screen. Poll them all
+  // until the observer reports again, and make it report: a target observed
+  // afresh gets its current state, not just the next change.
+  for (const p of state.plots[tab] || []) {
+    p.visible = undefined;
+    if (state.seen) { state.seen.unobserve(p.wrap); state.seen.observe(p.wrap); }
+  }
 
   // A fresh updater per tab, never stop()+start() on one: a tick already in
   // flight for the old tab would re-arm after start() and leave two polling
@@ -197,6 +228,16 @@ function groupsFor(tab) {
   const groups = [];
   const byKey = new Map();
   for (const n of names) {
+    const occ = /^sma\/mupix_(col|row)_chip$/.exec(n);
+    if (occ) {
+      // One 2D histogram (chip x column), drawn as one plot per plane with a
+      // line per chip: the 1-D occupancy of each chip, side by side.
+      for (const [plane, chips] of mupixPlanes()) {
+        const key = `${n}#${plane}:${chips.join(",")}`;
+        groups.push({ key, names: [n], occupancy: { axis: occ[1], plane, chips } });
+      }
+      continue;
+    }
     const m = /^(sma\/tot_ch\d+)_lsb([01])$/.exec(n);
     const key = m ? m[1] : n;
     if (!byKey.has(key)) { byKey.set(key, { key, names: [] }); groups.push(byKey.get(key)); }
@@ -227,26 +268,13 @@ function layoutTab(tab) {
     wrap.appendChild(div);
     wrap.appendChild(foot);
     grid.appendChild(wrap);
-
-    const pair = g.names.length > 1;
-    const mpg = new MPlotGraph(div, {
-      showMenuButtons: true,
-      mouseWheelZoom: true,
-      title: { text: "" },
-      stats: { show: false },
-      legend: { show: pair },
-      xAxis: { title: { text: "", textSize: 12 }, textSize: 12 },
-      yAxis: { title: { text: "", textSize: 12 }, textSize: 12 },
-    });
-    div.mpg = mpg;
-    g.names.forEach(function (n, i) {
-      mpg.addPlot({ label: pair ? `fine bit 0 = ${n.slice(-1)}` : shortName(n),
-                    xData: [], yData: [], line: { color: COLOURS[i] } });
-    });
-    const entry = Object.assign({ wrap, div, mpg, title, foot }, g);
+    // The renderer is made at the first reply, when the dimensions are known:
+    // an mplot graph for 1D, a DQMHeatmap for 2D (see drawPlot).
+    const entry = Object.assign({ wrap, div, mpg: null, heat: null, title, foot, sig: null }, g);
+    wrap._plot = entry;
+    watch(wrap);
     state.graphs.set(g.key, entry);
     plots.push(entry);
-    window.setTimeout(function () { mpg.resize(); mpg.draw(); }, 0);
   }
   if (!plots.length) {
     grid.appendChild(el("div", { class: "dqm-note" },
@@ -257,7 +285,92 @@ function layoutTab(tab) {
   state.plots[tab] = plots;
 }
 
+/**
+ * Plots scrolled out of view are not polled once they have been drawn: most
+ * tabs are taller than a screen. rootMargin: a plot about to scroll in is
+ * already fetched. Without IntersectionObserver every plot is polled.
+ */
+function watch(wrap) {
+  if (state.seen === null && typeof IntersectionObserver === "function") {
+    state.seen = new IntersectionObserver(function (entries) {
+      for (const e of entries) if (e.target._plot) e.target._plot.visible = e.isIntersecting;
+    }, { rootMargin: "200px 0px" });
+  }
+  if (state.seen) state.seen.observe(wrap);
+}
+
+/** The 1D renderer: an mplot graph, made on the first reply. */
+function ensureGraph(p) {
+  if (p.mpg) return p.mpg;
+  if (p.heat) { p.div.innerHTML = ""; p.heat = null; p.div.heatmap = null; }
+  const pair = p.names.length > 1;
+  const dtWin = /^sma\/mupix_dt_L[12]$/.test(p.key);
+  const mpg = new MPlotGraph(p.div, {
+    showMenuButtons: true,
+    mouseWheelZoom: true,
+    title: { text: "" },
+    stats: { show: false },
+    legend: { show: pair || dtWin || !!p.occupancy },
+    xAxis: { title: { text: "", textSize: 12 }, textSize: 12 },
+    yAxis: { title: { text: "", textSize: 12 }, textSize: 12 },
+  });
+  p.div.mpg = mpg;
+  if (p.occupancy) {
+    p.occupancy.chips.forEach(function (c, i) {
+      mpg.addPlot({ label: `chip ${c}`, xData: [], yData: [], line: { color: COLOURS[i % COLOURS.length] } });
+    });
+  } else {
+    p.names.forEach(function (n, i) {
+      mpg.addPlot({ label: pair ? `fine bit 0 = ${n.slice(-1)}` : shortName(n),
+                    xData: [], yData: [], line: { color: COLOURS[i] } });
+    });
+  }
+  if (dtWin) {
+    // The in-time window and the sideband, outlined over the histogram.
+    mpg.addPlot({ label: "in time", type: "scatter", xData: [], yData: [],
+                  line: { draw: true, width: 2, color: "#2ca02c" }, marker: { draw: false } });
+    mpg.addPlot({ label: "sideband", type: "scatter", xData: [], yData: [],
+                  line: { draw: true, width: 2, color: "#7f7f7f" }, marker: { draw: false } });
+  }
+  coalesce(mpg);
+  p.mpg = mpg;
+  window.setTimeout(function () { mpg.resize(); mpg.draw(); }, 0);
+  return mpg;
+}
+
+/**
+ * One draw per animation frame. mplot's setData() schedules a full draw and so
+ * does redraw(): an overlaid pair drew three times per update, a five-line
+ * trend six times.
+ */
+function coalesce(mpg) {
+  let queued = false;
+  const raf = window.requestAnimationFrame
+    ? (f) => window.requestAnimationFrame(f) : (f) => window.setTimeout(f, 0);
+  mpg.redraw = function () {
+    if (queued) return;
+    queued = true;
+    raf(function () { queued = false; mpg.draw(); });
+  };
+  return mpg;
+}
+
+/** The 2D renderer, made on the first reply. */
+function ensureHeatmap(p) {
+  if (p.heat) return p.heat;
+  if (p.mpg) { p.div.innerHTML = ""; p.mpg = null; p.div.mpg = null; }
+  p.heat = new DQMHeatmap(p.div);
+  p.div.heatmap = p.heat;
+  return p.heat;
+}
+
 function titleFor(g) {
+  if (g.occupancy) {
+    const o = g.occupancy;
+    return `${o.axis === "col" ? "Column" : "Row"} occupancy, ${o.plane} (chips ${o.chips.join(", ")}), ` +
+           `all pixel hits${o.axis === "row" ? " (rows ≥ 250 are not on the sensor)" : ""}  ` +
+           `[${shortName(g.names[0])}]`;
+  }
   const m = /tot_ch(\d+)$/.exec(g.key);
   if (m) {
     const ch = Number(m[1]);
@@ -271,9 +384,11 @@ async function refreshTab(tab) {
   if (state.names === null) return;          // the summary poll lists them first
   layoutTab(tab);
   const plots = state.plots[tab] || [];
-  let failed = 0, last = null;
+  let failed = 0, tried = 0, last = null;
   for (const p of plots) {
     if (state.tab !== tab) return;           // switched away mid-poll
+    if (p.visible === false && p.sig !== null) continue;   // off screen, drawn before
+    tried++;
     // Per plot, so one histogram that fails to decode or has vanished in a
     // rebuild does not stop the other twenty from updating.
     try {
@@ -291,12 +406,68 @@ async function refreshTab(tab) {
       if (!(e instanceof Error) || /did not answer/.test(e.message)) throw e;
     }
   }
-  if (plots.length && failed === plots.length) throw last;
+  if (tried && failed === tried) throw last;
   tabOk(tab);
 }
 
+/** [[plane name, chip ids], ...] from the summary (the ODB plane map), L1 and L2. */
+function mupixPlanes() {
+  const pl = state.summary && state.summary.mupix && state.summary.mupix.planes;
+  if (!pl) return [["L1", [0, 1, 2, 3]], ["L2", [4, 5, 6, 7]]];
+  return [["L1", pl.L1 || []], ["L2", pl.L2 || []]];
+}
+
+/**
+ * A per-plane occupancy plot: the chips' columns of the (chip x column/row)
+ * histogram, each drawn as a 1-D histogram.
+ */
+async function drawOccupancy(p) {
+  const name = p.names[0];
+  if (!(name in state.meta)) {
+    try { state.meta[name] = await BRPC.json(state.client, "dqm::metadata", name); }
+    catch (e) { state.meta[name] = null; }
+  }
+  const hist = await BRPC.histogram(state.client, name);
+  if (hist.dimensions !== 2) throw new Error(`${name} is not 2-D`);
+  const sig = `${DQMHeatmap.checksum(hist.data)}|${hist.entries}|${state.logY}`;
+  if (sig === p.sig && p.mpg) return;          // unchanged: nothing to draw
+  ensureGraph(p);
+  const nx = hist.nBins[0] + 2, ny = hist.nBins[1] + 2;
+  applyScale(p.mpg, 1);
+  let total = 0;
+  p.occupancy.chips.forEach(function (c, i) {
+    const col = new Array(ny);
+    for (let iy = 0; iy < ny; iy++) col[iy] = hist.data[(c + 1) + iy * nx];
+    total += col.reduce((a, b) => a + b, 0);
+    BRPC.display({ dimensions: 1, nBins: [hist.nBins[1]], lowEdge: [hist.lowEdge[1]],
+                   highEdge: [hist.highEdge[1]], data: col, entries: 0 }, p.mpg, i);
+    p.mpg.param.plot[i].line.color = COLOURS[i % COLOURS.length];
+  });
+  const axes = (state.meta[name] && state.meta[name].axes) || [];
+  p.mpg.param.xAxis.title.text = (axes[1] && axes[1].title) || p.occupancy.axis;
+  p.mpg.param.yAxis.title.text = "entries";
+  p.mpg.redraw();
+  p.foot.textContent = `${Math.round(total).toLocaleString()} pixel hits on ${p.occupancy.plane}`;
+  p.sig = sig;
+}
+
+/** The in-time window and sideband outlines on a t(pixel) - t(S1) plot (series 1 and 2). */
+function markMupixWindows(p, hist) {
+  const mp = state.summary && state.summary.mupix;
+  if (!mp || p.mpg.param.plot.length < 3) return;
+  let top = 1;
+  for (const v of hist.data) if (v > top) top = v;
+  const lo = state.logY ? 0.5 : 0;
+  const box = (w) => [[w[0], w[0], w[1], w[1]], [lo, top, top, lo]];
+  const [wx, wy] = box(mp.window_ns || [-150, 450]);
+  const [sx, sy] = box(mp.sideband_ns || [-2400, -1800]);
+  p.mpg.setData(1, wx, wy);
+  p.mpg.setData(2, sx, sy);
+}
+
 async function drawPlot(p) {
-  const counts = [];
+  if (p.occupancy) { await drawOccupancy(p); return; }
+  const hists = [];
   for (let i = 0; i < p.names.length; i++) {
     const name = p.names[i];
     if (!(name in state.meta)) {
@@ -306,20 +477,63 @@ async function drawPlot(p) {
       catch (e) { state.meta[name] = null; }
       p.title.textContent = titleFor(p);
     }
-    const hist = await BRPC.histogram(state.client, name);
+    hists.push(await BRPC.histogram(state.client, name));
+  }
+  const counts = hists.map((h) => h.entries);
+  const name0 = p.names[0];
+
+  if (hists[0].dimensions === 2 && hists.length === 1) {
+    const hist = hists[0];
+    const axes = (state.meta[name0] && state.meta[name0].axes) || [];
+    ensureHeatmap(p).setData(hist, {
+      logZ: state.logZ,
+      xTitle: (axes[0] && axes[0].title) || "",
+      yTitle: (axes[1] && axes[1].title) || "",
+    });
+    const out = p.heat.scale ? p.heat.scale.outside : 0;
+    const text = `${counts[0].toLocaleString()} entries` +
+      (out > 0 ? ` · ${Math.round(out).toLocaleString()} in under/overflow (not drawn)` : "");
+    if (p.foot.textContent !== text) p.foot.textContent = text;
+    p.sig = "2d";
+    return;
+  }
+
+  // 1D: redrawn only when a histogram, the y scale or the MuPix windows changed.
+  const mp = state.summary && state.summary.mupix;
+  const sig = hists.map((h) => `${DQMHeatmap.checksum(h.data)}:${h.entries}`).join(",") +
+    `|${state.logY}|${mp ? JSON.stringify([mp.window_ns, mp.sideband_ns]) : ""}`;
+  if (sig === p.sig && p.mpg) return;
+  ensureGraph(p);
+  hists.forEach(function (hist, i) {
+    const name = p.names[i];
     applyScale(p.mpg, hist.dimensions);
     BRPC.display(hist, p.mpg, i);
     // mplot resets a histogram's colour in setData; an overlaid pair has to be
     // told apart, so the colour is put back afterwards.
     if (hist.dimensions === 1 && p.names.length > 1) p.mpg.param.plot[i].line.color = COLOURS[i];
     applyAxisTitles(p.mpg, state.meta[name], hist.dimensions);
-    counts.push(hist.entries);
-  }
+    if (/^sma\/mupix_dt_L[12]$/.test(name)) markMupixWindows(p, hist);
+    if (name === "sma/mupix_s1_match") p.matchCounts = Array.from(hist.data);
+  });
   p.mpg.redraw();
   p.foot.textContent = p.names.length > 1
     ? p.names.map((n, i) => `lsb${n.slice(-1)}: ${counts[i].toLocaleString()}`).join(" · ") +
       " entries"
-    : `${counts[0].toLocaleString()} entries`;
+    : `${counts[0].toLocaleString()} entries` + (p.matchCounts ? matchText(p.matchCounts) : "");
+  p.sig = sig;
+}
+
+/**
+ * The fractions the S1-match histogram holds since the last clear: bin 0 the
+ * S1 hits judged, 1-3 L1 / L2 / L1+L2 in time, 4-6 in the sideband.
+ */
+function matchText(c) {
+  const b = (k) => c[k + 1] || 0;                 // index 0 is the underflow
+  const n = b(0);
+  if (!n) return "";
+  const f = (k) => `${(100 * b(k) / n).toFixed(1)} %`;
+  return ` · since the last clear, of ${n.toLocaleString()} S1 hits: in time L1 ${f(1)}, L2 ${f(2)}, ` +
+         `L1+L2 ${f(3)}; sideband L1 ${f(4)}, L2 ${f(5)}, L1+L2 ${f(6)}`;
 }
 
 /**
@@ -426,6 +640,15 @@ function layoutTrends() {
         get: (r) => (r.eff ? r.eff[k] : null) })) },
     { id: "rf", title: "RF valid fraction (S1 hits with a valid RF gate)", fraction: true,
       series: [{ label: "RF valid", get: (r) => r.rf_valid }] },
+    { id: "mupix", title: "S1 hits with a MuPix hit in time (accidentals taken out; raw and sideband for L1+L2)",
+      fraction: true,
+      series: [
+        { label: "L1", get: (r) => (r.mupix ? r.mupix.corr[0] : null) },
+        { label: "L2", get: (r) => (r.mupix ? r.mupix.corr[1] : null) },
+        { label: "L1+L2", get: (r) => (r.mupix ? r.mupix.corr[2] : null) },
+        { label: "L1+L2 raw", get: (r) => (r.mupix ? r.mupix.in[2] : null) },
+        { label: "L1+L2 sideband", get: (r) => (r.mupix ? r.mupix.side[2] : null) },
+      ] },
   ];
   tr.graphs = specs.map(function (spec) {
     const wrap = el("div", { class: "dqm-sma-plotwrap" });
@@ -444,6 +667,7 @@ function layoutTrends() {
       xAxis: { min: -TREND_S / 60, max: 0, title: { text: "minutes ago", textSize: 12 }, textSize: 12 },
       yAxis: { log: !!spec.log, title: { text: "", textSize: 12 }, textSize: 12 },
     });
+    coalesce(mpg);
     div.mpg = mpg;
     spec.series.forEach(function (s, i) {
       mpg.addPlot({ label: s.label, type: "scatter",
@@ -518,6 +742,75 @@ function render(s, status) {
   guard("dqm-sma-banner", () => renderBanner(s));
   guard("dqm-sma-flags", () => renderFlags(s));
   guard("dqm-sma-table", () => renderTable(s));
+  guard("dqm-sma-mupix", () => renderMupix(s));
+}
+
+const SYNC_CLASS = { ok: "green", low: "yellow", flagged: "red", insufficient: "", off: "" };
+
+/**
+ * The MuPix tab's head: per plane, the share of S1 hits with a pixel hit in
+ * the in-time window, in the sideband, and with the accidentals taken out,
+ * over the summary window; and the SMA <-> MuPix time-sync monitor's state.
+ * Built once, cells updated in place.
+ */
+function renderMupix(s) {
+  const holder = document.getElementById("dqm-sma-mupix");
+  if (!holder) return;
+  const mp = s && s.mupix;
+  if (!mp) { holder.innerHTML = ""; holder._built = false; return; }
+  if (!holder._built) {
+    holder.innerHTML = "";
+    holder.appendChild(el("div", { class: "dqm-strip dqm-sma-mpsync", id: "dqm-sma-mpsync" }));
+    const t = el("table", { class: "dqm-table dqm-sma-mptable" });
+    const head = el("tr", {});
+    for (const h of ["S1 hits with a MuPix hit", "in time", "sideband", "accidentals taken out"]) {
+      head.appendChild(el("th", {}, h));
+    }
+    t.appendChild(head);
+    holder._cells = {};
+    for (const k of ["L1", "L2", "both"]) {
+      const tr = el("tr", { "data-plane": k });
+      const tds = [0, 1, 2, 3].map(() => el("td", {}));
+      tds.forEach((td) => tr.appendChild(td));
+      holder._cells[k] = tds;
+      t.appendChild(tr);
+    }
+    holder.appendChild(t);
+    holder.appendChild(el("div", { class: "dqm-footnote", id: "dqm-sma-mpfoot" }));
+    holder._built = true;
+  }
+  const w = mp.window_ns || [], sb = mp.sideband_ns || [];
+  const planes = mp.planes || {};
+  for (const k of ["L1", "L2", "both"]) {
+    const f = (mp.fractions || {})[k] || {};
+    const tds = holder._cells[k];
+    const name = k === "both" ? "L1 and L2" : `${k} (chips ${(planes[k] || []).join(", ")})`;
+    setCell(tds[0], name, "");
+    setCell(tds[1], pct(f.in, 1), "");
+    setCell(tds[2], pct(f.side, 1), "");
+    setCell(tds[3], pct(f.corr, 1), k === "both" ? "dqm-sma-mpmain" : "");
+  }
+  const sy = mp.sync || {};
+  const bar = document.getElementById("dqm-sma-mpsync");
+  bar.innerHTML = "";
+  const val = sy.value === null || sy.value === undefined ? "" : ` · L1+L2 ${pct(sy.value, 1)}`;
+  const thr = sy.threshold === null || sy.threshold === undefined ? "" : ` (warns below ${pct(sy.threshold, 0)})`;
+  const stateText = {
+    ok: "in sync", low: `low for ${Math.round(sy.low_for_s || 0)} s`, flagged: "SYNC LOST?",
+    insufficient: "no verdict (too few S1 hits)", off: "MuPix analysis off",
+  }[sy.state] || String(sy.state || "?");
+  bar.appendChild(chip(`SMA ↔ MuPix time sync: ${stateText}${val}${thr}`, SYNC_CLASS[sy.state] || ""));
+  if (sy.absent) bar.appendChild(chip("no pixel words", "red"));
+  bar.appendChild(chip(`${num(mp.n_s1)} S1 hits judged · ${mp.pixels_per_frame === null ? "—" :
+    num(Math.round(mp.pixels_per_frame))} pixel words per frame`));
+  if (mp.unmapped) bar.appendChild(chip(`${num(mp.unmapped)} hits on chips with no plane`, "yellow"));
+  if (mp.skipped_frac) bar.appendChild(chip(`${pct(mp.skipped_frac, 1)} of pixel hits skipped (cap)`, "blue"));
+  const foot = `In time: t(pixel) - t(S1) in [${w[0]}, ${w[1]}) ns; sideband [${sb[0]}, ${sb[1]}) ns ` +
+    `(the accidentals); over the last ${Math.round(s.window_s || 0)} s, from the analysed S1 hits whose ` +
+    "windows lie in the frame's pixel data. The t(pixel) - t(S1) peak sits near 0 while the two time " +
+    "bases agree; it vanishes when they do not (see the sync chip).";
+  const fn = document.getElementById("dqm-sma-mpfoot");
+  if (fn.textContent !== foot) fn.textContent = foot;
 }
 
 function guard(id, fn) {
@@ -939,13 +1232,9 @@ function build() {
   r.appendChild(el("div", { id: "dqm-sma-flags", class: "dqm-sma-flags" }));
   r.appendChild(el("div", { id: "dqm-sma-table", class: "dqm-panel" }));
 
-  const bar = el("div", { class: "dqm-strip dqm-sma-tabs" });
-  for (const [id, label] of TABS) {
-    const b = el("button", { class: "mbutton dqm-sma-tab", id: `dqm-sma-tab-${id}` }, label);
-    b.onclick = function () { showTab(id); };
-    bar.appendChild(b);
-  }
-  bar.appendChild(el("span", { class: "dqm-sma-spacer" }));
+  // The page's controls on a row of their own above the tab strip, so they
+  // do not read as more tabs.
+  const bar = el("div", { class: "dqm-strip dqm-sma-toolbar", id: "dqm-sma-toolbar" });
   bar.appendChild(checkbox("dqm-sma-logy", "log y (1D)", state.logY,
     function (v) { state.logY = v; save(); redrawVisible(); }));
   bar.appendChild(checkbox("dqm-sma-logz", "log z (2D)", state.logZ,
@@ -965,10 +1254,13 @@ function build() {
   };
   bar.appendChild(clear);
   r.appendChild(bar);
+  r.appendChild(tabStrip(TABS, "dqm-sma", "SMA plots", () => state.tab, showTab));
 
   for (const [id] of TABS) {
-    const pane = el("div", { id: `dqm-sma-pane-${id}`, class: "dqm-sma-pane" });
+    const pane = el("div", { id: `dqm-sma-pane-${id}`, class: "dqm-sma-pane", role: "tabpanel",
+                             "aria-labelledby": `dqm-sma-tab-${id}` });
     pane.appendChild(el("div", { id: `dqm-sma-tabnote-${id}` }));
+    if (id === "mupix") pane.appendChild(el("div", { id: "dqm-sma-mupix", class: "dqm-panel" }));
     pane.appendChild(el("div", { class: "dqm-grid", id: `dqm-sma-grid-${id}` }));
     r.appendChild(pane);
   }
@@ -1003,6 +1295,49 @@ function fmtRate(hz) {
   if (hz >= 1e6) return `${(hz / 1e6).toFixed(2)} MHz`;
   if (hz >= 1e3) return `${(hz / 1e3).toFixed(1)} kHz`;
   return `${hz.toFixed(0)} Hz`;
+}
+
+/**
+ * A tab strip (role=tablist) of one role=tab button per [id, label] in `tabs`,
+ * with ids `${prefix}-tab-${id}` controlling the panes `${prefix}-pane-${id}`.
+ * Left/Right (wrapping), Home and End select and focus the neighbouring tab.
+ * `current()` says which tab is shown; `select(id)` shows one. markTabs()
+ * then sets the selection state, so the strip always follows showTab().
+ */
+function tabStrip(tabs, prefix, label, current, select) {
+  const bar = el("div", { class: "dqm-sma-tablist", role: "tablist", "aria-label": label });
+  for (const [id, text] of tabs) {
+    const b = el("button", {
+      type: "button", class: "dqm-sma-tab", id: `${prefix}-tab-${id}`, role: "tab",
+      "aria-selected": "false", "aria-controls": `${prefix}-pane-${id}`, tabindex: "-1",
+    }, text);
+    b.onclick = function () { select(id); };
+    bar.appendChild(b);
+  }
+  bar.addEventListener("keydown", function (ev) {
+    const n = tabs.length;
+    const i = tabs.findIndex(([id]) => id === current());
+    const to = { ArrowRight: (i + 1) % n, ArrowLeft: (i - 1 + n) % n, Home: 0, End: n - 1 }[ev.key];
+    if (to === undefined) return;
+    if (ev.preventDefault) ev.preventDefault();
+    const id = tabs[to][0];
+    if (id !== current()) select(id);
+    const b = document.getElementById(`${prefix}-tab-${id}`);
+    if (b) b.focus();
+  });
+  return bar;
+}
+
+/** The selection state of a tabStrip(): only the shown tab is selected and in the tab order. */
+function markTabs(tabs, prefix, shown) {
+  for (const [id] of tabs) {
+    const b = document.getElementById(`${prefix}-tab-${id}`);
+    if (!b) continue;
+    const on = id === shown;
+    b.setAttribute("aria-selected", on ? "true" : "false");
+    b.setAttribute("tabindex", on ? "0" : "-1");
+    b.className = on ? "dqm-sma-tab active" : "dqm-sma-tab";
+  }
 }
 
 function save() {
