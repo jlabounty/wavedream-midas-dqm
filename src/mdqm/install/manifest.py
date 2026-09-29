@@ -120,6 +120,7 @@ ENTRIES: tuple[Entry, ...] = (
     Entry("dqm-sma.js", "js/dqm-sma.js", False, "SMA plots page"),
     Entry("dqm-sma-events.js", "js/dqm-sma-events.js", False, "SMA event display page"),
     Entry("dqm-smaframe.js", "js/dqm-smaframe.js", False, "SMA frame (smaf) decoder"),
+    Entry("dqm-heatmap.js", "js/dqm-heatmap.js", False, "2D histograms drawn as an image"),
     Entry("dqm.css", "css/dqm.css", False, "the little that midas.css does not cover"),
     Entry("dqm-sma.css", "css/dqm-sma.css", False, "SMA page styles"),
 )
