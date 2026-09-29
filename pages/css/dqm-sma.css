@@ -1,0 +1,97 @@
+/* The SMA pages (SMA, SMAEvents). A separate file rather than more of dqm.css,
+   so a change here does not need a cache-busting bump on every other page.
+   Colours follow midas.css custom properties where one exists. */
+
+/* The coarse-shift banner. Deliberately loud: until it is fixed, every
+   fine/coarse number on the page is computed with the wrong shift. */
+.dqm-sma-banner   { display: flex; flex-wrap: wrap; align-items: center; gap: 12px;
+                    margin: 6px 0 10px 0; padding: 12px 16px; border-radius: 4px;
+                    background: #c00; color: #fff; font-size: 130%; font-weight: 700; }
+.dqm-sma-banner .mbutton { font-size: 75%; }
+
+/* "Counts are from the analysed sample": information under the status chips. */
+.dqm-sma-sampling { margin: -4px 0 8px 2px; }
+/* The same on the event display, beside the frame badges. */
+.dqm-smaev-sampling { margin-top: 0; }
+
+.dqm-sma-flags .dqm-diagnosis { margin: 2px 0; }
+.dqm-sma-flags   { margin-bottom: 8px; }
+
+table.dqm-sma-table tr.dqm-sma-quiet td { color: var(--mgray, #999); }
+table.dqm-sma-table td.dqm-sma-na { color: var(--mgray, #777); cursor: help; }
+table.dqm-sma-table th { white-space: nowrap; }
+
+.dqm-sma-tabs    { border-bottom: 1px solid var(--mgray, #ccc); padding-bottom: 6px; }
+.dqm-sma-tab.active { font-weight: 700; outline: 2px solid #06c; }
+.dqm-sma-spacer  { flex: 1 1 auto; }
+.dqm-sma-plotwrap { min-width: 0; }
+.dqm-sma-plot-error .dqm-footnote { color: var(--mred, #c00); }
+
+/* Event display */
+.dqm-sma-header  { margin: 4px 0 8px 0; }
+.dqm-sma-seed    { margin: 0 0 12px 0; padding: 4px 6px;
+                   border: 1px solid var(--mgray, #ccc); border-radius: 4px; }
+.dqm-sma-seedhead { display: flex; flex-wrap: wrap; align-items: center; gap: 8px;
+                    font-size: 90%; margin-bottom: 3px; }
+.dqm-sma-seedtitle { font-weight: 600; }
+.dqm-sma-pattern { display: inline-flex; gap: 2px; }
+.dqm-sma-pbox    { display: inline-block; min-width: 22px; text-align: center; font-size: 85%;
+                   padding: 1px 3px; border: 1px solid #888; border-radius: 3px;
+                   background: #eee; color: #888; }
+.dqm-sma-pbox.lit { background: #2ca02c; color: #fff; border-color: #1a6e1a; font-weight: 700; }
+.dqm-sma-badge   { display: inline-block; padding: 1px 7px; border-radius: 9px; font-size: 85%;
+                   background: #ddd; }
+.dqm-sma-badge.red    { background: var(--mred, #f88); }
+.dqm-sma-badge.yellow { background: var(--myellow, #ff8); }
+.dqm-sma-badge.blue   { background: #9cf; }
+.dqm-sma-canvas  { display: block; width: 100%; }
+.dqm-sma-legend  { display: flex; align-items: center; gap: 8px; font-size: 85%; margin-top: 4px; }
+.dqm-sma-ramp    { width: 240px; height: 12px; border: 1px solid #888; }
+/* color !important too: midas.css .mbutton:enabled (color #444) outranks one class. */
+.dqm-sma-frozen  { background: #06c !important; color: #fff !important; font-weight: 700; }
+
+/* Data from an analyzer that has stopped answering: kept, but not live. */
+.dqm-sma-stale   { opacity: 0.45; filter: grayscale(0.6); }
+
+/* Finding a frame again: the tag bar, the hover/pinned hit lines, the copy popup. */
+.dqm-smaev-tagbar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px;
+                    margin: 4px 0 2px 0; font-size: 90%; }
+.dqm-smaev-tag    { font-family: monospace; padding: 1px 6px; border-radius: 3px;
+                    background: #f0f0f0; border: 1px solid #ccc; user-select: all;
+                    overflow-wrap: anywhere; }
+.dqm-smaev-mini   { font-size: 85% !important; padding: 1px 8px !important; }
+.dqm-smaev-mini:disabled { opacity: 0.45; cursor: not-allowed; }
+.dqm-smaev-copied { background: #2ca02c !important; color: #fff !important; }
+.dqm-smaev-tagnote { color: #555; }
+.dqm-smaev-tagnote.red { color: var(--mred, #c00); font-weight: 600; }
+.dqm-smaev-tagnote.ok  { color: #1a6e1a; }
+/* The seed header's redrawn part: its badges stay items of the header's flex row. */
+.dqm-smaev-seedcontent { display: contents; }
+.dqm-smaev-copyseed { margin-left: auto; }
+.dqm-smaev-pointable { cursor: crosshair; }
+.dqm-smaev-hitinfo { margin: 3px 0 2px 0; font-size: 85%; }
+.dqm-smaev-hit    { font-family: monospace; overflow-wrap: anywhere; min-height: 1.5em;
+                    padding: 1px 4px; }
+.dqm-smaev-hint   { font-family: sans-serif; color: #888; }
+.dqm-smaev-hittag { color: #777; }
+/* Tagged hits: one list for both tabs, grouped by frame. The number box is
+   the one drawn beside the hit on the canvas. */
+.dqm-smaev-tagged { margin: 10px 0 6px 0; padding: 4px 8px 6px 8px; font-size: 85%;
+                    background: #fffdf0; border: 1px solid #e0c860; border-radius: 4px; }
+.dqm-smaev-taggedhead { display: flex; flex-wrap: wrap; align-items: center; gap: 8px;
+                        margin-bottom: 2px; }
+.dqm-smaev-taggedtitle { font-weight: 700; color: #7a5c00; }
+.dqm-smaev-taggednote { color: #555; }
+.dqm-smaev-taggednote.full { color: var(--mred, #c00); font-weight: 600; }
+.dqm-smaev-taggedframe { margin: 6px 0 2px 0; }
+.dqm-smaev-taggedrow { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+.dqm-smaev-taggedrow .dqm-smaev-hitline { flex: 1 1 400px; min-width: 0; }
+.dqm-smaev-tagnum { display: inline-block; min-width: 1.7em; text-align: center; border-radius: 2px;
+                    background: #000; color: #fff; font: bold 10px sans-serif; padding: 1px 2px; }
+.dqm-smaev-popup  { position: fixed; z-index: 1000; left: 50%; top: 30%;
+                    transform: translateX(-50%); width: min(720px, calc(100vw - 32px));
+                    padding: 10px 12px; background: #fff; border: 1px solid #888;
+                    border-radius: 4px; box-shadow: 0 4px 16px rgba(0, 0, 0, 0.3);
+                    display: flex; flex-direction: column; gap: 6px; font-size: 90%; }
+.dqm-smaev-popuptext { width: 100%; box-sizing: border-box; font-family: monospace; }
+.dqm-smaev-popup .mbutton { align-self: flex-end; }

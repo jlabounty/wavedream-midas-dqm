@@ -21,6 +21,18 @@ const DEFAULT_MAX = {
   "dqm::clear": 4 * 1024,
   "wd::status": 64 * 1024,
   "wd::defs": 64 * 1024,
+  "dqm::status": 64 * 1024,
+  "dqm::defs": 64 * 1024,
+  "sma::summary": 64 * 1024,
+  "sma::trend": 256 * 1024,
+  // A whole-frame raster is a few hundred kB; asking for less would cost a
+  // truncated reply and a retry on every poll.
+  "sma::frame": 512 * 1024,
+  // One raw MIDAS event, asked for by hand (Download raw event): as big as
+  // the frame, 320 kB for 40k words and up to ~8 MB, so ask for the largest
+  // once rather than paying a retry on the big ones. The retry still covers
+  // anything larger.
+  "sma::raw": 9 * 1024 * 1024,
 };
 
 /**
@@ -207,6 +219,14 @@ function display(hist, graph, index) {
  * The serialisation is the point: a fixed setInterval against a reply that
  * sometimes takes longer than the interval stacks requests behind each other
  * until mhttpd is the bottleneck. Re-arming from the response cannot.
+ *
+ * "One at a time" has to hold against every way a tick can be started: the
+ * re-arm timer, start(), and the tab becoming visible again. `_busy` is the
+ * guard. Without it a hide/show while a request was in flight found no timer
+ * pending, started a second chain beside the first, and each further toggle
+ * added another -- five concurrent sma::frame loops after ten toggles. Same
+ * for stop() + start() during a request. A tick that finds a request in
+ * flight leaves it to that request to re-arm.
  */
 class AutoUpdater {
   constructor(update, intervalMs) {
@@ -214,8 +234,9 @@ class AutoUpdater {
     this.intervalMs = intervalMs || 1000;
     this.running = false;
     this._timer = null;
+    this._busy = false;
     this._onVisible = () => {
-      if (!document.hidden && this.running && !this._timer) this._tick();
+      if (!document.hidden && this.running && !this._timer && !this._busy) this._tick();
     };
     document.addEventListener("visibilitychange", this._onVisible);
   }
@@ -234,8 +255,9 @@ class AutoUpdater {
   setInterval(ms) { this.intervalMs = ms; }
 
   async _tick() {
-    this._timer = null;
-    if (!this.running || document.hidden) return;
+    if (this._timer) { window.clearTimeout(this._timer); this._timer = null; }
+    if (this._busy || !this.running || document.hidden) return;
+    this._busy = true;
     let delay = this.intervalMs;
     try {
       await this.update();
@@ -244,12 +266,38 @@ class AutoUpdater {
       delay = Math.max(5000, this.intervalMs);
       if (typeof console !== "undefined") console.error("dqm update failed:", e);
       if (this.onError) this.onError(e);
+    } finally {
+      this._busy = false;
     }
-    if (this.running) this._timer = window.setTimeout(() => this._tick(), delay);
+    if (this.running && !this._timer) this._timer = window.setTimeout(() => this._tick(), delay);
   }
 }
 
-const BRPC = { call, list, json, histogram, decodeHistogram, display, AutoUpdater, textOf };
+/**
+ * A failed call, as one line a person can read.
+ *
+ * A brpc failure is an Error, but mjsonrpc rejects with a plain object
+ * ({request, xhr}) when mhttpd itself is down or restarting -- and
+ * `${thatObject}` is "[object Object]", which is what the page used to show.
+ */
+function errorText(e) {
+  if (e === null || e === undefined) return "unknown error";
+  if (typeof e === "string") return e;
+  if (e instanceof Error || typeof e.message === "string") return e.message;
+  if (e.xhr) {
+    const x = e.xhr;
+    if (x.readyState === 4 && x.status === 0) return "mhttpd is not reachable (network error)";
+    return `mhttpd answered HTTP ${x.status}${x.statusText ? ` (${x.statusText})` : ""}`;
+  }
+  if (e.error && (e.error.message || e.error.code !== undefined)) {
+    return `JSON-RPC error ${e.error.code !== undefined ? e.error.code : ""} ${e.error.message || ""}`.trim();
+  }
+  if (e.result && e.result.status !== undefined) return `MIDAS status ${e.result.status}`;
+  if (e.status !== undefined) return `MIDAS status ${e.status}`;
+  try { return JSON.stringify(e); } catch (x) { return String(e); }
+}
+
+const BRPC = { call, list, json, histogram, decodeHistogram, display, AutoUpdater, textOf, errorText };
 root.BRPC = BRPC;
 if (typeof module !== "undefined" && module.exports) module.exports = BRPC;
 

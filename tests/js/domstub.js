@@ -21,6 +21,7 @@ class El {
     this.listeners = {};
     this.onchange = null;
     this.onclick = null;
+    if (this.tagName === "CANVAS") { this.width = 300; this.height = 150; }
     this.classList = {
       add: (...c) => this._classes(c, true),
       remove: (...c) => this._classes(c, false),
@@ -39,6 +40,16 @@ class El {
     if (k === "class") this.className = String(v);
   }
   getAttribute(k) { return this.attrs[k]; }
+  removeAttribute(k) { delete this.attrs[k]; }
+  /** A recording 2D context for <canvas>, see makeContext2D. */
+  getContext(kind) {
+    if (this.tagName !== "CANVAS" || kind !== "2d") return null;
+    if (!this._ctx) this._ctx = makeContext2D();
+    return this._ctx;
+  }
+  getBoundingClientRect() {
+    return { left: 0, top: 0, width: this.clientWidth || 0, height: 0 };
+  }
   appendChild(c) { c.parent = this; this.children.push(c); return c; }
   insertBefore(c, ref) {
     c.parent = this;
@@ -54,7 +65,16 @@ class El {
     if (i >= 0) this.parent.children.splice(i, 1);
   }
   addEventListener(name, fn) { (this.listeners[name] = this.listeners[name] || []).push(fn); }
-  dispatch(name) { (this.listeners[name] || []).forEach((f) => f.call(this)); }
+  dispatch(name, ev) { (this.listeners[name] || []).forEach((f) => f.call(this, ev)); }
+  /** click(): the handler and listeners, and a record in El.clicks (a download link's). */
+  click() {
+    El.clicks.push(this);
+    if (typeof this.onclick === "function") this.onclick({ target: this });
+    this.dispatch("click", { target: this });
+  }
+  focus() { El.focused = this; }
+  /** select() on a textarea: what document.execCommand("copy") then copies. */
+  select() { El.selected = this; }
   set textContent(v) { this._text = String(v); this.children = []; }
   get textContent() {
     if (this._text !== null) return this._text;
@@ -70,6 +90,42 @@ class El {
   byClass(c) { return this.findAll((e) => e.classList.contains(c)); }
   byTag(t) { return this.findAll((e) => e.tagName === t.toUpperCase()); }
 }
+
+/**
+ * A canvas 2D context that records what was drawn instead of drawing it.
+ *
+ * `ops` holds [method, args, style] per call, where style is the fillStyle for
+ * fills and the strokeStyle for strokes at the time of the call -- enough for a
+ * test to ask "was a red outline drawn" or "how many bars went out" without a
+ * pixel buffer.
+ */
+function makeContext2D() {
+  const ctx = {
+    ops: [],
+    fillStyle: "#000", strokeStyle: "#000", lineWidth: 1, font: "10px sans-serif",
+    textAlign: "start", textBaseline: "alphabetic", globalAlpha: 1,
+    measureText: (t) => ({ width: String(t).length * 6 }),
+    count(name, style) {
+      return this.ops.filter((o) => o[0] === name && (style === undefined || o[2] === style)).length;
+    },
+    texts() { return this.ops.filter((o) => o[0] === "fillText").map((o) => String(o[1][0])); },
+  };
+  const fills = ["fillRect", "fill", "fillText"];
+  const strokes = ["strokeRect", "stroke"];
+  for (const m of [...fills, ...strokes, "clearRect", "beginPath", "closePath", "moveTo",
+                   "lineTo", "rect", "arc", "clip", "save", "restore", "setTransform",
+                   "setLineDash", "translate", "scale"]) {
+    ctx[m] = function (...args) {
+      const style = fills.includes(m) ? ctx.fillStyle : strokes.includes(m) ? ctx.strokeStyle : undefined;
+      ctx.ops.push([m, args, style]);
+    };
+  }
+  return ctx;
+}
+
+El.clicks = [];
+El.focused = null;
+El.selected = null;
 
 class TextNode extends El {
   constructor(t) { super("#text"); this._text = String(t); }
@@ -118,6 +174,27 @@ function runPage(scriptPath, responses, opts = {}) {
   root.id = "dqm-root";
   doc._roots.push(root);
   doc._byId.set("dqm-root", root);
+  // <body>, for what a page appends outside its root (a hidden textarea to copy
+  // from, a download link, a popup).
+  const body = new El("body");
+  doc.body = body;
+  doc._roots.push(body);
+
+  // The clipboard as the page can reach it. opts.secure: window.isSecureContext
+  // (navigator.clipboard only works there); opts.clipboard: "ok" (default),
+  // "reject" or "absent"; opts.execCommand: false makes execCommand("copy")
+  // refuse, as a browser does outside a user gesture.
+  const clipboard = [];          // what navigator.clipboard.writeText received
+  const copied = [];             // what execCommand("copy") copied (the selected textarea)
+  doc.execCommand = (cmd) => {
+    if (cmd !== "copy" || opts.execCommand === false) return false;
+    copied.push(El.selected ? El.selected.value : undefined);
+    return true;
+  };
+  const blobs = [];              // [{url, blob}] from URL.createObjectURL
+  const revoked = [];
+  El.clicks = [];
+  El.selected = null;
 
   const calls = [];
   const timers = [];
@@ -133,10 +210,28 @@ function runPage(scriptPath, responses, opts = {}) {
   };
 
   const loadHandlers = [];
+  const winListeners = {};
   g.document = doc;
   g.window = {
-    addEventListener: (n, f) => { if (n === "load") loadHandlers.push(f); },
+    addEventListener: (n, f) => {
+      if (n === "load") loadHandlers.push(f);
+      else (winListeners[n] = winListeners[n] || []).push(f);
+    },
     location: { href: "http://localhost:8088/?cmd=custom&page=Scalers" },
+    isSecureContext: !!opts.secure,
+    navigator: {
+      clipboard: opts.clipboard === "absent" ? undefined : {
+        writeText(t) {
+          if (opts.clipboard === "reject") return Promise.reject(new Error("NotAllowedError"));
+          clipboard.push(String(t));
+          return Promise.resolve();
+        },
+      },
+    },
+    URL: {
+      createObjectURL(b) { const url = `blob:stub/${blobs.length}`; blobs.push({ url, blob: b }); return url; },
+      revokeObjectURL(u) { revoked.push(u); },
+    },
   };
   // The page assigns window.dqmTempCell; keep window and globalThis in sync so
   // an inline onchange="dqmTempCell(this)" would resolve the same way.
@@ -199,7 +294,9 @@ function runPage(scriptPath, responses, opts = {}) {
   new Function(fs.readFileSync(scriptPath, "utf8"))();
 
   return {
-    doc, root, calls, timers, intervals,
+    doc, root, calls, timers, intervals, clipboard, copied, blobs, revoked,
+    /** Every element click() was called on (the page's download links among them). */
+    get clicks() { return El.clicks; },
     async load() {
       for (const h of loadHandlers) h();
       // Let the boot() promise chain settle.
@@ -207,6 +304,8 @@ function runPage(scriptPath, responses, opts = {}) {
       await new Promise((r) => setImmediate(r));
       for (let i = 0; i < 50; i++) await Promise.resolve();
     },
+    /** Fire a window event (mouseup, resize, ...) at the page's listeners. */
+    windowEvent(name, ev) { (winListeners[name] || []).forEach((f) => f(ev)); },
     flushTimers() { const t = timers.splice(0); t.forEach((f) => f()); },
     tick() { this.intervals.forEach((i) => i.fn()); },
   };
@@ -271,4 +370,4 @@ class Refresher {
   }
 }
 
-module.exports = { El, runPage, makeDocument, Refresher };
+module.exports = { El, runPage, makeDocument, makeContext2D, Refresher };

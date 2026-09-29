@@ -114,7 +114,14 @@ ENTRIES: tuple[Entry, ...] = (
     Entry("dqm-brpc.js", "js/dqm-brpc.js", False, "talking to an analyzer over binary RPC"),
     Entry("dqm-waveforms.js", "js/dqm-waveforms.js", False, "accumulated plots page"),
     Entry("dqm-evd.js", "js/dqm-evd.js", False, "event display page"),
+    Entry("SMAPlots", "sma.html", True, "SMA plots, flags and trends (needs the SMA analyzer)"),
+    Entry("SMAEvents", "sma-events.html", True,
+          "SMA S1-seeded events and whole-frame raster (needs the SMA analyzer)"),
+    Entry("dqm-sma.js", "js/dqm-sma.js", False, "SMA plots page"),
+    Entry("dqm-sma-events.js", "js/dqm-sma-events.js", False, "SMA event display page"),
+    Entry("dqm-smaframe.js", "js/dqm-smaframe.js", False, "SMA frame (smaf) decoder"),
     Entry("dqm.css", "css/dqm.css", False, "the little that midas.css does not cover"),
+    Entry("dqm-sma.css", "css/dqm-sma.css", False, "SMA page styles"),
 )
 
 #: Config subtree for the pages themselves. Deliberately *not* under /Custom --
