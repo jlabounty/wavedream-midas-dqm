@@ -14,11 +14,14 @@ dependencies = ["numpy>=1.24"]
 # than vendoring them: that module is the reference implementation, and a copy
 # would fork on the first bug fix.
 wavedream = ["wdscalers>=0.1"]
+# mdqm-sma-file: lz4 for .mid.lz4 files, matplotlib for summary.png.
+offline = ["lz4", "matplotlib"]
 dev = ["pytest>=8", "pytest-benchmark>=4", "ruff>=0.5"]
 
 [project.scripts]
 mdqm-analyzer = "mdqm.dqm.analyzer:main"
 mdqm-register-pages = "mdqm.install.register_pages:main"
+mdqm-sma-file = "mdqm.tools.sma_file:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
