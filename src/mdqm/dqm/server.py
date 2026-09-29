@@ -10,9 +10,12 @@ Everything uses brpc, JSON included, rather than splitting small replies onto
 (``mjsonrpc.cxx:3455``), which silently mangles any non-UTF-8 byte -- a landmine
 for whoever later adds a binary path to it. One transport, one client function.
 
-The ``dqm::`` commands are musip-compatible; ``wd::`` are ours. An unrecognised
-namespace returns an empty reply rather than an error, so another RPC handler in
-the same client can take it -- which is how musip's own dispatcher behaves.
+The ``dqm::`` commands are musip-compatible; ``wd::`` are ours, and
+``dqm::status``/``dqm::defs`` are plugin-neutral aliases of the ``wd::`` pair for
+pages that serve more than one analyzer. A plugin may add its own commands
+(``sma::...``) through ``extra``. An unrecognised namespace returns an empty
+reply rather than an error, so another RPC handler in the same client can take
+it -- which is how musip's own dispatcher behaves.
 """
 
 from __future__ import annotations
@@ -30,11 +33,14 @@ class Server:
     why the command set is easy to trust.
     """
 
-    def __init__(self, store, status_fn=None, defs_fn=None, scope_fn=None):
+    def __init__(self, store, status_fn=None, defs_fn=None, scope_fn=None, extra=None):
         self.store = store
         self._status_fn = status_fn or (lambda: {})
         self._defs_fn = defs_fn or (lambda: {})
         self._scope_fn = scope_fn or (lambda: None)
+        #: cmd -> fn(args: str) -> bytes, already framed by the plugin. Consulted
+        #: after the built-ins, so a plugin cannot shadow dqm::histogram.
+        self._extra = dict(extra or {})
         self.calls = 0
         self.last_error: str | None = None
 
@@ -63,10 +69,18 @@ class Server:
             return self._clear(args)
         if cmd == "wd::scope":
             return self._scope()
-        if cmd == "wd::status":
+        if cmd in ("wd::status", "dqm::status"):
             return self._json(self._status_fn())
-        if cmd == "wd::defs":
+        if cmd in ("wd::defs", "dqm::defs"):
             return self._json(self._defs_fn())
+        handler = self._extra.get(cmd)
+        if handler is not None:
+            blob = handler(args)
+            # Checked here, where it becomes a framed error the page can show,
+            # rather than in the ctypes copy on the RPC thread.
+            if not isinstance(blob, bytes | bytearray):
+                raise TypeError(f"{cmd} returned {type(blob).__name__}, not framed bytes")
+            return bytes(blob)
         # Not ours. Empty, not an error: another handler may want it.
         return b""
 

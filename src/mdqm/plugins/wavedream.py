@@ -176,6 +176,9 @@ class WaveDreamPlugin:
     #: Both the current IDs and the pre-2026-07-30 ones, for the same reason
     #: wdunpack accepts both: a run file records its IDs but not who wrote it.
     event_ids = frozenset({401, 1})
+    #: The WaveDREAM frontend's loss counter: the analyzer halves its own rate
+    #: when this rises.
+    dropped_path = "/Equipment/WDWaveforms/Variables/Thread/DroppedPackets"
 
     def __init__(self, store, roles: dict | None = None, binning: dict | None = None):
         self.store = store

@@ -13,6 +13,11 @@ seconds without restarting anything -- which for binning means the affected
 histograms are rebuilt and therefore reset, because a histogram with different
 bins is a different histogram and pretending otherwise would silently mix two
 binnings in one plot.
+
+The module-level defaults below are the WaveDREAM analyzer's. A second plugin
+running as its own client brings its own root and defaults, and passes them to
+`seed` and `read`; two analyzers sharing one tree would each rebuild on the
+other's edits and fight over the sampling rate.
 """
 
 from __future__ import annotations
@@ -50,6 +55,10 @@ BINNING: dict[str, object] = {
 }
 
 #: How hard the analyzer works. One knob, replacing the retired stack's three.
+#:
+#: Deliberately no "process all" here. A plugin whose events are cheap declares
+#: that key in its own defaults; for this one it would be a switch that makes
+#: Python decode every waveform, one mistaken edit away.
 SAMPLING: dict[str, object] = {
     "max events per s": 20.0,
     "publish history": False,
@@ -62,22 +71,33 @@ SECTIONS = {
 }
 
 
-def seed(client) -> int:
+def seed(client, root: str = ROOT, sections: dict | None = None) -> int:
     """Create any missing key, without disturbing one that exists.
+
+    `sections` is a nested dict of defaults: a dict value is an ODB directory,
+    anything else is a key. Defaults to the WaveDREAM tree under `ROOT`.
 
     Written key by key rather than as a subtree dict: ``odb_set`` defaults to
     ``remove_unspecified_keys=True``, so handing it a whole section would delete
     anything an operator had added under it.
     """
     created = 0
-    for section, defaults in SECTIONS.items():
-        for key, value in defaults.items():
-            path = f"{ROOT}/{section}/{key}"
-            if client.odb_exists(path):
-                continue
-            client.odb_set(path, value)
-            created += 1
+    for path, value in _leaves(root, SECTIONS if sections is None else sections):
+        if client.odb_exists(path):
+            continue
+        client.odb_set(path, value)
+        created += 1
     return created
+
+
+def _leaves(prefix: str, tree: dict):
+    """(ODB path, default) for every key in a nested defaults dict."""
+    for key, value in tree.items():
+        path = f"{prefix}/{key}"
+        if isinstance(value, dict):
+            yield from _leaves(path, value)
+        else:
+            yield path, value
 
 
 def _as_list(value):
@@ -87,24 +107,35 @@ def _as_list(value):
     return list(value) if isinstance(value, list | tuple) else [value]
 
 
-def read(client) -> dict[str, dict]:
+def read(client, root: str = ROOT, sections: dict | None = None) -> dict[str, dict]:
     """The current settings, with built-in defaults for anything missing.
+
+    Mirrors the shape of `sections` (the WaveDREAM tree when omitted). Only keys
+    that have a default are read, so a stray key an operator added does nothing
+    -- including a ``Sampling/process all`` added to a tree that does not
+    declare it.
 
     Never raises: the analyzer must keep running with an ODB that somebody has
     half-edited, and falling back to a known default is better than stopping.
     """
-    out: dict[str, dict] = {}
-    for section, defaults in SECTIONS.items():
-        values = dict(defaults)
-        for key, default in defaults.items():
-            try:
-                got = client.odb_get(f"{ROOT}/{section}/{key}")
-            except Exception:
-                continue
-            if got is None:
-                continue
-            values[key] = _as_list(got) if isinstance(default, list) else got
-        out[section] = values
+    return _read_tree(client, root, SECTIONS if sections is None else sections)
+
+
+def _read_tree(client, prefix: str, defaults: dict) -> dict:
+    out: dict = {}
+    for key, default in defaults.items():
+        path = f"{prefix}/{key}"
+        if isinstance(default, dict):
+            out[key] = _read_tree(client, path, default)
+            continue
+        out[key] = default
+        try:
+            got = client.odb_get(path)
+        except Exception:
+            continue
+        if got is None:
+            continue
+        out[key] = _as_list(got) if isinstance(default, list) else got
     return out
 
 
@@ -114,7 +145,10 @@ def fingerprint(settings: dict) -> str:
 
 
 def binning_fingerprint(settings: dict) -> str:
-    """Only the parts that change the *shape* of a histogram.
+    """Only the parts that change the *shape* of a WaveDREAM histogram.
+
+    The default shape test; a plugin with other settings supplies its own as
+    ``shape_fingerprint(settings)``.
 
     Separate from the whole-settings digest on purpose: moving a channel role
     should not throw away accumulated plots, while changing a bin count has to.

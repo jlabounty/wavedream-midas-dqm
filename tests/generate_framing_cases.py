@@ -18,8 +18,9 @@ from mdqm.dqm import framing
 OUT = Path(__file__).resolve().parent / "js" / "framing-cases.json"
 
 
-def _case(name, counts, edges, entries, array_type):
-    payload = framing.encode_histogram(counts, edges, entries)
+def _case(name, counts, edges, entries, array_type, payload=None):
+    if payload is None:
+        payload = framing.encode_histogram(counts, edges, entries)
     return {
         "name": name,
         "payload_b64": base64.b64encode(payload).decode(),
@@ -58,6 +59,26 @@ def build_cases() -> list[dict]:
     # padding with almost no data after it.
     tiny = np.array([1, 2, 3], dtype=np.uint32)
     cases.append(_case("1D u32, one real bin", tiny, [(0.0, 1.0)], 6, "Uint32Array"))
+
+    # u64 counters, through the Hist classes that own them: they must reach
+    # musip's decoder as f64 with every count exact, including ones past 2**32
+    # that a u32 encoding would have wrapped.
+    from mdqm.dqm.hist import Axis, Hist1D, Hist2D
+
+    h1 = Hist1D("u64", Axis(6, 0.0, 6.0), dtype=np.uint64)
+    c1 = rng.integers(0, 1000, size=8).astype(np.uint64)
+    c1[3] = 2**40 + 7
+    h1.add_counts(c1, entries=12345678901)
+    cases.append(_case("1D u64 histogram as f64", h1.counts, [(0.0, 6.0)], h1.entries,
+                       "Float64Array", payload=h1.encode()))
+
+    h2 = Hist2D("u64_2d", Axis(5, -1.0, 1.0), Axis(3, 0.0, 30.0), dtype=np.uint64)
+    c2 = rng.integers(0, 1000, size=(5, 7)).astype(np.uint64)
+    c2[2, 4] = 2**33
+    h2.add_counts(c2)
+    cases.append(_case("2D u64 histogram as f64 (non-square)", h2.counts,
+                       [(-1.0, 1.0), (0.0, 30.0)], h2.entries,
+                       "Float64Array", payload=h2.encode()))
 
     return cases
 

@@ -9,6 +9,7 @@ each is a one-word edit away.
 from __future__ import annotations
 
 import inspect
+import json
 import time
 
 from mdqm.dqm import analyzer as A
@@ -64,7 +65,12 @@ class _FakeClient:
         self.messages.append(text)
 
     def register_event_request(self, buf, event_id=-1, trigger_mask=-1, sampling_type=None):
-        self.requests.append(sampling_type)
+        self.requests.append((event_id, sampling_type))
+
+    def communicate(self, timeout_ms):
+        # The time-based yield can fire in any run_once on a slow machine, so
+        # every fake has to accept it.
+        pass
 
 
 def _analyzer(rate=1000.0):
@@ -77,7 +83,11 @@ def test_the_event_request_is_non_blocking():
     """GET_ALL would let a slow monitor stall the frontend producing the data."""
     import midas
 
-    src = inspect.getsource(A.main)
+    # main() delegates to the method; the requests themselves are made there.
+    assert "analyzer.register_event_requests(client, buf)" in inspect.getsource(A.main)
+    assert "register_event_request(" not in inspect.getsource(A.main).replace(
+        "register_event_requests(", "")
+    src = inspect.getsource(A.Analyzer.register_event_requests)
     # Check what is passed, not what is mentioned: the source says "never
     # GET_ALL" in a comment, and a bare substring test matches that too.
     assert "sampling_type=midas.GET_NONBLOCKING" in src
@@ -555,3 +565,424 @@ def test_startup_with_an_unseeded_odb_keeps_the_code_defaults():
     a = _analyzer()
     a.apply_settings(_SettingsClient(), force=True)     # nothing seeded
     assert a.settings["Binning"]["persistence y bins"] == 110
+
+
+# --- a second plugin beside the WaveDREAM one --------------------------------
+
+class _OwnSettingsPlugin(_FakePlugin):
+    """A plugin with its own settings tree, as the SMA one will have."""
+
+    name = "own"
+    event_ids = frozenset({301})
+    settings_root = "/DQM/Own"
+    settings_defaults = {
+        "Coarse shift": 14,
+        "Binning": {"tot bins": 64},
+        "Sampling": {"max events per s": 20.0, "process all": True},
+    }
+    dropped_path = ""
+    client_name = "own_analyzer"
+    process_all = True                 # before any settings tree is read
+
+    def __init__(self, store):
+        super().__init__(store)
+        self.applied = []
+
+    def shape_fingerprint(self, settings):
+        return str(settings["Binning"])
+
+    def apply_settings(self, settings, rebuild):
+        self.applied.append((settings, rebuild))
+
+    def commands(self):
+        from mdqm.dqm import framing
+        return {"own::echo": lambda args: framing.envelope(
+            framing.TAG_JSON, json.dumps({"echo": args}).encode())}
+
+
+def _own(rate=20.0, **kw):
+    return A.Analyzer(lambda store: _OwnSettingsPlugin(store), rate=rate, **kw)
+
+
+def test_a_plugin_with_its_own_root_never_touches_the_wavedream_tree():
+    from mdqm.dqm import settings as S
+
+    a = _own()
+
+    class _Watching(_SettingsClient):
+        def __init__(self):
+            super().__init__()
+            self.read_paths = []
+
+        def odb_get(self, path):
+            self.read_paths.append(path)
+            return super().odb_get(path)
+
+    c = _Watching()
+    created = S.seed(c, a.settings_root, a.settings_defaults)
+    assert created == 4
+    assert c.tree["/DQM/Own/Coarse shift"] == 14, "a key at the root, not in a section"
+    assert c.tree["/DQM/Own/Binning/tot bins"] == 64
+
+    c.tree["/DQM/Own/Coarse shift"] = 13
+    a.apply_settings(c, force=True)
+
+    touched = list(c.tree) + c.read_paths
+    assert not [p for p in touched if p.startswith(S.ROOT)], \
+        "two analyzers in one tree would reconfigure each other"
+    assert a.settings["Coarse shift"] == 13
+    assert a.status()["settings_root"] == "/DQM/Own"
+
+
+def test_the_plugin_applies_its_own_settings_and_is_told_when_to_rebuild():
+    a = _own()
+    c = _SettingsClient()
+    from mdqm.dqm import settings as S
+    S.seed(c, a.settings_root, a.settings_defaults)
+
+    a.apply_settings(c, force=True)
+    assert a.plugin.applied[-1][1] is True, "the first apply rebuilds from the ODB"
+    assert a.reconfigures == 1
+    assert not hasattr(a.plugin, "roles"), "the WaveDREAM path must not run"
+
+    c.tree["/DQM/Own/Coarse shift"] = 15
+    a._settings_checked = 0
+    assert a.apply_settings(c) is True
+    assert a.plugin.applied[-1] == (a.settings, False), "not a shape change"
+    assert a.reconfigures == 1
+
+    c.tree["/DQM/Own/Binning/tot bins"] = 32
+    a._settings_checked = 0
+    a.apply_settings(c)
+    assert a.plugin.applied[-1][1] is True
+    assert a.reconfigures == 2
+    assert any("binning changed; rebuilt" in m for m in c.messages)
+
+
+def test_half_a_settings_declaration_is_refused():
+    import pytest
+
+    class _Half(_FakePlugin):
+        settings_root = "/DQM/Half"
+
+    with pytest.raises(ValueError, match="both"):
+        A.Analyzer(lambda store: _Half(store))
+
+
+def test_process_all_bypasses_the_bucket():
+    a = _own(rate=1.0)
+    client = _FakeClient()
+    client.events = [_Event(301) for _ in range(200)]
+    a.run_once(client, buf=None)
+    assert a.processed == 200, "every accepted event is decoded"
+    assert a.status()["sampling_bypassed"] is True
+
+
+def test_the_process_all_backstop_leaves_events_for_the_next_cycle():
+    """A backlog must delay process-all frames, not drop them undecoded."""
+    a = _own(rate=1.0)
+    client = _FakeClient()
+    client.events = [_Event(301) for _ in range(50)]
+
+    # A budget already spent: stop after the first event, drain nothing more.
+    drained = a.run_once(client, buf=None, budget_s=-1.0)
+    assert drained == 1 and a.processed == 1
+    assert a.budget_exhausted == 1
+    assert len(client.events) == 49, "the rest stays in the buffer"
+
+    a.run_once(client, buf=None, budget_s=2.0)
+    assert a.processed == 50, "and is decoded next cycle, none lost"
+
+
+def test_the_process_all_setting_overrides_the_plugin_attribute():
+    from mdqm.dqm import settings as S
+
+    a = _own(rate=1.0)
+    c = _SettingsClient()
+    S.seed(c, a.settings_root, a.settings_defaults)
+    c.tree["/DQM/Own/Sampling/process all"] = False
+    c.tree["/DQM/Own/Sampling/max events per s"] = 1.0
+    a.apply_settings(c, force=True)
+
+    c.events = [_Event(301) for _ in range(100)]
+    a.run_once(c, buf=None)
+    assert a.processed <= 2, "sampling again: the ODB said so"
+
+
+def test_a_throttle_re_engages_the_bucket_for_process_all():
+    """The DAQ-health valve must work whatever the plugin prefers."""
+    a = _own(rate=4.0, dropped_path="/Equipment/X/Dropped")
+    client = _FakeClient(dropped_series=[0, 3])
+    client.odb["/Equipment/X/Dropped"] = 0
+
+    def odb_get(path, _orig=client.odb_get):
+        if path == "/Equipment/X/Dropped":
+            return client._dropped.pop(0)
+        return _orig(path)
+    client.odb_get = odb_get
+
+    a.check_daq_health(client)
+    a.check_daq_health(client)
+    assert a.bucket.rate == 2.0
+    assert a.status()["sampling_bypassed"] is False
+
+    client.events = [_Event(301) for _ in range(100)]
+    a.run_once(client, buf=None)
+    assert a.processed <= 3, "the bucket applies again once throttled"
+
+
+def test_the_wavedream_default_still_samples():
+    from mdqm.plugins.wavedream import WaveDreamPlugin
+
+    a = A.Analyzer(lambda s: WaveDreamPlugin(s), rate=20.0)
+    a.apply_settings(_seeded_client(), force=True)
+    assert a.process_all is False
+    assert a.status()["sampling_bypassed"] is False
+    assert a.bucket.rate == 20.0
+
+
+def test_an_empty_dropped_path_disables_the_health_check():
+    a = _own()
+    assert a.dropped_path == "", "the plugin's choice"
+
+    class _Loud(_FakeClient):
+        def odb_get(self, path):
+            raise AssertionError(f"read {path} with the check disabled")
+
+    a.check_daq_health(_Loud())
+    assert a.bucket.rate == a.configured_rate
+
+
+def test_the_dropped_path_comes_from_the_plugin_or_the_command_line():
+    from mdqm.plugins.wavedream import WaveDreamPlugin
+
+    assert A.Analyzer(lambda s: WaveDreamPlugin(s)).dropped_path == A.DROPPED_PATH
+    assert _own(dropped_path="/X").dropped_path == "/X"
+    assert _analyzer().dropped_path == A.DROPPED_PATH, "legacy plugins keep the WD counter"
+
+
+def test_one_event_request_per_event_id_all_non_blocking():
+    import midas
+
+    from mdqm.plugins.wavedream import WaveDreamPlugin
+
+    client = _FakeClient()
+    A.Analyzer(lambda s: WaveDreamPlugin(s)).register_event_requests(client, buf=None)
+    assert client.requests == [(1, midas.GET_NONBLOCKING), (401, midas.GET_NONBLOCKING)]
+
+    client = _FakeClient()
+    _own().register_event_requests(client, buf=None)
+    assert client.requests == [(301, midas.GET_NONBLOCKING)], \
+        "the SMA client must not be handed waveform events"
+
+    class _Any(_FakePlugin):
+        event_ids = frozenset()
+
+    client = _FakeClient()
+    A.Analyzer(lambda s: _Any(s)).register_event_requests(client, buf=None)
+    assert client.requests == [(-1, midas.GET_NONBLOCKING)]
+
+
+def test_decoding_yields_after_a_time_even_below_the_event_count():
+    """A few heavy frames must not hold off the RPC handler for their sum."""
+
+    class _Slow(_FakePlugin):
+        def process(self, event, run_number=None):
+            time.sleep(0.01)
+            return super().process(event, run_number)
+
+    a = A.Analyzer(lambda s: _Slow(s), rate=100000.0)
+    a.YIELD_AFTER_S = 0.015
+
+    class _Counting(_FakeClient):
+        yields = 0
+
+        def communicate(self, timeout_ms):
+            self.yields += 1
+
+    client = _Counting()
+    client.events = [_Event() for _ in range(6)]
+    a.run_once(client, buf=None)
+
+    assert a.processed == 6
+    assert A.Analyzer.YIELD_EVERY > 6, "the count alone would never yield here"
+    assert client.yields >= 2, f"yielded {client.yields} times over ~60 ms of decoding"
+    assert A.Analyzer.YIELD_AFTER_S == 0.05
+
+
+def test_status_names_the_client_it_runs_as():
+    assert _analyzer().status()["client"] == A.DEFAULT_CLIENT
+    a = _own(client_name="sma_analyzer")
+    assert a.status()["client"] == "sma_analyzer"
+
+
+def test_messages_carry_the_client_name():
+    a = _own(client_name="sma_analyzer", dropped_path="/D")
+    client = _FakeClient(dropped_series=[0, 2])
+    client.odb_get = lambda path: client._dropped.pop(0)
+    a.check_daq_health(client)
+    a.check_daq_health(client)
+    assert client.messages[0].startswith("sma_analyzer: DAQ dropped 2 packets")
+
+
+def test_dqm_status_and_defs_alias_the_wd_commands():
+    from mdqm.dqm import framing
+
+    a = _own(client_name="sma_analyzer")
+    for alias, original in (("dqm::status", "wd::status"), ("dqm::defs", "wd::defs")):
+        _st, got = a.serve(None, alias, "", 65536)
+        _size, tag, body = framing.parse_envelope(bytes(got))
+        assert tag == framing.TAG_JSON, alias
+        payload = json.loads(body)
+        _st, ref = a.serve(None, original, "", 65536)
+        ref_payload = json.loads(framing.parse_envelope(bytes(ref))[2])
+        assert payload.keys() == ref_payload.keys(), alias
+    assert json.loads(framing.parse_envelope(bytes(
+        a.serve(None, "dqm::defs", "", 65536)[1]))[2])["plugin"] == "own"
+
+
+def test_plugin_commands_are_dispatched():
+    from mdqm.dqm import framing
+
+    a = _own()
+    _st, got = a.serve(None, "own::echo", "hi", 65536)
+    _size, tag, body = framing.parse_envelope(bytes(got))
+    assert tag == framing.TAG_JSON
+    assert body == b'{"echo": "hi"}'
+    # Unknown commands in the plugin's namespace are still left for others.
+    assert bytes(a.serve(None, "own::nope", "", 65536)[1]) == b""
+
+
+def test_a_plugin_command_cannot_shadow_a_builtin():
+    from mdqm.dqm.server import Server
+
+    srv = Server(HistStore(), extra={"dqm::list": lambda args: b"hijacked"})
+    assert srv.dispatch("dqm::list", "") != b"hijacked"
+
+
+def test_a_failing_plugin_command_is_reported_not_raised():
+    from mdqm.dqm import framing
+    from mdqm.dqm.server import Server
+
+    def boom(args):
+        raise RuntimeError("frame gone")
+
+    srv = Server(HistStore(), extra={"sma::frame": boom})
+    _size, tag, body = framing.parse_envelope(srv.dispatch("sma::frame", ""))
+    assert tag == framing.TAG_ERROR
+    assert b"frame gone" in body
+
+
+def test_the_sma_plugin_is_known_and_its_absence_is_explained(monkeypatch):
+    import builtins
+
+    import pytest
+
+    real_import = builtins.__import__
+
+    def no_sma(name, *args, **kwargs):
+        if name == "mdqm.plugins.sma":
+            raise ModuleNotFoundError("No module named 'mdqm.plugins.sma'")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", no_sma)
+    with pytest.raises(SystemExit, match="plugin 'sma' cannot be loaded"):
+        A.make_plugin_factory("sma")
+    with pytest.raises(SystemExit, match="known: wavedream, sma"):
+        A.make_plugin_factory("nope")
+
+
+# --- review follow-ups ---------------------------------------------------------
+
+def test_an_existing_wavedream_tree_gains_no_keys():
+    """Upgrading the analyzer must not add anything to a running experiment's tree."""
+    from mdqm.dqm import settings as S
+
+    # The tree the WaveDREAM analyzer seeded before plugins had their own roots.
+    existing = {f"{S.ROOT}/{section}/{key}": 0 for section, keys in {
+        "Channel roles": ["waveform channels", "s1 channel", "rf channel",
+                          "nim channels", "nim threshold V", "labels"],
+        "Binning": ["persistence x bins", "persistence y bins", "persistence y min",
+                    "persistence y max", "amplitude bins", "amplitude min",
+                    "amplitude max", "deltat bins", "deltat max s", "phase bins"],
+        "Sampling": ["max events per s", "publish history"],
+    }.items() for key in keys}
+    c = _SettingsClient(existing)
+    assert S.seed(c) == 0, "no new key in an experiment that already has the tree"
+    assert set(c.tree) == set(existing)
+    assert S.seed(_SettingsClient()) == len(existing), "and nothing missing either"
+
+
+def test_a_process_all_key_added_by_hand_to_the_wavedream_tree_is_ignored():
+    from mdqm.plugins.wavedream import WaveDreamPlugin
+
+    a = A.Analyzer(lambda s: WaveDreamPlugin(s), rate=20.0)
+    c = _seeded_client(**{"Sampling/process all": True})
+    a.apply_settings(c, force=True)
+    assert a.process_all is False
+    assert "process all" not in a.settings["Sampling"]
+
+
+def test_rate_zero_stops_decoding_even_with_process_all():
+    from mdqm.dqm import settings as S
+
+    a = _own()
+    c = _SettingsClient()
+    S.seed(c, a.settings_root, a.settings_defaults)
+    c.tree["/DQM/Own/Sampling/max events per s"] = 0.0
+    a.apply_settings(c, force=True)
+    assert a.process_all is True
+
+    c.events = [_Event(301) for _ in range(20)]
+    assert a.run_once(c, buf=None) == 20, "still drained"
+    assert a.processed == 0, "zero means decode nothing"
+    assert a.status()["sampling_bypassed"] is False
+
+
+def test_a_plugin_that_fails_to_apply_settings_is_retried():
+    from mdqm.dqm import settings as S
+
+    a = _own()
+    c = _SettingsClient()
+    S.seed(c, a.settings_root, a.settings_defaults)
+    a.apply_settings(c, force=True)
+    before = a.settings
+
+    fail = {"n": 2}
+    good = a.plugin.apply_settings
+
+    def flaky(settings, rebuild):
+        if fail["n"]:
+            fail["n"] -= 1
+            raise RuntimeError("rebuild failed")
+        good(settings, rebuild)
+    a.plugin.apply_settings = flaky
+
+    c.tree["/DQM/Own/Binning/tot bins"] = 32
+    for _ in range(2):
+        a._settings_checked = 0
+        assert a.apply_settings(c) is False
+        assert a.settings is before, "nothing recorded until the plugin took it"
+    errors = [m for m in c.messages if "could not apply" in m]
+    assert len(errors) == 1, "said once, not on every poll"
+
+    a._settings_checked = 0
+    assert a.apply_settings(c) is True, "the same change is retried and lands"
+    assert a.settings["Binning"]["tot bins"] == 32
+    assert a.plugin.applied[-1][1] is True, "still a rebuild: the shape never took"
+
+
+def test_the_client_name_defaults_to_the_plugin_s():
+    assert _own().status()["client"] == "own_analyzer"
+    assert _own(client_name="x").client_name == "x"
+    assert _analyzer().client_name == A.DEFAULT_CLIENT
+
+
+def test_a_plugin_command_that_returns_no_bytes_is_an_error_frame():
+    from mdqm.dqm import framing
+    from mdqm.dqm.server import Server
+
+    srv = Server(HistStore(), extra={"sma::summary": lambda args: {"not": "bytes"}})
+    _size, tag, body = framing.parse_envelope(srv.dispatch("sma::summary", ""))
+    assert tag == framing.TAG_ERROR
+    assert b"not framed bytes" in body

@@ -61,6 +61,8 @@ TAG_HIST = b"hist"
 TAG_META = b"meta"
 TAG_JSON = b"json"
 TAG_SCOPE = b"scop"
+TAG_SMAF = b"smaf"                      # one SMA readout frame; see plugins/sma.py
+TAG_MEVT = b"mevt"                      # one raw MIDAS event (header + banks), a .mid file
 TAG_ERROR = b"err "
 
 #: Index into musip's ``PlotCollection::object_type`` variant. Only the ones we
@@ -122,6 +124,13 @@ def encode_histogram(
         raise ValueError(f"only 1D and 2D histograms are encodable, got {dims}D")
     if len(edges) != dims:
         raise ValueError(f"{dims}D histogram needs {dims} edge pairs, got {len(edges)}")
+
+    if np.issubdtype(counts.dtype, np.integer) and counts.dtype.itemsize > 4:
+        # The format's only integer ordinate is u32. Wider counters travel as
+        # f64, which is exact to 2**53 and which every decoder reads by its
+        # ordinate size alone; narrowing to u32 would wrap silently instead.
+        counts = counts.astype(np.float64)
+        ordinate_size = 8
 
     is_int = np.issubdtype(counts.dtype, np.integer)
     if dims == 1:
@@ -373,4 +382,189 @@ def decode_scope_frame(payload: bytes) -> dict:
         "run_active": bool(flags & SCOPE_RUN_ACTIVE),
         "widths_cached": bool(flags & SCOPE_WIDTHS_CACHED),
         "channels": channels, "derived": derived,
+    }
+
+
+# ---------------------------------------------------------------------------
+# SMA frames (tag b"smaf")
+# ---------------------------------------------------------------------------
+#
+# One SMA readout frame for the event display: a fixed header, a JSON block
+# with everything that is per frame or per seed (small, and changes shape as the
+# display grows), then one entry per hit in four flat arrays. The hits dominate
+# -- a 40000-word frame is ~33k hits -- so they travel as 7 bytes each instead
+# of ~40 bytes of JSON, and the page wraps them in typed arrays without parsing.
+#
+# Layout, offsets relative to the payload start (the envelope sliced off, as
+# for every other tag; JS typed arrays throw on a misaligned offset)::
+#
+#     0   u8   version = 1
+#     1   u8   flags        SMAF_SEEDED | SMAF_STALE | SMAF_TRUNCATED | SMAF_SUSPECT
+#     2   u16  time_shift   k: a hit's time is meta["t0_ns"] + t_rel_ns * 2^k
+#     4   u32  n_hits       n
+#     8   u64  frame_seq    the plugin's frame counter (the cache/freeze key)
+#     16  u32  run          run number, 0 when unknown
+#     20  u32  json_len     bytes of UTF-8 JSON (ASCII in practice)
+#     24  u64  reserved = 0
+#     32  JSON metadata, json_len bytes, then NUL padding to a multiple of 8
+#     A = 32 + ceil8(json_len)
+#     A        u32 t_rel_ns[n]   (hit time - meta["t0_ns"]) >> k; ascending
+#     A + 4n   u8  ch[n]
+#     A + 5n   u8  tot[n]
+#     A + 6n   u8  hit_flags[n]  HIT_* bits below
+#     total = A + 7n
+#
+# ``t_rel_ns`` starts 8-aligned and is the only multi-byte array, which is why
+# it comes first; the byte arrays need no alignment. ``t0_ns`` is the first
+# *shipped* hit. A u32 of ns covers 4.29 s, and real frames with a beam trip in
+# them span more (5-6 s were measured), so the encoder picks the smallest
+# ``time_shift`` k that fits the shipped span: k = 0, exact ns, for every ordinary
+# frame; otherwise the times lose their k low bits. In JavaScript multiply by
+# ``2 ** k`` -- ``<<`` works on 32-bit signed integers and would overflow.
+# Seed times in the JSON (``seeds[].t_rel``) are ns from ``t0_ns``, never shifted.
+#
+# Version 2 (header flag SMAF_WORDS, version byte 2) adds, per hit, the raw
+# 64-bit word as received and its index in the H000 bank (counted in 64-bit
+# words, filler and pixel words included), so a hit on the page can be found
+# again in the file. The u64 array goes first for alignment::
+#
+#     A        u64 raw_word[n]
+#     A + 8n   u32 t_rel_ns[n]
+#     A + 12n  u32 word_index[n]
+#     A + 16n  u8  ch[n];  A + 17n u8 tot[n];  A + 18n u8 hit_flags[n]
+#     total = A + 19n
+#
+# Without word data the payload is exactly version 1 (7 bytes a hit). The
+# seeded view is always v2 (a few hundred hits); the raster only on request
+# (``{"words": true}``): 19 instead of 7 bytes a hit is +170 %, 0.6 MB instead
+# of 0.23 MB for a 40000-word frame at 2 Hz, so the page asks for it once, for a
+# frozen frame.
+
+SMAF_HEADER = struct.Struct("<BBHIQIIQ")
+"""32 bytes: version, flags, timeShift, nHits, frameSeq, run, jsonLen, reserved."""
+
+SMAF_VERSION = 1
+SMAF_VERSION_WORDS = 2
+
+#: Header `flags` bits.
+SMAF_SEEDED = 1 << 0        # the seeded view (hits inside seed windows only); else raster
+SMAF_STALE = 1 << 1         # the frame was classified stale (replayed/old buffer)
+SMAF_TRUNCATED = 1 << 2     # more hits than max_hits; the latest ones were kept
+SMAF_SUSPECT = 1 << 3       # no usable time base (most hits outside the time clusters)
+SMAF_WORDS = 1 << 4         # v2: raw words and word indices follow (see above)
+
+#: Per-hit flag bits.
+HIT_MISMATCH = 1 << 0       # fine and coarse disagree beyond one coarse tick + margin
+HIT_TOT_CORRUPT = 1 << 1    # ToT >= the corrupt threshold (254/255 markers)
+HIT_FINE_LSB = 1 << 2       # fine bit 0 set
+HIT_IN_SEED = 1 << 3        # inside at least one seed window
+HIT_STALE = 1 << 4          # the hit belongs to a stale frame
+
+
+def encode_sma_frame(
+    meta: dict,
+    t_rel_ns,
+    ch,
+    tot,
+    hit_flags,
+    *,
+    frame_seq: int = 0,
+    run_number: int = 0,
+    seeded: bool = False,
+    stale: bool = False,
+    truncated: bool = False,
+    suspect: bool = False,
+    time_shift: int = 0,
+    raw_words=None,
+    word_index=None,
+) -> bytes:
+    """Encode one SMA frame; the arrays must all have the same length.
+
+    With `raw_words` and `word_index` (both or neither) the payload is version
+    2 (`SMAF_WORDS`), else version 1.
+
+    `meta` must be JSON-serialisable without NaN (JavaScript's ``JSON.parse``
+    rejects the ``NaN`` Python would write); the plugin maps NaN to null.
+    """
+    import json
+
+    t = np.ascontiguousarray(t_rel_ns, dtype="<u4")
+    c = np.ascontiguousarray(ch, dtype=np.uint8)
+    k = np.ascontiguousarray(tot, dtype=np.uint8)
+    f = np.ascontiguousarray(hit_flags, dtype=np.uint8)
+    n = t.size
+    if not (c.size == k.size == f.size == n):
+        raise ValueError(f"hit arrays differ in length: {n}, {c.size}, {k.size}, {f.size}")
+    blob = json.dumps(meta, separators=(",", ":"), allow_nan=False).encode()
+    words = (raw_words is not None) or (word_index is not None)
+    if words:
+        if raw_words is None or word_index is None:
+            raise ValueError("raw_words and word_index go together")
+        rw = np.ascontiguousarray(raw_words, dtype="<u8")
+        wi = np.ascontiguousarray(word_index, dtype="<u4")
+        if not rw.size == wi.size == n:
+            raise ValueError(f"word arrays differ in length: {n}, {rw.size}, {wi.size}")
+
+    if not 0 <= int(time_shift) <= 32:
+        raise ValueError(f"time_shift must be 0..32, got {time_shift}")
+    flags = ((SMAF_SEEDED if seeded else 0) | (SMAF_STALE if stale else 0)
+             | (SMAF_TRUNCATED if truncated else 0) | (SMAF_SUSPECT if suspect else 0)
+             | (SMAF_WORDS if words else 0))
+    version = SMAF_VERSION_WORDS if words else SMAF_VERSION
+    buf = bytearray(SMAF_HEADER.pack(version, flags, int(time_shift), n, int(frame_seq),
+                                     int(run_number) & 0xFFFFFFFF, len(blob), 0))
+    buf.extend(blob)
+    _align(buf, 8)
+    if words:
+        buf.extend(rw.tobytes())
+        buf.extend(t.tobytes())
+        buf.extend(wi.tobytes())
+    else:
+        buf.extend(t.tobytes())
+    buf.extend(c.tobytes())
+    buf.extend(k.tobytes())
+    buf.extend(f.tobytes())
+    return bytes(buf)
+
+
+def decode_sma_frame(payload: bytes) -> dict:
+    """Decode `encode_sma_frame`. A Python mirror of the page's decoder."""
+    import json
+
+    (version, flags, time_shift, n, frame_seq, run_number, json_len,
+     _r1) = SMAF_HEADER.unpack_from(payload, 0)
+    if version not in (SMAF_VERSION, SMAF_VERSION_WORDS):
+        raise ValueError(f"unknown smaf version {version}")
+    words = version == SMAF_VERSION_WORDS
+    if words != bool(flags & SMAF_WORDS):
+        raise ValueError(f"smaf version {version} with flags {flags:#x}")
+    off = SMAF_HEADER.size
+    meta = json.loads(bytes(payload[off:off + json_len]).decode())
+    off += json_len
+    rem = off % 8
+    if rem:
+        off += 8 - rem
+    per_hit = 19 if words else 7
+    if len(payload) < off + per_hit * n:
+        raise ValueError(f"short smaf payload: {len(payload)} bytes for {n} hits at {off}")
+    rw = wi = None
+    if words:
+        rw = np.frombuffer(payload, dtype="<u8", count=n, offset=off)
+        t = np.frombuffer(payload, dtype="<u4", count=n, offset=off + 8 * n)
+        wi = np.frombuffer(payload, dtype="<u4", count=n, offset=off + 12 * n)
+        b0 = off + 16 * n
+    else:
+        t = np.frombuffer(payload, dtype="<u4", count=n, offset=off)
+        b0 = off + 4 * n
+    c = np.frombuffer(payload, dtype=np.uint8, count=n, offset=b0)
+    k = np.frombuffer(payload, dtype=np.uint8, count=n, offset=b0 + n)
+    f = np.frombuffer(payload, dtype=np.uint8, count=n, offset=b0 + 2 * n)
+    return {
+        "version": version, "flags": flags, "n_hits": n, "frame_seq": frame_seq,
+        "run_number": run_number, "json_len": json_len, "arrays_offset": off,
+        "seeded": bool(flags & SMAF_SEEDED), "stale": bool(flags & SMAF_STALE),
+        "truncated": bool(flags & SMAF_TRUNCATED),
+        "suspect": bool(flags & SMAF_SUSPECT), "time_shift": time_shift,
+        "meta": meta, "t_rel_ns": t, "ch": c, "tot": k, "hit_flags": f,
+        "words": words, "raw_words": rw, "word_index": wi,
     }

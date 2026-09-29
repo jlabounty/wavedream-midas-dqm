@@ -6,6 +6,10 @@ vectorised, and encodable straight to the wire format the browser reads.
 Binning follows the usual convention and the one musip's format assumes: index 0
 is underflow, 1..n are the real bins, n+1 is overflow. The encoder ships all of
 them; the page strips the two ends.
+
+Counts are ``uint32`` unless a histogram asks for ``uint64``. A u32 bin fed
+every hit of a busy channel wraps within hours, and wraps silently; u64 bins
+go over the wire as f64, exact to 2**53.
 """
 
 from __future__ import annotations
@@ -38,6 +42,42 @@ def _indices(values: np.ndarray, n: int, lo: float, hi: float) -> tuple[np.ndarr
     return idx, dropped
 
 
+_COUNT_DTYPES = (np.dtype(np.uint32), np.dtype(np.uint64))
+
+
+def _count_dtype(dtype) -> np.dtype:
+    dt = np.dtype(dtype)
+    if dt not in _COUNT_DTYPES:
+        raise ValueError(f"histogram counts must be uint32 or uint64, got {dt}")
+    return dt
+
+
+def _add_counts(hist, counts, entries) -> None:
+    """Add a pre-binned array to `hist`, for plugins that bincount themselves.
+
+    `counts` has the histogram's full shape, under- and overflow included, so a
+    plugin that already has bin indices skips the float round trip of `fill`.
+    `entries` defaults to the sum of `counts`.
+    """
+    arr = np.asarray(counts)
+    if arr.shape != hist.counts.shape:
+        raise ValueError(f"{hist.name}: counts shape {arr.shape} does not match "
+                         f"{hist.counts.shape} (under/overflow included)")
+    if not np.issubdtype(arr.dtype, np.integer):
+        raise TypeError(f"{hist.name}: add_counts takes integer counts, got {arr.dtype}")
+    if np.issubdtype(arr.dtype, np.signedinteger) and arr.size and arr.min() < 0:
+        # Cast to unsigned, a negative count becomes an enormous one.
+        raise ValueError(f"{hist.name}: negative counts")
+    limit = np.iinfo(hist.counts.dtype).max
+    if arr.size and int(arr.max()) > limit:
+        # The cast would wrap, and a wrapped count is indistinguishable from a
+        # real one on the page.
+        raise ValueError(f"{hist.name}: a count of {int(arr.max())} does not fit "
+                         f"{hist.counts.dtype}; use dtype=np.uint64")
+    hist.counts += arr.astype(hist.counts.dtype, copy=False)
+    hist.entries += int(arr.sum()) if entries is None else int(entries)
+
+
 @dataclass
 class Axis:
     n: int
@@ -61,12 +101,14 @@ class Hist1D:
     title: str = ""
     #: Set by the definition; the analyzer clears these at run start.
     clear_on_run_start: bool = True
+    #: np.uint32 or np.uint64; see the module docstring.
+    dtype: object = np.uint32
     counts: np.ndarray = field(init=False)
     entries: int = field(default=0, init=False)
     dropped: int = field(default=0, init=False)
 
     def __post_init__(self):
-        self.counts = np.zeros(self.x.n + 2, dtype=np.uint32)
+        self.counts = np.zeros(self.x.n + 2, dtype=_count_dtype(self.dtype))
 
     def fill(self, values) -> None:
         idx, dropped = _indices(values, self.x.n, self.x.lo, self.x.hi)
@@ -74,8 +116,11 @@ class Hist1D:
         if idx.size:
             # bincount rather than np.add.at: same result, several times faster,
             # and this is the per-sample path for persistence-style fills.
-            self.counts += np.bincount(idx, minlength=self.x.n + 2).astype(np.uint32)
+            self.counts += np.bincount(idx, minlength=self.x.n + 2).astype(self.counts.dtype)
             self.entries += int(idx.size)
+
+    def add_counts(self, counts, entries: int | None = None) -> None:
+        _add_counts(self, counts, entries)
 
     def clear(self) -> None:
         self.counts.fill(0)
@@ -103,12 +148,13 @@ class Hist2D:
     y: Axis
     title: str = ""
     clear_on_run_start: bool = True
+    dtype: object = np.uint32
     counts: np.ndarray = field(init=False)
     entries: int = field(default=0, init=False)
     dropped: int = field(default=0, init=False)
 
     def __post_init__(self):
-        self.counts = np.zeros((self.y.n + 2, self.x.n + 2), dtype=np.uint32)
+        self.counts = np.zeros((self.y.n + 2, self.x.n + 2), dtype=_count_dtype(self.dtype))
 
     def fill(self, xs, ys) -> None:
         xv = np.asarray(xs, dtype=np.float64).ravel()
@@ -132,8 +178,12 @@ class Hist2D:
         flat = iy * nx + ix
         self.counts += np.bincount(
             flat, minlength=self.counts.size
-        ).astype(np.uint32).reshape(self.counts.shape)
+        ).astype(self.counts.dtype).reshape(self.counts.shape)
         self.entries += int(xv.size)
+
+    def add_counts(self, counts, entries: int | None = None) -> None:
+        """`counts` is (ny+2, nx+2), x fastest, like `self.counts`."""
+        _add_counts(self, counts, entries)
 
     def clear(self) -> None:
         self.counts.fill(0)

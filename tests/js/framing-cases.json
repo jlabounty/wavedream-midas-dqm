@@ -29508,6 +29508,86 @@
     2,
     3
    ]
+  },
+  {
+   "name": "1D u64 histogram as f64",
+   "payload_b64": "AQEBCAgAAAAGAAAAAAAAAAAAAAAAAAAAAAAAAAAAGEA1HNzfAgAAAAAAAAAAQHFAAAAAAAAQiEAAAAAAAJB1QABwAAAAAHBCAAAAAAAAZEAAAAAAAMiAQAAAAAAAoIxAAAAAAACAU0A=",
+   "n_bins": [
+    6
+   ],
+   "low_edge": [
+    0.0
+   ],
+   "high_edge": [
+    6.0
+   ],
+   "entries": 12345678901,
+   "array_type": "Float64Array",
+   "counts_flat": [
+    276.0,
+    770.0,
+    345.0,
+    1099511627783.0,
+    160.0,
+    537.0,
+    916.0,
+    78.0
+   ]
+  },
+  {
+   "name": "2D u64 histogram as f64 (non-square)",
+   "payload_b64": "AQYCCAgIAAAFAAAAAwAAAAAAAAAAAPC/AAAAAAAA8D8AAAAAAAAAAAAAAAAAAD5A3DYAAAIAAAAAAAAAAEB/QAAAAAAAeIdAAAAAAACAT0AAAAAAAJBxQAAAAAAASIZAAAAAAACAXUAAAAAAAHB9QAAAAAAAgEVAAAAAAABgikAAAAAAAEByQAAAAAAAoHZAAAAAAABAYEAAAAAAAAiHQAAAAAAAAGVAAAAAAAAA8D8AAAAAADB5QAAAAAAAIINAAAAAAACgdUAAAAAAAAAAQgAAAAAAwHBAAAAAAAAATUAAAAAAAGBmQAAAAAAAGIBAAAAAAAAQg0AAAAAAACBuQAAAAAAA2IBAAAAAAACgdEAAAAAAAHB4QAAAAAAAeIlAAAAAAAAgaEAAAAAAAOiEQAAAAAAAgIhAAAAAAADIjEAAAAAAAEBZQAAAAAAAmIJA",
+   "n_bins": [
+    5,
+    3
+   ],
+   "low_edge": [
+    -1.0,
+    0.0
+   ],
+   "high_edge": [
+    1.0,
+    30.0
+   ],
+   "entries": 8589948636,
+   "array_type": "Float64Array",
+   "counts_flat": [
+    500.0,
+    751.0,
+    63.0,
+    281.0,
+    713.0,
+    118.0,
+    471.0,
+    43.0,
+    844.0,
+    292.0,
+    362.0,
+    130.0,
+    737.0,
+    168.0,
+    1.0,
+    403.0,
+    612.0,
+    346.0,
+    8589934592.0,
+    268.0,
+    58.0,
+    179.0,
+    515.0,
+    610.0,
+    241.0,
+    539.0,
+    330.0,
+    391.0,
+    815.0,
+    193.0,
+    669.0,
+    784.0,
+    921.0,
+    101.0,
+    595.0
+   ]
   }
  ]
 }
