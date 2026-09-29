@@ -1,0 +1,1296 @@
+{
+ "_about": "SMA DQM resource profile. Produced by scratch/sma-dqm-profile/analyse.py from the raw samples in that directory (RESULTS.md there explains each measurement). CPU is % of one core; 'quiet' rows exclude repeats taken while other jobs kept the machine more than 25 % busy.",
+ "machine": {
+  "date": "2026-09-29T07:09:28+02:00",
+  "cpu_model": "Intel(R) Core(TM) Ultra 7 356H",
+  "host_cpus": 16,
+  "container_nproc": 8,
+  "container_cpu_max": "800000 100000",
+  "mem_total_mb": 24031,
+  "cpu_notes": "Intel Core Ultra 7 356H is a hybrid part (performance + efficiency cores); WSL2 exposes 16 logical CPUs and does not say which are which, so per-core speed varies with where the scheduler puts a process."
+ },
+ "analyzer_vs_rate": {
+  "idle_closed": {
+   "frames_per_s": 0.0,
+   "words_per_frame": null,
+   "cpu_pct_mean": 0.217,
+   "cpu_pct_repeats": [
+    0.217,
+    0.217
+   ],
+   "cpu_pct_p95": 1.0,
+   "cpu_ms_per_frame": null,
+   "core_s_per_Mwords": null,
+   "rss_mb": 115.98,
+   "pss_mb": 111.0,
+   "mhttpd_cpu_pct": 0.633,
+   "machine_busy_pct": [
+    42.2,
+    12.9
+   ],
+   "under_load": [
+    true,
+    false
+   ]
+  },
+  "idle_open": {
+   "frames_per_s": 0.0,
+   "words_per_frame": null,
+   "cpu_pct_mean": 1.517,
+   "cpu_pct_repeats": [
+    1.883,
+    1.517
+   ],
+   "cpu_pct_p95": 2.0,
+   "cpu_ms_per_frame": null,
+   "core_s_per_Mwords": null,
+   "rss_mb": 115.98,
+   "pss_mb": 111.0,
+   "mhttpd_cpu_pct": 1.067,
+   "machine_busy_pct": [
+    45.2,
+    8.7
+   ],
+   "under_load": [
+    true,
+    false
+   ]
+  },
+  "682_77_closed": {
+   "frames_per_s": 76.973,
+   "words_per_frame": 4000.0,
+   "cpu_pct_mean": 11.217,
+   "cpu_pct_repeats": [
+    18.316,
+    11.217,
+    14.382
+   ],
+   "cpu_pct_p95": 16.1,
+   "cpu_ms_per_frame": 1.457,
+   "core_s_per_Mwords": 0.364,
+   "rss_mb": 115.98,
+   "pss_mb": 84.41,
+   "mhttpd_cpu_pct": 0.617,
+   "machine_busy_pct": [
+    60.2,
+    13.2,
+    28.1
+   ],
+   "under_load": [
+    true,
+    false,
+    true
+   ]
+  },
+  "682_77_open": {
+   "frames_per_s": 76.965,
+   "words_per_frame": 4000.0,
+   "cpu_pct_mean": 13.875,
+   "cpu_pct_repeats": [
+    16.716,
+    11.133,
+    16.617
+   ],
+   "cpu_pct_p95": 17.05,
+   "cpu_ms_per_frame": 1.803,
+   "core_s_per_Mwords": 0.451,
+   "rss_mb": 115.737,
+   "pss_mb": 84.378,
+   "mhttpd_cpu_pct": 1.225,
+   "machine_busy_pct": [
+    61.4,
+    9.8,
+    23.8
+   ],
+   "under_load": [
+    true,
+    false,
+    false
+   ]
+  },
+  "480_11_closed": {
+   "frames_per_s": 11.016,
+   "words_per_frame": 4000.0,
+   "cpu_pct_mean": 3.033,
+   "cpu_pct_repeats": [
+    3.2,
+    3.033,
+    3.217
+   ],
+   "cpu_pct_p95": 4.05,
+   "cpu_ms_per_frame": 2.753,
+   "core_s_per_Mwords": 0.688,
+   "rss_mb": 115.98,
+   "pss_mb": 84.44,
+   "mhttpd_cpu_pct": 0.767,
+   "machine_busy_pct": [
+    60.5,
+    7.5,
+    28.8
+   ],
+   "under_load": [
+    true,
+    false,
+    true
+   ]
+  },
+  "480_11_open": {
+   "frames_per_s": 11.001,
+   "words_per_frame": 4000.0,
+   "cpu_pct_mean": 4.417,
+   "cpu_pct_repeats": [
+    3.483,
+    4.55,
+    4.417
+   ],
+   "cpu_pct_p95": 6.0,
+   "cpu_ms_per_frame": 4.015,
+   "core_s_per_Mwords": 1.004,
+   "rss_mb": 115.25,
+   "pss_mb": 84.25,
+   "mhttpd_cpu_pct": 1.484,
+   "machine_busy_pct": [
+    25.6,
+    52.3,
+    4.0
+   ],
+   "under_load": [
+    true,
+    true,
+    false
+   ]
+  },
+  "1008_35_closed": {
+   "frames_per_s": 34.973,
+   "words_per_frame": 40000.0,
+   "cpu_pct_mean": 25.891,
+   "cpu_pct_repeats": [
+    22.833,
+    43.169,
+    28.95
+   ],
+   "cpu_pct_p95": 32.075,
+   "cpu_ms_per_frame": 7.403,
+   "core_s_per_Mwords": 0.185,
+   "rss_mb": 115.855,
+   "pss_mb": 84.595,
+   "mhttpd_cpu_pct": 0.933,
+   "machine_busy_pct": [
+    13.7,
+    91.7,
+    4.9
+   ],
+   "under_load": [
+    false,
+    true,
+    false
+   ]
+  },
+  "1008_35_open": {
+   "frames_per_s": 35.0,
+   "words_per_frame": 40000.0,
+   "cpu_pct_mean": 24.466,
+   "cpu_pct_repeats": [
+    24.466,
+    43.467,
+    42.489
+   ],
+   "cpu_pct_p95": 28.0,
+   "cpu_ms_per_frame": 6.99,
+   "core_s_per_Mwords": 0.175,
+   "rss_mb": 115.78,
+   "pss_mb": 84.25,
+   "mhttpd_cpu_pct": 1.15,
+   "machine_busy_pct": [
+    19.1,
+    92.0,
+    91.6
+   ],
+   "under_load": [
+    false,
+    true,
+    true
+   ]
+  },
+  "1008_70_closed": {
+   "frames_per_s": 69.948,
+   "words_per_frame": 40000.0,
+   "cpu_pct_mean": 44.566,
+   "cpu_pct_repeats": [
+    44.566,
+    85.935,
+    76.232
+   ],
+   "cpu_pct_p95": 52.0,
+   "cpu_ms_per_frame": 6.371,
+   "core_s_per_Mwords": 0.159,
+   "rss_mb": 115.78,
+   "pss_mb": 84.19,
+   "mhttpd_cpu_pct": 0.633,
+   "machine_busy_pct": [
+    14.7,
+    86.3,
+    90.3
+   ],
+   "under_load": [
+    false,
+    true,
+    true
+   ]
+  },
+  "1008_70_open": {
+   "frames_per_s": 69.905,
+   "words_per_frame": 40000.0,
+   "cpu_pct_mean": 50.033,
+   "cpu_pct_repeats": [
+    45.166,
+    54.899,
+    68.9
+   ],
+   "cpu_pct_p95": 60.5,
+   "cpu_ms_per_frame": 7.158,
+   "core_s_per_Mwords": 0.179,
+   "rss_mb": 115.653,
+   "pss_mb": 84.16,
+   "mhttpd_cpu_pct": 1.192,
+   "machine_busy_pct": [
+    11.9,
+    24.2,
+    64.6
+   ],
+   "under_load": [
+    false,
+    false,
+    true
+   ]
+  },
+  "1008_100_closed": {
+   "frames_per_s": 99.791,
+   "words_per_frame": 40000.0,
+   "cpu_pct_mean": 65.917,
+   "cpu_pct_repeats": [
+    60.416,
+    71.417,
+    90.369
+   ],
+   "cpu_pct_p95": 81.101,
+   "cpu_ms_per_frame": 6.607,
+   "core_s_per_Mwords": 0.165,
+   "rss_mb": 115.64,
+   "pss_mb": 84.165,
+   "mhttpd_cpu_pct": 0.642,
+   "machine_busy_pct": [
+    7.6,
+    8.9,
+    92.2
+   ],
+   "under_load": [
+    false,
+    false,
+    true
+   ]
+  },
+  "1008_100_open": {
+   "frames_per_s": 99.837,
+   "words_per_frame": 40000.0,
+   "cpu_pct_mean": 66.549,
+   "cpu_pct_repeats": [
+    60.783,
+    72.316,
+    93.014
+   ],
+   "cpu_pct_p95": 77.054,
+   "cpu_ms_per_frame": 6.666,
+   "core_s_per_Mwords": 0.167,
+   "rss_mb": 115.698,
+   "pss_mb": 84.224,
+   "mhttpd_cpu_pct": 1.125,
+   "machine_busy_pct": [
+    7.5,
+    10.7,
+    91.6
+   ],
+   "under_load": [
+    false,
+    false,
+    true
+   ]
+  }
+ },
+ "wd_plus_sma_on_1008": {
+  "sma_analyzer": {
+   "1008_wdsma_closed": {
+    "frames_per_s": 34.63,
+    "words_per_frame": 40000.0,
+    "cpu_pct_mean": 26.666,
+    "cpu_pct_repeats": [
+     29.782,
+     26.666
+    ],
+    "cpu_pct_p95": 34.16,
+    "cpu_ms_per_frame": 7.7,
+    "core_s_per_Mwords": 0.193,
+    "rss_mb": 114.221,
+    "pss_mb": 70.55,
+    "mhttpd_cpu_pct": 0.7,
+    "missed_per_s": 312.39,
+    "machine_busy_pct": [
+     75.6,
+     4.7
+    ],
+    "load1": [
+     13.7,
+     2.9
+    ],
+    "under_load": [
+     true,
+     false
+    ],
+    "headline_from_quiet_repeats": true
+   },
+   "1008_wdsma_open": {
+    "frames_per_s": 34.584,
+    "words_per_frame": 40000.0,
+    "cpu_pct_mean": 27.383,
+    "cpu_pct_repeats": [
+     26.516,
+     28.25
+    ],
+    "cpu_pct_p95": 32.53,
+    "cpu_ms_per_frame": 7.918,
+    "core_s_per_Mwords": 0.198,
+    "rss_mb": 114.561,
+    "pss_mb": 70.934,
+    "mhttpd_cpu_pct": 1.217,
+    "missed_per_s": 312.053,
+    "machine_busy_pct": [
+     5.8,
+     13.3
+    ],
+    "load1": [
+     11.8,
+     1.6
+    ],
+    "under_load": [
+     false,
+     false
+    ],
+    "headline_from_quiet_repeats": true
+   }
+  },
+  "wd_analyzer": {
+   "1008_wdsma_closed": {
+    "frames_per_s": 19.966,
+    "words_per_frame": null,
+    "cpu_pct_mean": 2.4,
+    "cpu_pct_repeats": [
+     3.582,
+     2.4
+    ],
+    "cpu_pct_p95": 3.069,
+    "cpu_ms_per_frame": null,
+    "core_s_per_Mwords": null,
+    "rss_mb": 107.895,
+    "pss_mb": 61.145,
+    "mhttpd_cpu_pct": 0.7,
+    "missed_per_s": null,
+    "machine_busy_pct": [
+     75.6,
+     4.7
+    ],
+    "load1": [
+     13.7,
+     2.9
+    ],
+    "under_load": [
+     true,
+     false
+    ],
+    "headline_from_quiet_repeats": true
+   },
+   "1008_wdsma_open": {
+    "frames_per_s": 19.999,
+    "words_per_frame": null,
+    "cpu_pct_mean": 2.258,
+    "cpu_pct_repeats": [
+     2.267,
+     2.249
+    ],
+    "cpu_pct_p95": 3.0,
+    "cpu_ms_per_frame": null,
+    "core_s_per_Mwords": null,
+    "rss_mb": 107.868,
+    "pss_mb": 61.037,
+    "mhttpd_cpu_pct": 1.217,
+    "missed_per_s": null,
+    "machine_busy_pct": [
+     5.8,
+     13.3
+    ],
+    "load1": [
+     11.8,
+     1.6
+    ],
+    "under_load": [
+     false,
+     false
+    ],
+    "headline_from_quiet_repeats": true
+   }
+  }
+ },
+ "per_frame_breakdown_offline": {
+  "run01008_00001": {
+   "words_per_frame": 40000.0,
+   "process_ms_per_frame_best": 6.404,
+   "process_ms_per_frame_median": 6.869,
+   "stages_ms_per_frame": {
+    "histogram fills": 2.965,
+    "coincidences": 2.331,
+    "stale+sort": 1.631,
+    "fine/coarse": 0.808,
+    "RF": 0.588,
+    "fine/coarse bit counts": 0.465,
+    "decode": 0.423,
+    "health fills + bookkeeping (process body)": 0.265,
+    "shift scan": 0.096,
+    "bookkeeping": 0.044,
+    "trend/summary bookkeeping": 0.002
+   }
+  },
+  "run00682_00005": {
+   "words_per_frame": 4000.0,
+   "process_ms_per_frame_best": 2.358,
+   "process_ms_per_frame_median": 2.421,
+   "stages_ms_per_frame": {
+    "histogram fills": 1.182,
+    "coincidences": 0.271,
+    "fine/coarse": 0.248,
+    "stale+sort": 0.244,
+    "fine/coarse bit counts": 0.157,
+    "health fills + bookkeeping (process body)": 0.101,
+    "decode": 0.099,
+    "RF": 0.087,
+    "shift scan": 0.048,
+    "bookkeeping": 0.036,
+    "trend/summary bookkeeping": 0.002
+   }
+  }
+ },
+ "live_pyspy_share": {
+  "live35_open_r1": {
+   "histogram fills": 0.343,
+   "coincidences": 0.178,
+   "stale+sort": 0.133,
+   "MIDAS python client (receive/communicate)": 0.076,
+   "fine/coarse bit counts": 0.068,
+   "fine/coarse": 0.063,
+   "RF": 0.048,
+   "decode": 0.041,
+   "analyzer loop": 0.029,
+   "bookkeeping (process body, trend rows)": 0.005,
+   "shift scan": 0.004,
+   "sma::frame encode": 0.004,
+   "dqm::histogram/list encode": 0.003,
+   "brpc dispatch/status JSON": 0.002,
+   "sma::summary": 0.002
+  },
+  "live35_open_r2": {
+   "histogram fills": 0.329,
+   "coincidences": 0.17,
+   "stale+sort": 0.135,
+   "MIDAS python client (receive/communicate)": 0.099,
+   "fine/coarse bit counts": 0.071,
+   "fine/coarse": 0.054,
+   "RF": 0.048,
+   "decode": 0.047,
+   "analyzer loop": 0.025,
+   "shift scan": 0.007,
+   "bookkeeping (process body, trend rows)": 0.005,
+   "sma::frame encode": 0.004,
+   "dqm::histogram/list encode": 0.002,
+   "brpc dispatch/status JSON": 0.002,
+   "sma::summary": 0.001
+  }
+ },
+ "replies_1008": {
+  "frame_raster_ch7_hidden": {
+   "ms_median": 0.902,
+   "ms_best": 0.546,
+   "bytes": 202831
+  },
+  "frame_raster_ch7_shown": {
+   "ms_median": 0.656,
+   "ms_best": 0.41,
+   "bytes": 228212
+  },
+  "frame_seeded": {
+   "ms_median": 0.185,
+   "ms_best": 0.162,
+   "bytes": 1378
+  },
+  "frame_raster_cached": {
+   "ms_median": 0.01,
+   "ms_best": 0.009,
+   "bytes": 202831
+  },
+  "summary": {
+   "ms_median": 0.183,
+   "ms_best": 0.137,
+   "bytes": 4216
+  },
+  "trend_full": {
+   "ms_median": 0.219,
+   "ms_best": 0.155,
+   "bytes": 1615
+  },
+  "trend_incremental": {
+   "ms_median": 0.102,
+   "ms_best": 0.067,
+   "bytes": 770
+  },
+  "dqm_list": {
+   "ms_median": 0.002,
+   "ms_best": 0.002,
+   "bytes": 808
+  },
+  "histograms_per_tab": {
+   "rf": {
+    "n": 7,
+    "ms_median": 0.038,
+    "bytes": 140424
+   },
+   "timing": {
+    "n": 8,
+    "ms_median": 0.028,
+    "bytes": 16312
+   },
+   "tot": {
+    "n": 19,
+    "ms_median": 0.072,
+    "bytes": 116464
+   },
+   "health": {
+    "n": 11,
+    "ms_median": 0.035,
+    "bytes": 25664
+   }
+  }
+ },
+ "static_footprint_1008": {
+  "histograms": 45,
+  "hist_bins": 37072,
+  "hist_counts_bytes": 296576,
+  "hist_objects_deep_bytes": 373994,
+  "trend_ring_rows": 601,
+  "trend_ring_deep_bytes": 1044908,
+  "trend_row_deep_bytes": 2068,
+  "shift_ring_bytes": 28848,
+  "snapshots_deep_bytes": {
+   "_last": 2296142,
+   "_last_good": 0,
+   "_last_seeded": 0
+  },
+  "snapshots_total_bytes": 2296142,
+  "frame_cache_entries": {
+   "(21700, 'raster', (), 60000)": 230312
+  },
+  "frame_cache_bytes": 230312
+ },
+ "memory": {
+  "rss_start_no_frames_mb": 93.896,
+  "rss_first_sample_mb": 106.52,
+  "rss_5min_mb": 112.44,
+  "rss_end_mb": 87.0,
+  "duration_s": 2149.857,
+  "rss_max_mb": 115.83,
+  "pss_end_mb": 58.54,
+  "slope_mb_per_h_after_5min": -67.46,
+  "slope_mb_per_h_after_10min": -78.413,
+  "cpu_mean_pct": 40.138,
+  "second_window": {
+   "offset_from_start_s": 2234.325,
+   "duration_s": 1789.888,
+   "anon_plus_swap_mb": [
+    45.953,
+    45.957
+   ],
+   "anon_plus_swap_slope_mb_per_h": 0.028,
+   "rss_plus_swap_mb": [
+    100.543,
+    100.398
+   ],
+   "rss_plus_swap_slope_mb_per_h": -0.4,
+   "shmem_mb": [
+    50.113,
+    50.113
+   ],
+   "swap_mb_end": 14.398
+  },
+  "long_running_analyzer": {
+   "uptime_h": 7.75,
+   "frames_processed": 1058393,
+   "rss_mb": 115.36
+  },
+  "note": "rss_end/slope_* of the first window are not a leak measure: the host started swapping (other jobs) and pages of the analyzer were swapped out. The leak measure is second_window.anon_plus_swap_slope_mb_per_h (private memory resident + swapped, same process, 37-67 min after start)."
+ },
+ "tracemalloc_ring_full": {
+  "frames": 45500,
+  "data_s": 1300.0,
+  "wall_s": 1714.277,
+  "traced_bytes_at_half": 2874336,
+  "traced_bytes_at_end": 3355033,
+  "traced_growth_bytes": 480697,
+  "traced_growth_per_1000_frames": 21129.538
+ },
+ "mhttpd_pages": {
+  "events_raster_ch7_hidden": {
+   "1": {
+    "mhttpd_cpu_pct_above_idle": [
+     0.27,
+     0.266
+    ],
+    "mhttpd_rss_mb": [
+     167.938,
+     167.938
+    ],
+    "analyzer_cpu_pct_above_idle": [
+     6.813,
+     7.037
+    ],
+    "kB_per_s_per_viewer": [
+     387.378,
+     387.8
+    ],
+    "load1": [
+     7.63,
+     4.96
+    ]
+   },
+   "3": {
+    "mhttpd_cpu_pct_above_idle": [
+     0.635,
+     0.564
+    ],
+    "mhttpd_rss_mb": [
+     167.938,
+     167.938
+    ],
+    "analyzer_cpu_pct_above_idle": [
+     1.888,
+     0.812
+    ],
+    "kB_per_s_per_viewer": [
+     394.099,
+     394.122
+    ],
+    "load1": [
+     6.09,
+     3.27
+    ]
+   },
+   "idle_mhttpd_cpu_pct": [
+    0.79,
+    0.762
+   ]
+  },
+  "events_raster_ch7_shown": {
+   "1": {
+    "mhttpd_cpu_pct_above_idle": [
+     0.132,
+     0.331
+    ],
+    "mhttpd_rss_mb": [
+     167.938,
+     167.938
+    ],
+    "analyzer_cpu_pct_above_idle": [
+     1.414,
+     -4.646
+    ],
+    "kB_per_s_per_viewer": [
+     443.376,
+     425.984
+    ],
+    "load1": [
+     1.67,
+     14.33
+    ]
+   },
+   "3": {
+    "mhttpd_cpu_pct_above_idle": [
+     0.622,
+     0.722
+    ],
+    "mhttpd_rss_mb": [
+     167.938,
+     167.938
+    ],
+    "analyzer_cpu_pct_above_idle": [
+     8.815,
+     -4.692
+    ],
+    "kB_per_s_per_viewer": [
+     428.352,
+     429.457
+    ],
+    "load1": [
+     6.9,
+     15.03
+    ]
+   },
+   "idle_mhttpd_cpu_pct": [
+    0.729,
+    0.592
+   ]
+  },
+  "events_seeded": {
+   "1": {
+    "mhttpd_cpu_pct_above_idle": [
+     0.231,
+     0.199
+    ],
+    "mhttpd_rss_mb": [
+     167.938,
+     167.938
+    ],
+    "analyzer_cpu_pct_above_idle": [
+     2.454,
+     -0.572
+    ],
+    "kB_per_s_per_viewer": [
+     6.978,
+     6.919
+    ],
+    "load1": [
+     9.23,
+     4.42
+    ]
+   },
+   "3": {
+    "mhttpd_cpu_pct_above_idle": [
+     0.752,
+     0.763
+    ],
+    "mhttpd_rss_mb": [
+     167.938,
+     167.938
+    ],
+    "analyzer_cpu_pct_above_idle": [
+     3.564,
+     3.978
+    ],
+    "kB_per_s_per_viewer": [
+     6.831,
+     6.948
+    ],
+    "load1": [
+     7.49,
+     5.48
+    ]
+   },
+   "idle_mhttpd_cpu_pct": [
+    0.73,
+    0.763
+   ]
+  },
+  "plots_health": {
+   "1": {
+    "mhttpd_cpu_pct_above_idle": [
+     0.496,
+     0.565
+    ],
+    "mhttpd_rss_mb": [
+     98.879,
+     142.648
+    ],
+    "analyzer_cpu_pct_above_idle": [
+     -6.2,
+     1.977
+    ],
+    "kB_per_s_per_viewer": [
+     34.845,
+     34.92
+    ],
+    "load1": [
+     1.71,
+     0.82
+    ]
+   },
+   "3": {
+    "mhttpd_cpu_pct_above_idle": [
+     1.69,
+     1.527
+    ],
+    "mhttpd_rss_mb": [
+     136.414,
+     142.648
+    ],
+    "analyzer_cpu_pct_above_idle": [
+     -3.813,
+     -0.166
+    ],
+    "kB_per_s_per_viewer": [
+     32.993,
+     34.887
+    ],
+    "load1": [
+     1.39,
+     0.46
+    ]
+   },
+   "idle_mhttpd_cpu_pct": [
+    0.794,
+    0.761
+   ]
+  },
+  "plots_rf": {
+   "1": {
+    "mhttpd_cpu_pct_above_idle": [
+     0.648,
+     0.467
+    ],
+    "mhttpd_rss_mb": [
+     168.25,
+     167.777
+    ],
+    "analyzer_cpu_pct_above_idle": [
+     9.89,
+     3.068
+    ],
+    "kB_per_s_per_viewer": [
+     124.912,
+     120.173
+    ],
+    "load1": [
+     7.66,
+     17.79
+    ]
+   },
+   "3": {
+    "mhttpd_cpu_pct_above_idle": [
+     1.455,
+     1.558
+    ],
+    "mhttpd_rss_mb": [
+     167.742,
+     167.883
+    ],
+    "analyzer_cpu_pct_above_idle": [
+     10.214,
+     5.712
+    ],
+    "kB_per_s_per_viewer": [
+     118.257,
+     120.495
+    ],
+    "load1": [
+     12.2,
+     24.5
+    ]
+   },
+   "idle_mhttpd_cpu_pct": [
+    0.858,
+    0.971
+   ]
+  },
+  "plots_timing": {
+   "1": {
+    "mhttpd_cpu_pct_above_idle": [
+     0.263,
+     0.629
+    ],
+    "mhttpd_rss_mb": [
+     142.844,
+     168.109
+    ],
+    "analyzer_cpu_pct_above_idle": [
+     -1.703,
+     2.955
+    ],
+    "kB_per_s_per_viewer": [
+     25.896,
+     25.919
+    ],
+    "load1": [
+     4.18,
+     4.38
+    ]
+   },
+   "3": {
+    "mhttpd_cpu_pct_above_idle": [
+     1.09,
+     1.624
+    ],
+    "mhttpd_rss_mb": [
+     162.0,
+     168.238
+    ],
+    "analyzer_cpu_pct_above_idle": [
+     -0.093,
+     4.4
+    ],
+    "kB_per_s_per_viewer": [
+     25.007,
+     25.735
+    ],
+    "load1": [
+     3.98,
+     4.79
+    ]
+   },
+   "idle_mhttpd_cpu_pct": [
+    1.028,
+    0.829
+   ]
+  },
+  "plots_tot": {
+   "1": {
+    "mhttpd_cpu_pct_above_idle": [
+     0.521,
+     0.663
+    ],
+    "mhttpd_rss_mb": [
+     142.684,
+     142.828
+    ],
+    "analyzer_cpu_pct_above_idle": [
+     3.855,
+     -0.546
+    ],
+    "kB_per_s_per_viewer": [
+     104.25,
+     116.536
+    ],
+    "load1": [
+     7.22,
+     4.15
+    ]
+   },
+   "3": {
+    "mhttpd_cpu_pct_above_idle": [
+     2.222,
+     2.514
+    ],
+    "mhttpd_rss_mb": [
+     142.688,
+     142.844
+    ],
+    "analyzer_cpu_pct_above_idle": [
+     1.359,
+     3.195
+    ],
+    "kB_per_s_per_viewer": [
+     112.62,
+     111.471
+    ],
+    "load1": [
+     4.53,
+     4.67
+    ]
+   },
+   "idle_mhttpd_cpu_pct": [
+    0.796,
+    0.828
+   ]
+  },
+  "plots_trends": {
+   "1": {
+    "mhttpd_cpu_pct_above_idle": [
+     0.097,
+     0.293
+    ],
+    "mhttpd_rss_mb": [
+     167.883,
+     167.938
+    ],
+    "analyzer_cpu_pct_above_idle": [
+     11.865,
+     11.86
+    ],
+    "kB_per_s_per_viewer": [
+     9.834,
+     9.511
+    ],
+    "load1": [
+     19.56,
+     22.86
+    ]
+   },
+   "3": {
+    "mhttpd_cpu_pct_above_idle": [
+     0.461,
+     0.661
+    ],
+    "mhttpd_rss_mb": [
+     167.934,
+     167.938
+    ],
+    "analyzer_cpu_pct_above_idle": [
+     3.519,
+     -1.774
+    ],
+    "kB_per_s_per_viewer": [
+     9.552,
+     9.878
+    ],
+    "load1": [
+     20.28,
+     15.48
+    ]
+   },
+   "idle_mhttpd_cpu_pct": [
+    0.988,
+    0.79
+   ]
+  }
+ },
+ "browser_per_view": {
+  "events_raster_ch7_hidden": {
+   "tree_cpu_pct": 12.694,
+   "main_thread_busy_pct": 3.739,
+   "script_pct": 0.145,
+   "heap_used_mb_first": 5.56,
+   "heap_used_mb_last": 2.325,
+   "heap_after_gc_slope_mb_per_h": 0.065,
+   "nodes_first": 588,
+   "nodes_last": 748,
+   "listeners_first": 52,
+   "listeners_last": 68,
+   "tree_cpu_pct_5min_windows": [
+    12.443,
+    10.98,
+    14.73,
+    12.137,
+    12.863,
+    12.22,
+    13.487
+   ],
+   "heap_after_gc_mb_first_last": [
+    1.98,
+    2.06
+   ]
+  },
+  "events_raster_ch7_shown": {
+   "tree_cpu_pct": 13.915,
+   "main_thread_busy_pct": 4.238,
+   "script_pct": 0.149,
+   "heap_used_mb_first": 2.248,
+   "heap_used_mb_last": 7.245,
+   "heap_after_gc_slope_mb_per_h": 0.062,
+   "nodes_first": 510,
+   "nodes_last": 494,
+   "listeners_first": 45,
+   "listeners_last": 43,
+   "tree_cpu_pct_5min_windows": [
+    13.437,
+    11.577,
+    16.32,
+    13.32,
+    14.5,
+    13.383,
+    14.867
+   ],
+   "heap_after_gc_mb_first_last": [
+    1.99,
+    2.07
+   ]
+  },
+  "events_seeded": {
+   "tree_cpu_pct": 9.524,
+   "main_thread_busy_pct": 3.132,
+   "script_pct": 0.124,
+   "heap_used_mb_first": 2.037,
+   "heap_used_mb_last": 1.543,
+   "heap_after_gc_slope_mb_per_h": 0.15,
+   "nodes_first": 5246,
+   "nodes_last": 3180,
+   "listeners_first": 92,
+   "listeners_last": 57,
+   "tree_cpu_pct_5min_windows": [
+    9.64,
+    8.45,
+    10.62,
+    8.927,
+    10.56,
+    9.333,
+    9.14
+   ],
+   "heap_after_gc_mb_first_last": [
+    1.22,
+    1.38
+   ]
+  },
+  "plots_health": {
+   "tree_cpu_pct": 15.449,
+   "main_thread_busy_pct": 6.817,
+   "script_pct": 0.937,
+   "heap_used_mb_first": 3.476,
+   "heap_used_mb_last": 3.024,
+   "heap_after_gc_slope_mb_per_h": 0.162,
+   "nodes_first": 1106,
+   "nodes_last": 1087,
+   "listeners_first": 203,
+   "listeners_last": 206,
+   "tree_cpu_pct_5min_windows": [
+    15.52,
+    13.997,
+    18.367,
+    14.847,
+    16.683,
+    14.403,
+    14.327
+   ],
+   "heap_after_gc_mb_first_last": [
+    1.87,
+    2.12
+   ]
+  },
+  "plots_trends": {
+   "tree_cpu_pct": 13.02,
+   "main_thread_busy_pct": 9.404,
+   "script_pct": 1.219,
+   "heap_used_mb_first": 2.905,
+   "heap_used_mb_last": 3.596,
+   "heap_after_gc_slope_mb_per_h": 0.565,
+   "nodes_first": 1191,
+   "nodes_last": 1274,
+   "listeners_first": 182,
+   "listeners_last": 199,
+   "tree_cpu_pct_5min_windows": [
+    8.527,
+    11.103,
+    15.943,
+    12.793,
+    16.073,
+    13.067,
+    13.63
+   ],
+   "heap_after_gc_mb_first_last": [
+    2.71,
+    3.28
+   ]
+  }
+ },
+ "cli": {
+  "run00682_00005.mid.lz4_png": {
+   "wall_s": [
+    4.116,
+    3.066
+   ],
+   "cpu_s": [
+    3.957,
+    2.92
+   ],
+   "peak_rss_mb": 84.898,
+   "exit": 3
+  },
+  "run00682_00005.mid.lz4_nopng": {
+   "wall_s": [
+    2.434,
+    1.625
+   ],
+   "cpu_s": [
+    2.417,
+    1.608
+   ],
+   "peak_rss_mb": 65.898,
+   "exit": 3
+  },
+  "run01008_00001.mid.lz4_png": {
+   "wall_s": [
+    3.449,
+    2.721
+   ],
+   "cpu_s": [
+    3.408,
+    2.649
+   ],
+   "peak_rss_mb": 87.922,
+   "exit": 3
+  },
+  "run01008_00001.mid.lz4_nopng": {
+   "wall_s": [
+    2.036,
+    1.791
+   ],
+   "cpu_s": [
+    2.024,
+    1.733
+   ],
+   "peak_rss_mb": 71.41,
+   "exit": 3
+  },
+  "run00480_00001.mid.lz4_png": {
+   "wall_s": [
+    4.266,
+    1.801
+   ],
+   "cpu_s": [
+    4.212,
+    1.597
+   ],
+   "peak_rss_mb": 83.902,
+   "exit": 0
+  },
+  "run00480_00001.mid.lz4_nopng": {
+   "wall_s": [
+    0.857,
+    0.888
+   ],
+   "cpu_s": [
+    0.734,
+    0.733
+   ],
+   "peak_rss_mb": 69.426,
+   "exit": 0
+  }
+ },
+ "optimisation_candidates_not_applied": {
+  "run01008_00001": {
+   "frames": 196,
+   "A_fine_coarse_diff_fill": {
+    "identical": true,
+    "now_ms": 0.328,
+    "integer_ms": 0.221,
+    "saving_ms_per_frame": 0.107
+   },
+   "B_duplicate_shift_scan": {
+    "saving_ms_per_frame": 0.314
+   },
+   "C_partner_hits_fill": {
+    "identical": true,
+    "now_ms": 0.16,
+    "integer_ms": 0.087,
+    "saving_ms_per_frame": 0.073
+   },
+   "process_ms_per_frame": 9.684
+  },
+  "run00682_00005": {
+   "frames": 739,
+   "A_fine_coarse_diff_fill": {
+    "identical": true,
+    "now_ms": 0.069,
+    "integer_ms": 0.058,
+    "saving_ms_per_frame": 0.012
+   },
+   "B_duplicate_shift_scan": {
+    "saving_ms_per_frame": 0.069
+   },
+   "C_partner_hits_fill": {
+    "identical": true,
+    "now_ms": 0.042,
+    "integer_ms": 0.017,
+    "saving_ms_per_frame": 0.025
+   },
+   "process_ms_per_frame": 2.622
+  }
+ },
+ "sizing": {
+  "sma_analyzer_now_1008_35Hz": "about 25 % of one core, about 115 MB RSS (about 50 MB of it the shared MIDAS buffer/ODB)",
+  "rule_of_thumb": "about 0.9 ms per frame + 0.14 ms per 1000 words, one core of this laptop",
+  "budget_sma_analyzer": "one core, 256 MB",
+  "budget_dqm_host_wd_plus_sma": "two cores, 1 GB (both analyzers, mhttpd, headroom)",
+  "load_sensitivity": "with the machine ~90 % busy the per-frame CPU doubled (12-13 ms vs 6.5 ms) and at 100 frames/s only ~70 frames/s were processed"
+ }
+}

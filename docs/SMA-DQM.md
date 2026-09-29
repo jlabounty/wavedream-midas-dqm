@@ -1,0 +1,815 @@
+# SMA online DQM: shifter guide
+
+This guide takes you from an idle DAQ to a working SMA monitor, explains every
+indicator on the two pages, and gives the manual path for when the monitor is
+down. File and line references are to this repository (`src/mdqm/...`,
+`pages/...`) as of 2026-09-29.
+
+## What it is
+
+The SMA board (MuSiP trigger/ToT board) sends one readout frame per MIDAS event:
+event id 301, bank `H000`, a list of 64-bit words. The SMA DQM is one extra MIDAS
+client, `sma_analyzer`, that reads frames from the SYSTEM buffer, decodes them,
+fills histograms and a summary, and answers the two custom pages in mhttpd:
+
+| Page (side menu) | What it shows |
+|---|---|
+| **SMAPlots** | status chips, flags, a per-channel table, and five tabs of plots: Health, ToT / corruption, Timing, RF / delayed, Trends (last 10 min) |
+| **SMAEvents** | the latest frame: *S1-seeded events* (every channel around the latest S1 hits) and *Whole-frame raster* (time vs channel for the whole frame) |
+
+It never slows the DAQ down: it reads the buffer without blocking the writer
+(`GET_NONBLOCKING`, `Analyzer.register_event_requests` in
+`src/mdqm/dqm/analyzer.py`).
+
+**It is a live peek, not a lossless record, and it never uses more than its CPU
+budget.** The analyzer measures its own CPU use and analyses only as many
+frames per second as fit in `/DQM/SMA/Sampling/CPU budget %` (default **20 %
+of one core**, everything included: reading the buffer, decoding, filling the
+histograms, answering the pages). At high rate it analyses a sample and skips
+the rest; a skipped frame is never read, so it costs nothing however fast the
+DAQ runs. The pages always say how much was analysed (**analysed N % of
+frames**, see below). Rates, efficiencies and other fractions are not biased by
+the sampling; histogram counts are from the analysed sample.
+
+It is a plugin of the same package as the WaveDREAM DQM and runs next to the
+WaveDREAM analyzer (`wd_analyzer`) as a separate process with its own ODB tree:
+`/DQM/SMA` for SMA, `/DQM/Analyzer` for WaveDREAM (`src/mdqm/plugins/sma.py:548-554`).
+
+Measured on this laptop at one to ten times the rate of run 1008
+(`docs/profile-sma-highrate.json`, section "Resource requirements"): the
+analyzer stays at its budget at every rate; at today's rate and the default
+budget it analyses most of the frames, at ten times the rate about one in ten.
+
+## Start to finish from an idle DAQ
+
+### 1. Install (once per machine)
+
+```bash
+cd wavedream-frontends/wavedream-midas-dqm
+pip install -e .                                   # mdqm-analyzer, mdqm-register-pages, mdqm-sma-file
+pip install -e ../wavedream-scalar-readout         # only needed for the WaveDREAM analyzer
+```
+
+`mdqm-sma-file` also needs `lz4` (for `.mid.lz4`) and `matplotlib` (for its PNG).
+The MIDAS python package must be importable (`$MIDASSYS/python` on `PYTHONPATH`).
+
+### 2. Register the pages (once, and again after the checkout moves)
+
+```bash
+mdqm-register-pages --experiment <EXPT>
+```
+
+This writes the `/Custom/SMAPlots` and `/Custom/SMAEvents` keys (and the
+WaveDREAM pages) with absolute paths to this checkout
+(`src/mdqm/install/manifest.py:117-119`). It is safe to run on every start; it
+removes keys of its own that are no longer in the list (for example the old
+`/Custom/SMA`). Options (`src/mdqm/install/register_pages.py:207-220`):
+`--list`, `--dry-run`, `--check` (every key still points at a readable file),
+`--remove`, `--prefix` (to avoid a name clash in a shared experiment).
+
+### 3. Start the analyzer
+
+**Where it runs on pinky is not decided yet (TBD).** On the DAQ PC (pinky) or
+any machine that can reach the experiment, start it as a low-priority guest:
+
+```bash
+env OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 MALLOC_ARENA_MAX=2 \
+    nice -n 19 ionice -c3 prlimit --as=1073741824 \
+    mdqm-analyzer --experiment <EXPT> --plugin sma --client sma_analyzer
+```
+
+* The `env` settings: one BLAS/OpenMP thread and two malloc arenas. A pip-installed
+  numpy with OpenBLAS otherwise starts a thread per core, each with an 8 MiB stack
+  and a 64 MiB arena, and can then fail at import under the address-space limit.
+
+* `nice -n 19`: the DAQ's own processes always get the CPU first.
+* `ionice -c3`: idle I/O class (the analyzer writes nothing, but it costs
+  nothing to be sure).
+* `prlimit --as=1073741824`: a 1 GiB ceiling on its address space. Its virtual
+  size is about 250 MB plus the SYSTEM buffer (it maps the buffer and the ODB),
+  so 1 GiB is enough for a SYSTEM buffer up to about 600 MB; with a larger one
+  raise the limit or leave `prlimit` out. Past the ceiling an allocation fails
+  inside the analyzer instead of the machine starting to swap.
+* Optionally `taskset -c N` in front to keep it on one core.
+* **Do not use a cgroup CPU quota** (systemd `CPUQuota=`, `docker --cpus` on a
+  dedicated container, and so on) to hold it down. A quota freezes the process
+  when it runs out, possibly while it holds the SYSTEM buffer lock, and then the
+  writer (the DAQ) waits. The CPU budget is the limit; `nice` only orders it
+  behind the DAQ.
+
+**Once on pinky, before the first start**, check two things.
+
+1. The MIDAS library exports the skip call:
+   ```bash
+   nm -D /home/pinky/packages/midas/lib/libmidas-c-compat.so | grep -E 'bm_skip_eventi|bm_get_buffer_leveliPi'
+   ```
+   It should print `_Z13bm_skip_eventi` (and `_Z19bm_get_buffer_leveliPi`). If
+   `bm_skip_eventi` is missing, the analyzer still works: `dqm::status` shows
+   `skip_method: "drain"` (instead of `"bm_skip_event"`) and it prints a line at
+   start. It then drops skipped frames by reading them, at most 200 per skip. That
+   costs a copy each, within the same CPU budget.
+2. After a minute of running, the analyzer's virtual size is well under the
+   limit: `grep VmSize /proc/$(pgrep -f 'client sma_analyzer')/status`. It was
+   210-255 MB here; it must stay well below 1 GiB.
+
+The CPU itself is bounded by the budget (`/DQM/SMA/Sampling/CPU budget %`), not
+by these. `mdqm-analyzer --help` lists all options. `--max-event-size` defaults
+to `/Experiment/MAX_EVENT_SIZE` (clamped to 8-64 MiB). A larger frame is counted
+(`events_truncated` in `dqm::status`) and skipped, and the read buffer then grows
+to fit such frames (up to 64 MiB), so MIDAS posts its "event truncated" error
+once, not once per frame. Leave it running in a `tmux`
+window or under a service. On first start it creates `/DQM/SMA` with
+default values ("seeded N settings key(s)"); it never overwrites a key that
+already exists. The WaveDREAM analyzer is a separate command:
+`mdqm-analyzer --experiment <EXPT> --plugin wavedream --client wd_analyzer`.
+
+Optional: make it startable from the MIDAS **Programs** page by setting
+`/Programs/sma_analyzer/Start command` to the command above (it then runs on the
+mhttpd host).
+
+To stop it: `Ctrl-C` in its window, or `kill <pid>` (it stops cleanly on
+SIGTERM). Stopping it loses the accumulated plots.
+
+### 4. Open the pages
+
+In the experiment's mhttpd, pick **SMAPlots** or **SMAEvents** in the side menu
+(`?cmd=custom&page=SMAPlots`). The first chip should say
+**sma_analyzer connected**. With no run and no data the pages stay empty; that
+is not an error.
+
+### 5. Start a run
+
+Nothing else to do. The plots clear themselves at every new run number
+(`src/mdqm/dqm/analyzer.py:377-379`). Within a few seconds of beam, the chips show
+frames/s, the live fraction and the shift check.
+
+## The SMAPlots page, indicator by indicator
+
+### Status chips (top row)
+
+| Chip | Meaning | What to do |
+|---|---|---|
+| `sma_analyzer connected` (green) | the analyzer answered in the last poll | nothing |
+| `analyzer throttled` (red) | the DAQ-health valve lowered its rate. For SMA this valve is off (no musip loss counter known yet, `sma.py:550-552`), so this should not appear | tell the DQM expert |
+| `no analyzer` (red) + `last seen HH:MM:SS` (yellow) | the analyzer did not answer; the page greys out and everything shown is from the time given | see "Analyzer not connected" below |
+| `run N` / `run N (stopped)` | run number the analyzer sees; yellow when no run is active | nothing |
+| `frames A analysed · B offered · C stale` | A = frames analysed since the analyzer started, B = frames the DAQ sent (counted from the event serial numbers, so skipped frames are counted without being read), C = stale frames | nothing |
+| `analysed X % of frames` (blue) | the share of the frames sent in the last 60 s that the analyzer analysed. Below 100 % is normal at high rate: it samples to stay within its CPU budget. Shown as `... since start` when no frame arrived in the last 60 s | nothing; see "Sampling" below |
+| `CPU x % / budget y %` | the analyzer's own CPU (last 5 s, % of one core) and its budget. Yellow above 1.1 x the budget, which should not last more than a few seconds | if it stays yellow, tell the DQM expert |
+| `N missed (serial gaps)` (yellow) | only with the development flag `--no-cpu-budget` (process everything): frames the analyzer never saw because the buffer overwrote them first. It keeps its count until the analyzer restarts | restart it without the flag (sampling is the normal mode) |
+| `N suspect time base` (red) | frames whose hit times make no sense, almost always a wrong coarse shift | see the shift banner |
+| `A analysed / B offered frames/s` | analysis rate and the rate the DAQ sends | compare B with the expected beam rate |
+| `live X %` | fraction of time covered by frames (1.0 = no dead time between frames), measured on pairs of consecutive frames; `—` when no two consecutive frames were analysed | a sudden drop means frames are missing or short |
+| `last frame N s ago` (yellow) | no frame for more than 5 s | check the SMA readout if a run is active |
+| `shift 14: ok` (green) / `mismatch, best K` (red) / `no fit` (yellow) / `insufficient` | the coarse-shift self-check (below) | see the shift banner |
+
+The table, flags and chips average over the last 60 s (`Self check/summary window s`).
+
+### Sampling: what "analysed N %" means
+
+Below the chips, when not every frame (or not every S1 hit) was analysed, a
+grey note says so, for example:
+
+> Counts are from the analysed sample: 45 % of frames (CPU budget 20 % of a
+> core); S1-seeded plots use at most 2000 S1 hits per frame (56 % of S1 hits).
+> Rates, fractions and efficiencies are unbiased.
+
+* **Frames.** The analyzer gets `CPU budget %` of one core and fits as many
+  frames into it as it can; the rest are skipped unread. Which frames are
+  analysed has nothing to do with their content, so every rate (hits per second
+  of time covered by the analysed frames), efficiency, mismatch fraction, ToT
+  fraction and live fraction is the same as with every frame; only the number
+  of entries in each histogram is smaller. The analyzer reads frames in pairs
+  of consecutive frames, so the frame gap and the live fraction (which need a
+  frame and the one sent just before it) are still measured. The rates use the
+  second frame of each pair only: the first is the frame being written when the
+  analyzer came back to the buffer, which favours long frames and would read
+  the rate low around beam trips.
+* **S1 hits.** A frame with more than `Cuts/max S1 per frame` (2000) kept S1
+  hits gives the S1-seeded analyses (pattern, efficiency given S1, S2..S5 - S1,
+  RF phase, delayed channels) to an evenly spread sample of 2000 of them. A
+  run-1008 frame has about 3500. Word counts, per-channel rates, ToT,
+  fine/coarse checks and stale words always use every hit.
+* An info flag `sampling` repeats this in the flag list. It is information,
+  not a warning.
+* A low analysed fraction is expected at high rate. It only means the budget is
+  too small if the plots fill too slowly to be useful; then the DQM expert can
+  raise `/DQM/SMA/Sampling/CPU budget %` (it takes effect within 2 s and resets
+  nothing).
+
+### The red banner: coarse shift
+
+The board writes each hit's time twice: a fine field and a coarse field equal to
+`time >> shift`. The shift is a board setting that has changed between firmware
+versions. If `/DQM/SMA/Coarse shift` does not match the board, every time-derived
+number on the page is wrong.
+
+The analyzer checks this continuously: over the last 30 s it counts how many S1
+hits have consistent fine and coarse fields at shifts 3 and 12-16
+(`sma.py:1011-1038`). When another shift beats the configured one by more than
+20 points and reaches 90 %, with at least 1000 S1 words, the page shows:
+
+> **Coarse shift 13 configured, 14 fits better (100.0 % vs 3.9 % of ... S1 words in 30 s) — set /DQM/SMA/Coarse shift = 14**
+
+(flag `shift_mismatch`, `sma.py:1167-1175`; banner `pages/js/dqm-sma.js:576-615`).
+A second red banner, **Time base: ...** (flag `time_base`, `sma.py:1176-1181`),
+means frames kept less than half of their hits in one time cluster; it has the
+same cause and the same fix.
+
+What to do:
+
+1. Click **Edit Coarse shift...** in the banner (or ODB page ->
+   `/DQM/SMA/Coarse shift`) and set the value the banner names.
+2. The banner clears within a few seconds (measured: 1 s). The plots restart
+   from zero, which is expected (a message "rebuilt 45 histograms (counts reset)"
+   appears in the MIDAS message bar).
+3. Write it in the elog and **tell the SMA expert**: a shift change usually
+   means a firmware change on the switching board.
+
+For reference: shift 14 fits the recent runs checked (429, 682, 1008); run 342 and
+earlier used 3, runs 367-375 used 15. A switching-board firmware change discussed
+on 2026-09-24 would move it to 13 once deployed.
+
+Before 1000 S1 words have been seen the chip says `insufficient` and a blue
+`shift_unchecked` note says per-channel checks are waiting (`sma.py:1187-1190`).
+`no fit` (flag `shift_no_fit`, `sma.py:1182-1186`) means no scanned shift works
+for S1: suspect the S1 channel itself and call the SMA expert.
+
+### Flags (below the banner)
+
+Worst first. Codes as in `sma.py:1152-1232`:
+
+| Flag | Severity | Meaning | What to do |
+|---|---|---|---|
+| `mismatch` on a channel | error above 50 %, warning above 5 % | that channel's fine and coarse time fields disagree: a timestamp fault on the board. Only shown once the shift check is `ok`, and only for S1-S5 and RF by default | compare with the known faults below; a new channel or a big change goes to the elog and the SMA expert |
+| `tot_corrupt` | warning above 5 % | many hits with ToT code >= 250 (a corruption marker) | same |
+| `stale_frames` | warning | some frames were old data (not this run's), left out of the plots. Common for the first frames after a run start | nothing unless it persists |
+| `all_stale` | error | every frame in 60 s is stale: the board is sending old data, or S1's own timestamps are broken at every shift | call the SMA expert |
+| `no_frames` | error (warning before the first frame) | no SMA frame for more than 5 s while a run is active | check that the SMA/musip readout is running and the SMA link is enabled |
+| `efficiency_drop` | warning | a counter's efficiency given S1 fell by more than 10 points in the last 30 s compared with the last 10 min | check HV and cabling of that counter |
+| `oversize` | warning | a frame had more than `Cuts/max words per frame` words and was not decoded | tell the SMA expert (the readout sent a huge frame) |
+| `sampling` | info | not every frame was analysed (CPU budget): histogram counts are from the sample, rates and fractions are not affected | nothing |
+| `settings` | warning | a value under `/DQM/SMA` was invalid and its default is used; the text names it | fix the ODB value |
+
+**Known timestamp faults (as of 2026-09-28), measured with this DQM on replayed
+runs:**
+
+| Channel | Run 682 | Run 1008 | Status |
+|---|---|---|---|
+| S5 (ch 5) | 95 % | 93 % | fine = t/2, a known board fault: expect the red S5 flag |
+| S3 (ch 3) | 13.5 % | 1.3 % | varies by run |
+| RF (ch 6) | 0 % | 31 % | varies by run |
+| S2 (ch 2) | 2.7 % | 0.3 % | |
+| S4 (ch 4) | 0.6 % | 0.1 % | |
+| current (ch 7) | 0 % | 100 % | not flagged (not in `mismatch flag channels`) |
+
+### The table
+
+One row per channel: rate (hits per second of covered time), hits per frame,
+fraction of hits with ToT >= 250, fine/coarse mismatch fraction, stale words, and
+**eff. given S1**: the fraction of S1 hits with a hit on that counter within
++-50 ns. The efficiency shows **n/a (timestamp fault)** when the counter's
+mismatch is above 5 % (`sma.py:1109-1115`): with broken timestamps the
+coincidence misses by microseconds and the number would look like a dead
+counter. Channels outside `mismatch flag channels` show their mismatch in grey,
+"(not flagged)". Footnote: RF valid fraction (S1 hits with a usable RF gate) and
+vetoed fraction.
+
+### Tabs
+
+* **Health**: word types, frame classes (good / stale / empty / suspect), words
+  per frame, frame span and gap, live fraction, rate per channel, stale words.
+* **ToT / corruption**: ToT per channel (split by fine bit 0), ToT >= 250 per
+  channel, coarse minus fine, `fine_vs_coarse` (which fine bit disagrees), fine-bit
+  occupancy.
+* **Timing**: S2..S5 minus S1 time differences, coincidence pattern, partners per
+  S1, S1 spacing.
+* **RF / delayed**: RF pulses per S1 gate, RF phase, RF period, phase vs S1 ToT,
+  delayed channels (8-10) minus S1.
+* **Trends**: rate per channel, live fraction, efficiency given S1, RF valid
+  fraction, 1 s rows over the last 10 min. The efficiency trend shows the raw
+  value even for a counter the table marks n/a (S5 sits near 0 there; ignore it).
+
+Controls: log y / log z, update rate (1 Hz, 0.5 Hz, 0.2 Hz, paused), **Clear**
+(zeroes the histograms only; the summary and trends are not affected).
+
+## The SMAEvents page
+
+* **S1-seeded events** (4 Hz): the latest 4 S1 hits whose whole window
+  (-200 ns .. +3 us) lies in the frame. One lane per channel, bars from t to
+  t+ToT, hatched red = fine/coarse mismatch, magenta marker = ToT >= 250, black
+  tick on RF = the pulse the phase is taken from. Badges per seed: which
+  counters fired (green), RF phase/period and whether the gate is valid, hit
+  count, mismatch and ToT counts. The *window* selector switches to a +-150 ns
+  prompt view.
+* **Whole-frame raster** (2 Hz): time vs channel for the whole frame, ToT as
+  colour, hit count per channel on the right. Drag to zoom in time, double-click
+  for the whole frame. *hide the current channel* removes ch 7, which otherwise
+  dominates.
+* Both tabs show the latest *analysed* frame. When the analyzer samples, a note
+  after the frame badges says so: "Latest analysed frame; the analyzer analyses
+  45 % of frames (CPU budget)".
+* **Freeze** holds the current frame so you can point at it; the frame sequence
+  number stays fixed until you release it.
+* Clicking hits tags them into the **Tagged hits** list under the plots
+  (numbered, grouped by frame, with Δt); see
+  [Tracking down an odd event](#tracking-down-an-odd-event).
+* **Single ▸** (both tabs) freezes if live, then fetches exactly one newer frame for the
+  visible tab per press (raster keeps its *hide the current channel* choice); if the analyzer
+  has nothing newer it asks once more after 300 ms, then says "no newer frame than seq N yet"
+  and keeps the display. **Frozen — resume** goes back to live polling.
+* A stale or suspect frame carries a red **STALE frame** or **SUSPECT time base** badge
+  with the reason (`pages/js/dqm-sma-events.js:278-285`). The seeded view shows only
+  good frames.
+
+## Settings: `/DQM/SMA`
+
+The analyzer re-reads the tree every 2 s (`analyzer.py:231-233`); edits take
+effect without a restart. Changing the coarse shift, channel roles (except
+labels), anything under Cuts or Binning **rebuilds the histograms and zeroes
+them** (`SmaPlugin.apply_settings`) and posts a MIDAS message. Labels, Self check
+and Sampling never reset a plot. Defaults: `SETTINGS_DEFAULTS` in `sma.py`.
+
+| Key | Default | Effect | Resets plots |
+|---|---|---|---|
+| `Coarse shift` | 14 | board coarse = time >> shift | yes |
+| `Channel roles/s1` | 1 | the seed channel | yes |
+| `Channel roles/counters` | [1, 2, 3, 4, 5] | S1..S5 in order (first must be the S1 channel) | yes |
+| `Channel roles/rf` | 6 | RF channel | yes |
+| `Channel roles/current` | 7 | proton-current channel | yes |
+| `Channel roles/delayed` | [8, 9, 10] | channels paired with S1 in [-1, +10] us | yes |
+| `Channel roles/labels` | 16 x "" | display names; empty = role name or chNN | **no** |
+| `Cuts/coinc window ns` | 50 | S1 coincidence window (pattern, efficiency) | yes |
+| `Cuts/dt window ns` | 200 | range of the S2..S5 - S1 plots | yes |
+| `Cuts/seed pre ns`, `seed post ns` | 200, 3000 | seeded-event window | yes |
+| `Cuts/seeds` | 4 | seeds shown per frame | yes |
+| `Cuts/rf gate ns`, `rf min pulses`, `rf max pulses` | 125, 2, 4 | RF phase gate | yes |
+| `Cuts/latch margin ns` | 3616 | tolerance of the fine/coarse check | yes |
+| `Cuts/stale gap ms` | 50 | hits further apart than this split a frame into time clusters; the cluster holding the median is kept | yes |
+| `Cuts/tot corrupt` | 250 | ToT code counted as corrupt | yes |
+| `Cuts/delayed lo ns`, `delayed hi ns` | -1000, 10000 | delayed-channel window | yes |
+| `Cuts/max words per frame` | 1048576 | larger frames (over 8 MiB) are counted as `oversize` (summary, status, a warning flag) and not decoded: one costs ~0.6 s of CPU and hundreds of MB. 0 = no limit | yes |
+| `Cuts/max S1 per frame` | 2000 | a frame with more kept S1 hits gives the S1-seeded analyses (pattern, efficiency, S2..S5 - S1, RF, delayed) to an evenly spread sample of this many; 0 = no cap. Bounds the cost of a dense frame | yes |
+| `Cuts/max gap s`, `max overlap ms` | 10, 10 | larger jumps between frames count as a loop/run boundary | yes |
+| `Cuts/stale frame ...`, `suspect kept fraction` | see `sma.py:145-153` | the stale/suspect frame rules (`sma.py:407-473`) | yes |
+| `Binning/...` | `sma.py:155-171` | histogram ranges and bin counts | yes |
+| `Self check/shift window s`, `shift margin`, `shift min fraction`, `shift min words` | 30, 0.2, 0.9, 1000 | the shift check | no |
+| `Self check/summary window s` | 60 | averaging of chips, table and flags | no |
+| `Self check/mismatch warn fraction`, `mismatch error fraction` | 0.05, 0.5 | mismatch flag levels | no |
+| `Self check/tot corrupt warn fraction` | 0.05 | `tot_corrupt` level | no |
+| `Self check/min hits` | 200 | channels with fewer hits are not judged | no |
+| `Self check/no frames s` | 5 | `no_frames` delay | no |
+| `Self check/efficiency window s`, `efficiency drop` | 30, 0.1 | `efficiency_drop` | no |
+| `Self check/mismatch flag channels` | [1..6] | channels that can raise mismatch/ToT flags | no |
+| `Sampling/CPU budget %` | 20 | the analyzer's CPU, % of one core, everything included; it analyses as many frames as fit and skips the rest unread. At most 50 (a larger value is used as 50, `cpu_budget_clamped` in `dqm::status`). 0: analyse nothing. No budget at all only with the development flag `mdqm-analyzer --no-cpu-budget` | no |
+| `Sampling/max events per s` | 1000 | hard cap on analysed frames per second, on top of the budget; 0 means "decode nothing" | no |
+| `Sampling/raw ring MB` | 16 | the raw bytes of the last analysed frames, for **Download raw event** (`sma::raw`); about 50 frames of run 1008. Oversize frames are never kept. 0 = none | no |
+
+An ODB seeded by an older version has a `Sampling/process all` key: it is
+ignored now (the budget replaced it) and can be deleted.
+
+A key the analyzer seeded once keeps its value when a newer version changes the
+default (for example `Binning/span bins`). To go back to the defaults, delete the
+key (or all of `/DQM/SMA`) and restart the analyzer; keys it does not know are
+ignored.
+
+## Tracking down an odd event
+
+Every frame on SMAEvents carries a **tag** that finds it again in the data
+files:
+
+> SMA run 1008 · event 301 serial 4757 · 2026-09-28 07:31:02 UTC · frame seq 4750
+
+It gives the run, the MIDAS event id and **serial number** (the key: serials count up
+through a whole run, across subruns), and the event header's time (UTC, 1 s). The
+frame seq is only this analyzer's own counter.
+
+**On shift:**
+
+1. **Freeze** the frame (or step with **Single ▸**).
+2. Click **Copy tag** in the frame header and paste it into the elog.
+3. For hits: hover one to see its line, click it to **tag** it. Click more
+   hits to tag them too (on either tab); click a tagged hit again, or its **×**
+   in the list, to untag it. The **Tagged hits (N)** list under the plots has
+   one row per hit, grouped under its frame's tag: its number, the channel,
+   ToT, time, fine/coarse flag, the hit's **word index** in the H000 bank
+   (64-bit words, filler and pixel words counted) and the raw word in hex, and
+   for every hit after a frame's first, **Δt** in ns from that first tagged
+   hit. For example `ch 5 (S5) · ToT 37 · … · word 12345 · 0x8512… · Δt +42 ns`.
+   On the canvas each tagged hit is boxed in black with its list number beside
+   it, whenever its frame is on screen (a hit tagged on the seeded tab is also
+   marked on the frozen raster of the same frame).
+   - The raster has word data only for a frozen frame. A click on a live
+     raster **freezes** it, fetches the words once, and then tags the hit (the
+     list says so while it waits).
+   - The list stays through tab switches, new frames, Freeze/Single and a
+     reload of the page (it is kept per browser tab). It holds at most 200
+     hits. **Clear all** empties it. **Esc** clears only the hover line.
+   - **Copy** on a row copies that line with its frame tag. **Copy all**
+     copies the whole list, per frame: its tag, its hits one per line, and the
+     command that lists those words from the run file:
+
+     ```
+     SMA run 1008 · event 301 serial 355 · 2026-09-28 05:31:08 UTC · frame seq 19617
+       #1 · ch 1 (S1) · ToT 10 · t 10585709453 ns (t_rel 0 ns) · fine/coarse ok · word 39501 · 0x810a009dbd451b8d
+       #2 · ch 2 (S2) · ToT 2 · t 10585709459 ns (t_rel 6 ns) · fine/coarse ok · word 39502 · 0x8202009dbd451b93 · Δt +6 ns
+       mdqm-sma-file --serial 355 --run 1008 --dir <raw dir> --words 39501:39502
+     ```
+
+     Replace `<raw dir>` with the directory holding the run's `.mid` files.
+4. For a seed, the seed's copy action gives the tag plus the S1 word and the
+   word range of the hits in its window.
+5. If the event matters, click **Download raw event**. That saves
+   `sma_run<run>_serial<serial>.mid`, the MIDAS event as the analyzer received it.
+   It is a valid one-event MIDAS file (`mdump -x`, `midas.file_reader` and
+   `mdqm-sma-file` read it). The analyzer keeps only the last 16 MB of analysed
+   frames (`Sampling/raw ring MB`): about 50 run-1008 frames, which is 2 s at
+   today's analysis rate. So the page fetches the raw event the moment you
+   **Freeze** (or press **Single ▸**) and keeps it while the frame is frozen, and
+   Download works for as long as you like. A live, unfrozen frame that has
+   already left the ring shows "no longer held — use the tag".
+
+On a page served over plain http from a hostname (not localhost), browsers
+refuse the clipboard API; the page then copies another way, and if that fails
+too it shows the text selected in a small box for Ctrl-C.
+
+**Later, in the analysis:**
+
+```bash
+mdqm-sma-file --serial 4757 --run 1008 --dir /path/to/raw            # scans run01008_*.mid* in order
+mdqm-sma-file --serial 4757 --run 1008 --dir /path --words 12340:12350   # only those words (inclusive)
+mdqm-sma-file --serial 4757 run01008_00024.mid.lz4                    # or name the file(s)
+```
+
+It prints the tag, the file, subrun and **event position**, a table (word index,
+raw hex, ch, ToT, fine, coarse, time, fine/coarse ok or MISMATCH), and writes
+`sma_run<run>_serial<serial>.mid` (in `--out`, or `--event-out PATH`). With
+`--words` every word in the range is listed, filler and pixel words too. Without
+it, the first 200 trigger words are listed (`--max-lines`). It stops at the first
+match; exit 0 found, 1 not found.
+
+**The nearline rec ntuple** numbers entries by the event's **position** in its
+subrun file: 0-based among *all* events of the file, the begin-of-run record and
+the WaveDREAM events included. It does not use the serial.
+`mdqm-sma-file --serial` prints that position, e.g. serial 0 of run 1008 is
+position 10 of `run01008_00000`. That agrees with the raw-word study, whose event
+list (`scratch/sma-raw-check/examples.json`, made against the rec ntuple) has
+`event_index == rec_entry` for all 117 events. So: tag → `mdqm-sma-file
+--serial` → subrun and position → rec entry.
+
+On the local rig, `replay.sh` sends the file's own serials and times
+(`replay-run.py --keep-header`) and sets the run number from the file name, so
+the tags there match the files as well. With `--loop` the serials start again
+each pass, which the analyzer treats as a restart. The replayer re-packs events,
+so the 4 reserved bytes of each bank header in a downloaded rig event are 0
+where the file has whatever the frontend left there; every data word is
+identical. At PSI the download is the event exactly as the frontend wrote it.
+
+## Manual path: `mdqm-sma-file` (analyzer or DAQ down)
+
+The same plugin over one file, no MIDAS needed (`src/mdqm/tools/sma_file.py`).
+It uses the default settings, not the ODB. **It is not CPU-budgeted: it analyses
+every frame of the file** (it is a batch job, not a guest on the DAQ PC). The
+S1 cap (`Cuts/max S1 per frame`) is a cut and applies in both, so the CLI and an
+analyzer started with `--no-cpu-budget` on the same frames give identical histograms; an analyzer
+that sampled has the same rates and fractions but fewer entries.
+
+```bash
+mdqm-sma-file /path/run01008_00001.mid.lz4                    # -> ./sma-file-1008_1/
+mdqm-sma-file run00342.mid.lz4 --shift 3 --frames 300 --out /tmp/342
+mdqm-sma-file FILE --settings '{"Cuts": {"coinc window ns": 30}}' --no-png
+mdqm-sma-file FILE --settings my-sma-settings.json --skip 10 --frames 50
+```
+
+Options (`sma_file.py:489-511`): `--shift N` (default 14), `--frames N`,
+`--skip N`, `--out DIR` (default `./sma-file-<run>_<subrun>/`), `--settings`
+(inline JSON or a JSON file in the `/DQM/SMA` layout; unknown keys are an error),
+`--no-png`, `--quiet`.
+
+Outputs in the output directory:
+
+| File | Content |
+|---|---|
+| `hists.npz` | every histogram, identical to what the analyzer holds when it analysed the same frames (`--no-cpu-budget`; verified for runs 682 and 1008) |
+| `summary.json` | exactly what the SMAPlots page shows (chips, table, flags, shift check) |
+| `trend.json` | the 1 s trend rows |
+| `summary.png` | one-page overview |
+
+A text summary goes to the terminal: frame classes, live fraction, shift check,
+rates, mismatch per channel, efficiencies, flags.
+
+Exit status (`sma_file.py:71-73`, `:597`): **0** fine (warnings allowed),
+**3** at least one error flag (for example a wrong shift, or the S5 mismatch),
+**2** bad argument or unreadable file.
+
+If it reports `shift_mismatch`, run it again with the `--shift` it names; that
+tells you which shift the board used for that file. Example: run 342 with the
+default gives exit 3, "Coarse shift 14 is configured but 3 fits better"; with
+`--shift 3` the check is `ok`.
+
+## Troubleshooting
+
+**Analyzer not connected (`no analyzer` chip).** Check the process is running
+(`ps aux | grep mdqm-analyzer`) and that `sma_analyzer` is listed on the MIDAS
+Programs or Status page. If not, start it (step 3). Its log says
+`lost MIDAS (...); retrying in Ns` when it lost the connection and is retrying
+on its own (`analyzer.py:604`).
+
+**The analyzer died after a MIDAS restart.** If the experiment's shared memory
+was recreated (all clients stopped, `/dev/shm` files removed, ODB reloaded), or
+the analyzer process was frozen for more than 10 s (MIDAS's watchdog removes it),
+MIDAS itself aborts the analyzer on its next access ("Cannot continue,
+aborting..."). Its retry loop cannot catch that. Start it again (step 3); the
+plots start from zero. A restart of mhttpd, the frontends or the logger alone
+does not affect it: the pages come back as soon as mhttpd is back, with the
+plots intact.
+
+**Stale buffer readers.** The ODB list `/System/Buffers/SYSTEM/Clients` can keep
+names of clients that have exited (it is a record, not the live list); the
+Buffers page of mhttpd shows who is really attached. A reader that stops reading
+(for example a frozen analyzer) does not block the DAQ: its requests are
+non-blocking, and MIDAS removes it after its 10 s watchdog timeout.
+
+**After mhttpd restarts, SMAPlots keeps saying "Could not update this tab".**
+The plots do update again; the note is left over from the outage. Reload the
+page (this is a known page bug as of 2026-09-29).
+
+**The page looks old after an update of this package.** mhttpd tells browsers to
+cache `.js` and `.css` files for 24 h. The HTML pages load them with a version
+tag (`pages/sma.html:13-17`, `pages/sma-events.html:13-17`, for example
+`dqm-sma.js?v=4`); whoever changes a script bumps its `?v=`. As a shifter, a hard
+reload (Ctrl-Shift-R) fixes it.
+
+**A raster reply is truncated or slow.** The page asks for up to 512 kB per
+`sma::frame` (`pages/js/dqm-brpc.js:26-30`); a whole 40000-word frame is about
+230 kB. Replies measured 15-60 ms even with the DAQ flooding the buffer.
+
+**In a container, clients fail with `BM_CORRUPTED, mismatch of buffer name in
+shared memory`.** Docker gives containers a 64 MB `/dev/shm` by default. The ODB
+plus the SYSTEM buffer plus SYSMSG must fit; a 64 MB SYSTEM buffer does not.
+Either make the SYSTEM buffer smaller (`/Experiment/Buffer sizes/SYSTEM`, set
+before the buffer is first created) or recreate the container with
+`--shm-size`. See `scratch/sma-dqm-standalone/README.md` for the local rig.
+
+**The analyzer analyses fewer frames than the DAQ sends.** That is the design:
+it analyses what fits in its CPU budget (`analysed X % of frames`). On a busy
+machine each frame costs more CPU, so the same budget analyses fewer frames; the
+analyzer backs off rather than taking more. If the plots fill too slowly, the
+DQM expert can raise `/DQM/SMA/Sampling/CPU budget %`.
+
+## Resource requirements
+
+**The analyzer never uses more than its CPU budget** (`/DQM/SMA/Sampling/CPU
+budget %`, default 20 % of one core). At a high rate it analyses a sample of the
+frames. The rate does not change what it costs, only how many of the frames it
+analyses.
+
+### Under the CPU budget, 1x to 10x run 1008
+
+Measured on 2026-09-29 (`docs/profile-sma-highrate.json`; scripts and raw data
+in `scratch/sma-dqm-profile/highrate/`, `RESULTS.md` there). Run 1008's frames
+had their hit times compressed k times (`scratch/sma-dqm-standalone/make_dense.py`:
+40000-word frames, k times shorter, rates exactly k times higher). They were
+replayed at k x 35 frames/s, so x10 is 350 frames/s, 14 M words/s, 112 MB/s. The
+analyzer ran under `nice -n 19 ionice -c3 prlimit --as=1 GiB` with the default
+budget of 20 %. Each row is two repeats of 60 s, and the reply latencies are
+from dqm::status, sma::summary and sma::frame (raster) probed through mhttpd at
+1 Hz each, with SMAPlots and SMAEvents also open in a browser for the "pages
+open" figures:
+
+| Load | Offered frames/s | Analyzer CPU, mean / p95 of 1-s samples | Analysed | RSS | Replies p95 (status / summary / raster) | Rates shown vs true |
+|---|---|---|---|---|---|---|
+| no data | 0 | 1.1 % / 2 % | – | 110-120 MB | 4 / 4 / 10 ms | – |
+| x1 (today) | 35 | 18.1 % / 20-22 % | 50-61 % | 109-115 MB | 7-18 / 3-6 / 9-13 ms | within 0.2 % |
+| x2 | 71 | 18.0 % / 19-21 % | 32-36 % | 113-118 MB | 3-8 / 3-8 / 9-13 ms | within 0.1 % |
+| x5 | 177 | 18.0 % / 19-22 % | 11-15 % | 114-118 MB | 7-14 / 3-15 / 9-18 ms | within 0.1 % |
+| x10 | 350 | 18.0 % / 20-22 % | 6-8 % | 115-119 MB | 8-12 / 3-13 / 9 ms | within 0.25 % |
+
+* **CPU**: at the budget's 90 % target at every rate, pages open or closed. The
+  p95 of the 1-s samples is at most 2 points above the budget.
+* **Other budgets at x10**: 5 % gives 4.6 % of a core (1.2 % of the frames
+  analysed), 50 % gives 45 % (21 %). At budget 0 the analyzer only skips: it uses
+  0.9-1.0 % of a core at 350 frames/s, including answering the probes.
+* **Without a budget** (`--no-cpu-budget`, the old "process all") at x10: 91 % of a core
+  (p95 100 %), 46 % of the frames, replies p95 about 60 ms.
+* **A rate step** from x1 to x10: the largest 0.5-s CPU sample afterwards was 24 %,
+  and the CPU was back within budget 0.6 s after the step.
+* **A busy machine** (8 busy loops in the container, the machine 53 % busy): the
+  CPU stays at 18 %; each frame costs more, so fewer are analysed (x10: 5.2-5.7 %
+  instead of 5.1-7.6 %; x1: 55-58 % instead of 48-75 %). It backs off, it does
+  not take more.
+* **The DAQ side**: the replayer sends 349.8 frames/s with no analyzer and
+  349.6-350.1 frames/s with one at any budget. Its time inside `send_event` is
+  0.10-0.16 ms per frame on average, at most 3 ms, with or without an analyzer,
+  so it is never held up. Only the 8 busy loops slowed the replayer itself, to
+  347 frames/s.
+* **Memory**: the analyzer's private memory went from 46 to 48 MB over 40 minutes
+  (the 10-minute trend fills in the first ten; this was measured before the raw ring,
+  which adds up to `Sampling/raw ring MB` = 16 MB). RSS is 110-121 MB, about 50 MB
+  of which is the SYSTEM buffer and ODB mapped into it.
+* **Dense frames**: frames of 400000 words (ten times denser, at 35 frames/s)
+  stay at the budget, 17.9 %. One frame takes about 56 ms, the S1 cap analyses
+  5.6 % of their S1 hits, the slowest reply was 96 ms and RSS peaks at 180 MB.
+  Frames of 1.12 M words (9 MB, above an 8 MB MAX_EVENT_SIZE) take about 135 ms
+  each; RSS then peaks at 311 MB, under the 1 GiB ceiling.
+
+At today's rate the default budget analyses about 60 % of the frames. One
+analysed 1008 frame costs 7-9 ms of CPU live: 5.3 ms in `process()` (with the S1
+cap; 6.2 ms without) plus reading, cold caches and replies. Analysing every
+frame at 35 frames/s would take a budget of about 30-35 %.
+
+### Per-frame cost, every frame analysed (no budget)
+
+The measurements below are from before the budget (`docs/profile-sma.json`,
+2026-09-29, analyzer analysing every frame). They give the cost of the analysis
+itself. Under a budget they set how many frames fit into it, not how much CPU
+is used.
+
+Measured on 2026-09-29 on this laptop (Intel Core Ultra 7 356H, 16 logical CPUs
+under WSL2, the `testbeam-midas` container capped at 8 CPUs), with real run
+files replayed into the local `smadqm` experiment. Every number below is in
+`docs/profile-sma.json`; the scripts and raw samples are in the workspace at
+`scratch/sma-dqm-profile/` (`RESULTS.md` there explains each measurement). CPU
+is given as a percentage of one core. The laptop was shared with other heavy
+jobs for part of the day; the numbers quoted here are from the repeats taken
+while the rest of the machine was less than 25 % busy, and the effect of load is
+described separately.
+
+### The analyzer
+
+At the current beam (run 1008: 40000-word frames at 35 frames/s, 1.4 M words/s)
+**one SMA analyzer needs about 25 % of one core and about 115 MB of RAM**
+(`analyzer_vs_rate`):
+
+| Data | Frames/s | Analyzer CPU | CPU per frame |
+|---|---|---|---|
+| no data (run stopped) | 0 | 0.2 % | – |
+| run 480 (4000 words) | 11 | 3 % | 2.8 ms |
+| run 682 (4000 words) | 77 | 11 % | 1.5 ms |
+| run 1008 (40000 words) | 35 | 25 % | 7.4 ms |
+| run 1008, twice the rate | 70 | 45 % | 6.4 ms |
+| run 1008 | 100 | 66 % | 6.6 ms |
+
+A rule of thumb that fits these rows: **about 0.9 ms per frame plus 0.14 ms per
+1000 words**, on one core of this laptop. The design target of 4 M words/s
+would take about 60-65 % of a core. The ceiling measured in the stress test
+(`docs/stress-sma.json`) is about 140 frames/s of 40000-word frames, i.e.
+5.6 M words/s, on one core.
+
+Where the time goes, for a 40000-word frame (`per_frame_breakdown_offline`,
+confirmed on the live analyzer with py-spy, `live_pyspy_share`): filling the
+histograms about a third, coincidences and time differences 17-25 %, the
+stale-hit filter and time sort 13-17 %, fine/coarse checks 13 %, RF phase 5 %,
+decoding the words 4 %, and, live only, reading the MIDAS buffer 8-10 %. For small (4000-word)
+frames the histogram filling is half of the time: it costs about 1.2 ms per
+frame whatever the frame size, because there are 45 histograms to update.
+
+Open pages cost the analyzer little: answering SMAPlots and SMAEvents (raster)
+adds about 1.5 % of a core with no data and is within the scatter at 35
+frames/s. Building one whole-frame raster takes about 1 ms and is done once per
+frame, however many viewers ask for it (`replies_1008`).
+
+**RAM.** The analyzer starts at about 94 MB (Python, numpy, MIDAS, the empty
+histograms) and settles at about 115 MB after ten minutes, once the 10-minute
+trend is full. About 50 MB of that is the MIDAS SYSTEM buffer and ODB mapped
+into the process, which it shares with every other MIDAS client; its own
+(private) memory is about 50 MB. The analyzer's own data are small: the 45
+histograms hold 0.3 MB, the 10-minute trend 1 MB, the last frames kept for the
+event display 2.3 MB, the cached raster 0.2 MB (`static_footprint_1008`).
+**No leak was found** (`memory`, `tracemalloc_ring_full`): with run 1008 looped at
+35 frames/s and pages open, the analyzer's private memory (resident plus swapped
+out) stayed at 46.0 MB from 37 to 67 minutes after its start, +0.03 MB/h. An
+analyzer that had been running for 7.75 hours (1.06 million frames) was at
+115 MB, the same as after ten minutes.
+
+Without a budget (`--no-cpu-budget`) plan on one core and 256 MB, and do not let it
+share a core with heavy batch jobs. When other jobs kept this laptop 90 % busy,
+the same frames cost twice the CPU (12-13 ms instead of 6.5 ms per frame). At
+100 frames/s the analyzer then fell behind and processed about 70 frames/s (the
+rest are counted as "missed (serial gaps)"; the DAQ is never slowed). **With the
+default budget, plan on 20 % of a core and 256 MB**, whatever the rate (RSS
+about 155 MB with the 16 MB raw-event ring). Raise
+the address-space limit if the SYSTEM buffer is larger than about 600 MB.
+
+### Next to the WaveDREAM analyzer
+
+With both analyzers on run 1008 (35 SMA frames/s and about 310 WaveDREAM
+events/s, `wd_plus_sma_on_1008`, measured before the budget): SMA 27 % of a core
+and 115 MB, WaveDREAM 2-3 % of a core and 108 MB (it samples 20 events/s by
+design), mhttpd about 1 %. With the SMA budget at its default the two analyzers
+together stay under a quarter of a core at any rate. **Budget one core and 1 GB
+of RAM** for the two analyzers, mhttpd and headroom.
+
+### mhttpd and the network, per open page
+
+Each open page costs mhttpd a fraction of a percent of a core
+(`mhttpd_pages`, 30 s per point, twice, against a baseline with no page open;
+mhttpd idles at 0.6-1 % with the replay running):
+
+| Page, tab | mhttpd CPU per viewer | Data per viewer |
+|---|---|---|
+| SMAPlots, Health | 0.5 % | 35 kB/s |
+| SMAPlots, ToT / corruption | 0.6-0.8 % | 110 kB/s |
+| SMAPlots, Timing | 0.4-0.5 % | 26 kB/s |
+| SMAPlots, RF / delayed | 0.5 % | 120 kB/s |
+| SMAPlots, Trends | 0.2 % | 10 kB/s |
+| SMAEvents, seeded (4 Hz) | 0.2-0.25 % | 7 kB/s |
+| SMAEvents, raster (2 Hz), ch 7 hidden | 0.2 % | 390 kB/s |
+| SMAEvents, raster (2 Hz), ch 7 shown | 0.2-0.25 % | 430 kB/s |
+
+So three shifters with pages open cost mhttpd 1-2.5 % of a core. The raster
+is the only heavy one on the network: about 3.5 Mbit/s per viewer, which
+matters only over a slow remote link (set its update to 0.5 Hz there). mhttpd's
+own memory grew from about 100 MB to about 170 MB as pages were first opened
+and then stayed there; as with the WaveDREAM pages this is allocator working
+set, not a leak.
+
+### The browser
+
+One open view costs its browser about 10-15 % of one core
+(`browser_per_view`; headless Chromium, which draws in software, so a desktop
+browser with a graphics card should need less): SMAPlots Health 15 %, Trends
+13 %, SMAEvents seeded 10 %, raster 13-14 %. The JavaScript heap stays at
+2-3.5 MB after garbage collection, flat over 35 minutes (the Trends tab grows by
+0.6 MB during its first 10 minutes while the trend fills, then stays flat), and
+the number of page elements does not grow.
+
+### The offline CLI
+
+`mdqm-sma-file` on one subrun takes 1-4 s and at most 90 MB of RAM (`cli`):
+about 2 s for a 1008 or 682 subrun without the PNG, 1 s more with it.
+
+## For developers
+
+### How the CPU budget works
+
+* **Controller** (`CpuBudget` in `src/mdqm/dqm/analyzer.py`). Every second it
+  takes the process's CPU time (`time.process_time`: all threads, so buffer
+  reads, decoding, fills and brpc replies all count) and the frames analysed
+  over the last 2 s, and sets the analysis rate to
+  `analysed/s x 0.9 x budget / CPU fraction`: the rate at which the measured
+  cost per frame uses 90 % of the budget. The idle cost is inside the measured
+  fraction, so it settles a little below 90 %, never above. It raises the rate
+  by at most 2x what was actually analysed per step (bounds the overshoot when
+  the DAQ rate jumps), never goes below 0.2 frames/s while the budget is above 0,
+  and never above `max events per s`.
+* **Reading** (`Analyzer._run_budget`, `BufferOps`). Frames are analysed in
+  slots of two consecutive frames. A slot skips first only when the budget is
+  the limit: when the offered rate of the requested events (from their serial
+  numbers, over the last 2 s) is above 95 % of the rate the budget allows.
+  Otherwise frames are read in order and none is skipped. (The buffer level
+  cannot decide this: it counts every event in SYSTEM, WaveDREAM's too.) The
+  skip is `bm_skip_event`, which sets this client's read pointer to the buffer's write
+  pointer (`midas.cxx`, `bm_skip_event`: `pclient->read_pointer =
+  pheader->write_pointer`): O(1), under the buffer lock, nothing copied. The
+  next frame read is the next one written. The python client has no wrapper,
+  so it is called through the library already loaded
+  (`_Z13bm_skip_eventi`, `_Z19bm_get_buffer_leveliPi` in
+  `libmidas-c-compat.so`; measured 1 us per call). The request stays
+  `GET_NONBLOCKING`, so the writer is never held up by this client in any case.
+* **Why not `GET_RECENT`.** It does not skip to the newest event. In
+  `bm_check_requests` (`midas.cxx`) a `GET_RECENT` request only refuses an
+  event whose header time stamp is more than 1 s older than now (1 s
+  resolution); every event younger than that is still copied out in order,
+  exactly as with `GET_NONBLOCKING`. It saves nothing at a steady high rate.
+  (Events that match no request are passed over without a copy in either mode;
+  the copy happens in `bm_read_buffer` only for requested events.)
+* **Offered frames** are counted from the serial numbers of the analysed ones
+  (a jump from 10 to 14 means 4 offered), so skipped frames cost nothing to
+  count; after a MIDAS reconnect the baseline restarts, so an outage is not
+  counted as offered frames. The gap, the live fraction and the rates are only
+  computed on a frame whose predecessor (the previous serial) was analysed too.
+* **Errors in the plugin** (for example a MemoryError) drop that one event,
+  are counted (`plugin_errors` in `dqm::status`) and reported once per error
+  type; only MIDAS errors send the analyzer through its reconnect loop.
+* **Rates** divide the hits by the time the frames cover, taken from each
+  frame's fine/coarse-consistent hits (`Frame.timed_extent`). A few faulty S5/RF
+  words (coarse - fine at half a wrap) decode one 2^20 ns wrap early and widen
+  the all-hit extent by ~1 ms; with every frame analysed the overlap of
+  consecutive frames removed that, but a lone sampled frame has no neighbour,
+  and its rates read 4 % low at the 1008 rate and 25 % low at ten times it.
+  With the consistent-hit extent, every-frame and every-third-frame rates agree
+  to 0.01 %. The span, gap and live-fraction histograms keep the all-hit extent
+  (`PISMAWord` / `PITMidasMusip`).
+* **WaveDREAM** is unchanged: its settings tree has no `CPU budget %`, so it
+  keeps the token bucket at `max events per s` and drains the buffer as before
+  (`tests/test_cpu_budget.py::test_the_wavedream_analyzer_is_untouched_by_the_budget`).
+
+* Local rig with replayed run files: `scratch/sma-dqm-standalone/README.md`
+  (workspace scratch area, not in this repository).
+* High-rate test data: `scratch/sma-dqm-standalone/make_dense.py` (1008 frames with
+  their times compressed k times, and `--merge N` for N-times-denser frames); results
+  in `docs/profile-sma-highrate.json`.
+* Load test (start the analyzer with `--no-cpu-budget`, a development flag: it
+  measures the lossless ceiling): `scripts/stress-analyzer.py FILE --event-id 301 --client sma_analyzer
+  --status-cmd dqm::status --limit-path "/DQM/SMA/Sampling/max events per s"
+  --frame-cmd sma::frame --frame-args '{"view": "raster"}'`; results in
+  `docs/stress-sma.json`.
+* Per-frame cost on real frames: `scripts/bench-sma.py FILE` (gate: 100 frames/s of
+  40000-word frames on one core).
+* Cost of a page for mhttpd, the analyzer and the network: `scripts/profile-page.py
+  --driver chromium --container testbeam-midas --url
+  'http://localhost:8123/?cmd=custom&page=SMAEvents' --click '#dqm-smaev-tab-raster'
+  --analyzer-client sma_analyzer --experiment smadqm --dropped-path '' --tabs 0 1 3
+  --repeat 2` (the defaults still profile the WaveDREAM Scalers page).
+  Resource figures: `docs/profile-sma.json`, section "Resource requirements" above.

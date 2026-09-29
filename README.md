@@ -33,6 +33,52 @@ Then open the experiment's mhttpd and pick **Scalers** or **Scope** from the sid
 Registration is idempotent and safe to run on every start — that is how a moved
 checkout heals itself.
 
+## SMA (MuSiP trigger/ToT board) DQM
+
+A second analyzer plugin, `src/mdqm/plugins/sma.py`, decodes SMA readout frames
+(event 301, bank `H000`) and serves two more pages, **SMAPlots** (flags,
+per-channel table, Health / ToT / Timing / RF / Trends tabs) and **SMAEvents**
+(S1-seeded events and a whole-frame raster). It runs as its own client next to
+the WaveDREAM one, with its own ODB tree `/DQM/SMA`:
+
+```bash
+nice -n 19 ionice -c3 mdqm-analyzer --experiment MYEXPT --plugin sma --client sma_analyzer
+mdqm-sma-file run01008_00001.mid.lz4          # same plugin over one file, no MIDAS
+```
+
+**It is a live peek, bounded by a CPU budget, not a lossless record.** The
+analyzer measures its own CPU and analyses only as many frames per second as fit
+in `/DQM/SMA/Sampling/CPU budget %` (default 20 % of one core, everything
+included: reading the buffer, decoding, filling, answering the pages). The
+frames in between are skipped without being read (`bm_skip_event` moves the
+client's read pointer to the newest event), so they cost nothing at any rate.
+The pages say which share was analysed ("analysed N % of frames"); rates,
+fractions and efficiencies are unaffected by the sampling, histogram counts are
+from the sample. Dense frames are bounded too: the S1-seeded analyses use at
+most `Cuts/max S1 per frame` (2000) S1 hits per frame. Measured at 1x-10x run
+1008 in `docs/profile-sma-highrate.json`. The ODB cannot set more than 50 %;
+`mdqm-analyzer --no-cpu-budget` (development only) restores the old behaviour
+(every frame, in order, as long as one core keeps up); the offline
+`mdqm-sma-file` is never budgeted. Frames over `Cuts/max words per frame`
+(1 Mi words) are counted and not decoded.
+
+The shifter guide, start to finish, is **[docs/SMA-DQM.md](docs/SMA-DQM.md)**:
+every chip, flag and banner, the coarse-shift check, the `/DQM/SMA` settings,
+the offline `mdqm-sma-file` (outputs `hists.npz`, `summary.json`, `trend.json`,
+`summary.png`; exit 0 / 3 on an error flag / 2 on bad input) and troubleshooting.
+
+Tools added with it:
+
+| Tool | What |
+|---|---|
+| `mdqm-sma-file FILE [--shift N] [--frames N] [--skip N] [--settings JSON] [--out DIR]` | the manual path when the analyzer or DAQ is down |
+| `mdqm-sma-file --serial N --run R --dir D [--words A:B]` | find one event by the tag copied from SMAEvents (run + serial): prints its words and event position (= nearline rec-ntuple entry), writes `sma_run<R>_serial<N>.mid`. See "Tracking down an odd event" in docs/SMA-DQM.md |
+| `scripts/replay-run.py ... --keep-header` | send the file's own serials and time stamps, so tags from the pages match the file |
+| `scripts/replay-run.py ... --event-id 301 --numpy` | `--numpy` (now the default; `--no-numpy` for the old path) sends banks as arrays, 5-6x faster on 40000-word frames; `--event-id` may be repeated |
+| `scripts/stress-analyzer.py FILE --event-id 301 --client sma_analyzer --status-cmd dqm::status --limit-path "/DQM/SMA/Sampling/max events per s" --frame-cmd sma::frame --frame-args '{"view": "raster"}'` | load test for either plugin; `--lossless` sets the pass fraction (0.999); counts frames the buffer overwrote via the plugin's serial check. For SMA run the analyzer with `--no-cpu-budget` (otherwise it samples on purpose). Results: `docs/stress-sma.json` |
+| `scripts/replay-run.py ... --report-s 5` | prints the achieved rate and the time spent in `send_event` every 5 s: whether a consumer ever held the producer up |
+| `scripts/bench-sma.py FILE...` | per-frame cost of the SMA decode and analysis on real frames, one core (gate: 100 frames/s of 40000-word frames) |
+
 ## Sharing an experiment
 
 The pages register as `/Custom/<name>` keys holding **absolute** paths, and never
