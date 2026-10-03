@@ -313,16 +313,22 @@ def test_the_overlap_of_consecutive_frames_is_counted_once_in_the_rates():
 
 
 def test_every_histogram_counts_in_uint64_and_encodes_as_f64():
+    """Except the MuPix x/y maps: uint32 on the wire (half the bytes), widened
+    before a bin could wrap (test_sma_mupix_xy)."""
     p = _plugin()
     _feed(p, R1008, run=1008)
     names = [n for n in p.store.names() if n.startswith("sma/")]
     assert len(names) >= 40
+    xy = ("sma/mupix_track_", "sma/mupix_hits_xy_")
     for n in names:
         h = p.store.get(n)
-        assert h.counts.dtype == np.uint64, n
         d = framing.decode_histogram(h.encode())
-        assert d["counts"].dtype == np.float64, n
-        assert np.array_equal(d["counts"], h.counts.astype(np.float64)), n
+        if n.startswith(xy):
+            assert h.counts.dtype == np.uint32 and d["counts"].dtype == np.uint32, n
+        else:
+            assert h.counts.dtype == np.uint64, n
+            assert d["counts"].dtype == np.float64, n
+        assert np.array_equal(d["counts"], h.counts.astype(d["counts"].dtype)), n
 
 
 def test_consecutive_frames_fill_gap_and_live_and_a_long_gap_resets():

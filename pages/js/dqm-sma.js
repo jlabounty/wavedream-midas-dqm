@@ -11,10 +11,15 @@
 //      wrong until it is fixed;
 //   3. a per-channel table (rates, ToT >= 250, fine/coarse mismatch, stale,
 //      S1-conditional efficiency), with the flagged cells coloured;
-//   4. tabs of histograms, and the 10-minute trends. The MuPix tab adds the
-//      in-time fractions of S1 hits (L1, L2, L1+L2, with the sideband and the
-//      accidentals taken out) and the time-sync state above its plots; its
-//      per-chip column/row occupancy is drawn per plane, one line per chip.
+//   4. tabs of histograms, and the 10-minute trends. Two MuPix tabs:
+//      "MuPix phase space" (reco frame, +x beam-left): a one-line note (track
+//      fractions, ToT cuts, stage shift, geometry, chips as drawn), the in-time
+//      hit maps of L1 and L2, the S1-seeded tracks x/y, x/x', y/y' -- each a
+//      row of all / light / heavy -- their ToT map and states. "MuPix
+//      diagnostics": the in-time fractions of S1 hits (L1, L2, L1+L2, with the
+//      sideband and the accidentals taken out) and the time-sync state above
+//      the timing, ToT and occupancy plots; the per-chip column/row occupancy
+//      is drawn per plane, one line per chip.
 //      The NIM / TOT tab (since run 1015 each counter has a NIM copy, "S1L"
 //      ...) has a table per counter -- pair efficiency, purity, NIM-only share,
 //      median NIM - TOT, the lag-fault vote -- above its plots, per counter.
@@ -46,7 +51,11 @@ const TABS = [
   ["tot", "ToT / corruption"],
   ["timing", "Timing"],
   ["rf", "RF / delayed"],
-  ["mupix", "MuPix"],
+  // The phase space first: it is what a shifter watches. The diagnostics tab
+  // keeps the old tab's id, so a page that remembered "mupix" opens it.
+  // [id, label, short label for a phone-width tab bar]
+  ["mupixxy", "MuPix phase space", "MuPix x/y"],
+  ["mupix", "MuPix diagnostics", "MuPix diag."],
   ["nim", "NIM / TOT"],
   ["trends", "Trends"],
 ];
@@ -66,6 +75,14 @@ const ORDER = {
         /^tot_ge250_per_ch$/, /^tot_vs_ch_lsb/, /^tot_ch\d+/],
   timing: [/^pattern$/, /^s1_coinc$/, /^dt_S\d+_S1$/, /^s1_partner_hits$/, /^s1_spacing_us$/],
   rf: [/^rf_npulses$/, /^rf_phase_s1$/, /^rf_period$/, /^rf_phase_vs_s1_tot$/, /^delayed_dt_ch/],
+  // MuPix x/y: the hit maps, then the S1-seeded tracks (all / light / heavy
+  // side by side, one row each for x/y, x/x', y/y'), their ToT map and states.
+  mupixxy: [/^mupix_hits_xy_L1$/, /^mupix_hits_xy_L2$/,
+            /^mupix_track_xy$/, /^mupix_track_xy_light$/, /^mupix_track_xy_heavy$/,
+            /^mupix_track_xxp$/, /^mupix_track_xxp_light$/, /^mupix_track_xxp_heavy$/,
+            /^mupix_track_yyp$/, /^mupix_track_yyp_light$/, /^mupix_track_yyp_heavy$/,
+            /^mupix_track_tot$/, /^mupix_track_state$/, /^mupix_hits_xy_/, /^mupix_track_/],
+  // Every other mupix_ histogram is a diagnostic.
   mupix: [/^mupix_dt_L1$/, /^mupix_dt_L2$/, /^mupix_s1_match$/, /^mupix_tot_L1$/, /^mupix_tot_L2$/,
           /^mupix_col_chip/, /^mupix_row_chip/, /^mupix_hits_chip$/, /^mupix_/],
   nim: [/^nim_/, /^s1_coinc_tot$/],
@@ -81,9 +98,36 @@ const NIM_KINDS = ["dt", "dt_wide", "classes", "walk", "lag", "width", "candidat
 /** 1D plots drawn with log y by default (the NIM tab's "log y for Δt" switch). */
 const LOG_Y_DEFAULT = [/^sma\/nim_dt_S\d+$/, /^sma\/nim_dt_wide_S\d+$/];
 
+/**
+ * The MuPix x/y track maps: linear z by default (the phase-space tab's own switch),
+ * so the beam spot and the x/x' band read as they are; the other maps, the hit
+ * maps among them, follow the toolbar's log z.
+ */
+const XY_TRACK_MAP = /^sma\/mupix_track_(xy|xxp|yyp)(_light|_heavy)?$/;
+
+/** The MuPix x/y histograms: the note on them goes in front of the first. */
+const XY_ANY = /^sma\/mupix_(hits_xy_L\d|track_\w+)$/;
+
+/**
+ * Plots laid out side by side in a row of their own, `cols` to a row on a wide
+ * screen, one below the other on a phone: the two hit maps; all / light /
+ * heavy of each track map. `square`: the plot box is sized so the map's frame
+ * is about square (x and y in mm on the same scale).
+ */
+function rowOf(name) {
+  const s = shortName(name);
+  if (/^mupix_hits_xy_L\d$/.test(s)) return { key: "xyhits", cols: 2, square: true };
+  const m = /^mupix_track_(xy|xxp|yyp)(_light|_heavy)?$/.exec(s);
+  if (m) return { key: `xy${m[1]}`, cols: 3, square: true };
+  return null;
+}
+
+/** Plots outside a row that are drawn about square anyway. */
+const SQUARE = [/^sma\/mupix_track_tot$/];
+
 function tabOf(name) {
   const s = shortName(name);
-  for (const tab of ["tot", "timing", "rf", "mupix", "nim"]) {
+  for (const tab of ["tot", "timing", "rf", "mupixxy", "mupix", "nim"]) {
     if (ORDER[tab].some((re) => re.test(s))) return tab;
   }
   return "health";
@@ -112,6 +156,9 @@ const state = {
   logY: false,
   logZ: true,
   nimLogY: true,           // the NIM tab's dt plots on log y (LOG_Y_DEFAULT)
+  xyLogZ: false,           // the MuPix x/y track maps on log z (XY_TRACK_MAP)
+  xyHead: null,            // the MuPix x/y note and switch, placed by layoutTab
+  xyNoteSig: null,         // the note's parts as last drawn
   names: null,             // dqm::list, null until the analyzer has answered once
   epoch: null,             // summary epoch; a change means the histograms were rebuilt
   plots: {},               // tab -> [{key, names, wrap, div, mpg, title, foot}]
@@ -127,7 +174,7 @@ const state = {
   banners: {},             // banner id -> {wrap, span}
   flagsSig: null,
   lastOkAt: null,
-  mupixSig: null,          // the MuPix plane map the MuPix tab was laid out for
+  mupixSig: null,          // the MuPix plane map the MuPix diagnostics tab was laid out for
   nimSig: null,            // the NIM table's rows (counters, channels) as last built
   mergeSig: null,          // the summary's nim_merge the tabs were laid out for
 };
@@ -155,7 +202,7 @@ async function refreshSummary() {
   state.summary = summary;
   state.status = status;
   // The per-plane occupancy plots have one line per chip of the plane: a
-  // plane-map edit in the ODB lays the MuPix tab out again.
+  // plane-map edit in the ODB lays the MuPix diagnostics tab out again.
   const sig = JSON.stringify(summary && summary.mupix ? summary.mupix.planes : null);
   if (state.mupixSig !== null && sig !== state.mupixSig && state.plots.mupix) {
     delete state.plots.mupix;
@@ -280,7 +327,10 @@ function groupsFor(tab) {
     }
     const m = /^(sma\/tot_ch\d+)_lsb([01])$/.exec(n);
     const key = m ? m[1] : n;
-    if (!byKey.has(key)) { byKey.set(key, { key, names: [] }); groups.push(byKey.get(key)); }
+    if (!byKey.has(key)) {
+      byKey.set(key, { key, names: [], row: rowOf(n), square: SQUARE.some((re) => re.test(n)) });
+      groups.push(byKey.get(key));
+    }
     byKey.get(key).names.push(n);
   }
   // S1 coincidences on the merged counters and on the TOT words alone, on one
@@ -316,28 +366,51 @@ function logYFor(name) {
   return state.logY || (state.nimLogY && LOG_Y_DEFAULT.some((re) => re.test(name)));
 }
 
+/** Whether a 2D histogram is drawn with log z: the MuPix switch for the track maps, else the toolbar's. */
+function logZFor(name) {
+  return XY_TRACK_MAP.test(name) ? state.xyLogZ : state.logZ;
+}
+
 function layoutTab(tab) {
   if (state.plots[tab] || state.names === null) return;
   const grid = document.getElementById(`dqm-sma-grid-${tab}`);
   if (!grid) return;
   grid.innerHTML = "";
   const plots = [];
-  for (const g of groupsFor(tab)) {
+  const rows = new Map();
+  const groups = groupsFor(tab);
+  // The MuPix x/y note goes in front of the x/y plots (at the end without them:
+  // "XY off" has to be said somewhere).
+  let head = tab === "mupixxy" ? xyHead() : null;
+  // Where a plot goes: into its row (made at its first plot, so rows keep
+  // the plots' order), or straight into the grid.
+  const into = function (g) {
+    if (head && XY_ANY.test(g.names[0])) { grid.appendChild(head); head = null; }
+    if (!g.row) return grid;
+    if (!rows.has(g.row.key)) {
+      const r = el("div", { class: `dqm-sma-row dqm-sma-row${g.row.cols}`, "data-row": g.row.key });
+      grid.appendChild(r);
+      rows.set(g.row.key, r);
+    }
+    return rows.get(g.row.key);
+  };
+  for (const g of groups) {
     const cached = state.graphs.get(g.key);
     if (cached && cached.names.join() === g.names.join()) {
-      grid.appendChild(cached.wrap);
+      into(g).appendChild(cached.wrap);
       cached.title.textContent = titleFor(cached);
       plots.push(cached);
       continue;
     }
-    const wrap = el("div", { class: "dqm-sma-plotwrap" });
+    const sq = (g.row && g.row.square) || g.square;
+    const wrap = el("div", { class: `dqm-sma-plotwrap${sq ? " dqm-sma-square" : ""}` });
     const title = el("div", { class: "dqm-histtitle" }, titleFor(g));
     const div = el("div", { class: "dqm-plot" });
     const foot = el("div", { class: "dqm-footnote" }, "");
     wrap.appendChild(title);
     wrap.appendChild(div);
     wrap.appendChild(foot);
-    grid.appendChild(wrap);
+    into(g).appendChild(wrap);
     // The renderer is made at the first reply, when the dimensions are known:
     // an mplot graph for 1D, a DQMHeatmap for 2D (see drawPlot).
     const entry = Object.assign({ wrap, div, mpg: null, heat: null, title, foot, sig: null }, g);
@@ -346,7 +419,9 @@ function layoutTab(tab) {
     state.graphs.set(g.key, entry);
     plots.push(entry);
   }
-  if (!plots.length) {
+  if (head) grid.appendChild(head);
+  // On the phase-space tab the note says why there is nothing (XY off).
+  if (!plots.length && tab !== "mupixxy") {
     grid.appendChild(el("div", { class: "dqm-note" },
       state.names && state.names.length
         ? "The analyzer has no histograms for this tab."
@@ -430,7 +505,32 @@ function ensureHeatmap(p) {
   if (p.mpg) { p.div.innerHTML = ""; p.mpg = null; p.div.mpg = null; }
   p.heat = new DQMHeatmap(p.div);
   p.div.heatmap = p.heat;
+  sized(p.div);
   return p.heat;
+}
+
+/**
+ * Redraw a heatmap whose box changed size. DQMHeatmap measures its box once
+ * and again only on a window resize; a box in a row of fluid columns also
+ * changes when the page around it does (a scroll bar appearing, the note
+ * wrapping), and the canvas then hangs over its column, colour-bar labels
+ * cut off. The observer fires only on a change, so it costs nothing per poll.
+ */
+function sized(div) {
+  if (typeof ResizeObserver !== "function") return;
+  if (!state.boxes) {
+    state.boxes = new ResizeObserver(function (entries) {
+      for (const e of entries) {
+        const hm = e.target.heatmap;
+        if (!hm || !hm.cssSize) continue;
+        const w = e.target.clientWidth, h = e.target.clientHeight;
+        if (!w || !h || (w === hm.cssSize[0] && h === hm.cssSize[1])) continue;
+        hm.cssSize = null;
+        if (hm.hist) hm.draw();
+      }
+    });
+  }
+  state.boxes.observe(div);
 }
 
 function titleFor(g) {
@@ -449,7 +549,11 @@ function titleFor(g) {
     return "S1 coincidences, merged TOT + NIM vs TOT only  [s1_coinc, s1_coinc_tot]";
   }
   const meta = state.meta[g.names[0]];
-  return meta && meta.title ? `${meta.title}  [${shortName(g.names[0])}]` : shortName(g.key);
+  if (!(meta && meta.title)) return shortName(g.key);
+  // The x/y maps' frame, "(bt2026-v4, +x beam-left)", is said once, in the
+  // note above them; three-across titles are short enough to stay level.
+  const t = XY_ANY.test(g.names[0]) ? meta.title.replace(/\s*\([^()]*\+x beam-left\)$/, "") : meta.title;
+  return `${t}  [${shortName(g.names[0])}]`;
 }
 
 async function refreshTab(tab) {
@@ -557,8 +661,9 @@ async function drawPlot(p) {
   if (hists[0].dimensions === 2 && hists.length === 1) {
     const hist = hists[0];
     const axes = (state.meta[name0] && state.meta[name0].axes) || [];
+    const logZ = logZFor(name0);
     ensureHeatmap(p).setData(hist, {
-      logZ: state.logZ,
+      logZ,
       xTitle: (axes[0] && axes[0].title) || "",
       yTitle: (axes[1] && axes[1].title) || "",
     });
@@ -849,6 +954,7 @@ function render(s, status) {
   guard("dqm-sma-flags", () => renderFlags(s));
   guard("dqm-sma-table", () => renderTable(s));
   guard("dqm-sma-mupix", () => renderMupix(s));
+  guard("dqm-sma-xynote", () => renderXy(s));
   guard("dqm-sma-nim", () => renderNim(s));
 }
 
@@ -1013,7 +1119,7 @@ function mergeChip(s) {
 const SYNC_CLASS = { ok: "green", low: "yellow", flagged: "red", insufficient: "", off: "" };
 
 /**
- * The MuPix tab's head: per plane, the share of S1 hits with a pixel hit in
+ * The MuPix diagnostics tab's head: per plane, the share of S1 hits with a pixel hit in
  * the in-time window, in the sideband, and with the accidentals taken out,
  * over the summary window; and the SMA <-> MuPix time-sync monitor's state.
  * Built once, cells updated in place.
@@ -1078,11 +1184,116 @@ function renderMupix(s) {
   if (fn.textContent !== foot) fn.textContent = foot;
 }
 
+// ---------------------------------------------------------------------------
+// MuPix x/y
+// ---------------------------------------------------------------------------
+
+/**
+ * The head of the MuPix x/y plots: a one-line note from summary.xy (renderXy)
+ * and the switch for log z on the track maps. Made once and kept, so a click on
+ * the switch is not lost to a redraw; layoutTab puts it in front of the plots.
+ */
+function xyHead() {
+  if (state.xyHead) return state.xyHead;
+  const note = el("div", { class: "dqm-sma-xynote", id: "dqm-sma-xynote" }, "MuPix x/y: …");
+  const tools = el("div", { class: "dqm-sma-xytools" },
+    checkbox("dqm-sma-xylogz", "log z for the track maps", state.xyLogZ,
+      function (v) { state.xyLogZ = v; save(); redrawVisible(); }));
+  state.xyHead = el("div", { class: "dqm-sma-xyhead", id: "dqm-sma-xyhead" }, note, tools);
+  state.xyHead._note = note;
+  if (state.summary) renderXy(state.summary);
+  return state.xyHead;
+}
+
+/** A shift in mm, signed: "+1.50", "−2.00". */
+function fmtShift(x) {
+  const v = Number(x) || 0;
+  return `${v < 0 ? "−" : "+"}${Math.abs(v).toFixed(2)}`;
+}
+
+/** Where a quadrant is drawn on the maps (x to the right is beam-left: the view looking upstream). */
+const QUAD_ARROW = ["↘", "↙", "↗", "↖"];   // q0 beam-left bottom ... q3 beam-right top
+
+/**
+ * The chips as drawn, per plane, top row then bottom: "L1 ↖3 ↗2 ↙1 ↘0". Its
+ * hover text names each chip's quadrant in words.
+ */
+function quadText(quads) {
+  const out = [], tip = [];
+  for (const plane of ["L1", "L2"]) {
+    const qs = quads.filter((q) => q.plane === plane);
+    if (!qs.length) continue;
+    const at = (k) => { const q = qs.find((x) => x.quadrant === k); return q ? String(q.chip) : "–"; };
+    out.push(`${plane} ${[3, 2, 1, 0].map((k) => `${QUAD_ARROW[k]}${at(k)}`).join(" ")}`);
+    for (const q of qs) tip.push(`chip ${q.chip}: ${plane} ${q.where}`);
+  }
+  return out.length ? [`chips as drawn: ${out.join(" · ")}`, tip.join("\n")] : null;
+}
+
+/**
+ * The note's parts, [[text, kind, title], ...], kind "" or "warn" (muted
+ * warning), "muted" or "label", title an optional hover text. From summary.xy
+ * alone; a missing block says so.
+ */
+function xyNoteParts(xy) {
+  if (!xy) return [["MuPix x/y:", "label"], ["no x/y summary from the analyzer", "warn"]];
+  if (!xy.enabled) {
+    return [["MuPix x/y:", "label"],
+            [`XY off: ${xy.off_reason || "MuPix/XY/enable = n, or the MuPix analysis is off"}`,
+             xy.off_reason && !/enable = n/.test(xy.off_reason) ? "warn" : ""]];
+  }
+  const f = xy.fractions || {}, c = xy.cuts || {}, st = xy.stage || {};
+  const parts = [["MuPix x/y:", "label"]];
+  parts.push([`tracks ${pct(f.track, 1)} of ${num(xy.n_s1)} S1 hits judged, ambiguous ${pct(f.ambiguous, 1)}`, ""]);
+  const unit = c.tot_ns ? ` (×${c.tot_ns} ns)` : "";
+  parts.push([`light ${pct(xy.light_frac, 1)}, heavy ${pct(xy.heavy_frac, 1)} of the tracks ` +
+              `(light: both planes' max ToT ≤ ${c.tot_light_max}${unit} · heavy: ≥ ${c.tot_heavy_min})`, ""]);
+  const sh = st.shift_mm || [0, 0];
+  const shift = `x ${fmtShift(sh[0])}, y ${fmtShift(sh[1])} mm`;
+  const note = st.note || undefined;
+  if (st.applied === false) parts.push(["stage shift off", "", note]);
+  else if (st.source === "missing") parts.push(["stage: missing, (0, 0) mm used", "warn", note]);
+  else if (st.source === "error") parts.push([`stage: read failed, last shift kept (${shift})`, "warn", note]);
+  else if (st.source === "none") parts.push(["stage: no reading yet, (0, 0) mm used", "muted", note]);
+  else {
+    const from = { odb: "XY table", file: "the file's begin-of-run ODB", manual: "set by hand" }[st.source] ||
+      String(st.source);
+    parts.push([`stage shift ${shift} (${from})`, "", note]);
+  }
+  parts.push([`${xy.geometry || "?"}, +x beam-left, seen looking upstream`, ""]);
+  const qt = quadText(xy.quadrants || []);
+  if (qt) parts.push([qt[0], "", qt[1]]);
+  const un = xy.unplaced_chips || [];
+  if (un.length) parts.push([`chips with no place: ${un.join(", ")}`, "warn"]);
+  if (xy.resets) parts.push([`maps reset ${xy.resets}× by XY edits`, "muted"]);
+  return parts;
+}
+
+/** The MuPix x/y note, redrawn only when its text changed. */
+function renderXy(s) {
+  const head = state.xyHead;
+  if (!head) return;
+  const parts = xyNoteParts(s ? s.xy : null);
+  const sig = JSON.stringify(parts);
+  if (sig === state.xyNoteSig) return;
+  state.xyNoteSig = sig;
+  const note = head._note;
+  note.innerHTML = "";
+  parts.forEach(function ([text, kind, title], i) {
+    if (i > 1) note.appendChild(document.createTextNode(" · "));
+    else if (i === 1) note.appendChild(document.createTextNode(" "));
+    const span = el("span", { class: kind ? `dqm-sma-xy-${kind}` : "" }, text);
+    if (title) { span.setAttribute("title", title); span.classList.add("dqm-sma-xy-tip"); }
+    note.appendChild(span);
+  });
+}
+
 function guard(id, fn) {
   try { fn(); } catch (e) {
     // The block's DOM is replaced by the error, so whatever was cached about
     // it has to be rebuilt on the next good summary.
     if (id === "dqm-sma-table") state.table = null;
+    if (id === "dqm-sma-xynote") state.xyNoteSig = null;
     if (id === "dqm-sma-flags") state.flagsSig = null;
     if (id === "dqm-sma-banner") state.banners = {};
     if (id === "dqm-sma-nim") state.nimSig = null;
@@ -1313,10 +1524,13 @@ function renderFlags(s) {
   for (const f of flags) {
     const cls = { error: "red", warn: "yellow" }[f.severity] || "blue";
     const div = el("div", { class: `dqm-diagnosis ${cls} dqm-sma-flag`, "data-code": f.code }, f.text);
-    if (/^nim_/.test(f.code)) {
-      // The TOT + NIM flags point at the tab with the numbers and plots behind them.
-      const go = el("button", { type: "button", class: "dqm-sma-flaglink" }, "NIM / TOT tab ›");
-      go.onclick = function () { showTab("nim"); };
+    // The TOT + NIM and the MuPix flags point at the tab with the numbers and
+    // plots behind them (the MuPix ones are all about the readout and time sync).
+    const to = /^nim_/.test(f.code) ? "nim" : /^mupix_/.test(f.code) ? "mupix" : null;
+    if (to) {
+      const label = TABS.find(([id]) => id === to)[1];   // the full label
+      const go = el("button", { type: "button", class: "dqm-sma-flaglink" }, `${label} tab ›`);
+      go.onclick = function () { showTab(to); };
       div.appendChild(document.createTextNode(" "));
       div.appendChild(go);
     }
@@ -1610,14 +1824,20 @@ function fmtRate(hz) {
  * Left/Right (wrapping), Home and End select and focus the neighbouring tab.
  * `current()` says which tab is shown; `select(id)` shows one. markTabs()
  * then sets the selection state, so the strip always follows showTab().
+ * An optional third entry is a short label, shown instead on a narrow window
+ * (dqm-sma.css); the full one stays the tab's accessible name.
  */
 function tabStrip(tabs, prefix, label, current, select) {
   const bar = el("div", { class: "dqm-sma-tablist", role: "tablist", "aria-label": label });
-  for (const [id, text] of tabs) {
+  for (const [id, text, short] of tabs) {
     const b = el("button", {
       type: "button", class: "dqm-sma-tab", id: `${prefix}-tab-${id}`, role: "tab",
       "aria-selected": "false", "aria-controls": `${prefix}-pane-${id}`, tabindex: "-1",
-    }, text);
+    }, short ? el("span", { class: "dqm-sma-tabfull" }, text) : text);
+    if (short) {
+      b.appendChild(el("span", { class: "dqm-sma-tabshort", "aria-hidden": "true" }, short));
+      b.setAttribute("title", text);
+    }
     b.onclick = function () { select(id); };
     bar.appendChild(b);
   }
@@ -1651,7 +1871,7 @@ function save() {
   try {
     window.localStorage.setItem(LS, JSON.stringify({
       client: state.client, tab: state.tab, intervalMs: state.intervalMs,
-      logY: state.logY, logZ: state.logZ, nimLogY: state.nimLogY,
+      logY: state.logY, logZ: state.logZ, nimLogY: state.nimLogY, xyLogZ: state.xyLogZ,
     }));
   } catch (e) { /* private browsing or quota */ }
 }
@@ -1665,6 +1885,7 @@ function restore() {
     if (o.logY !== undefined) state.logY = !!o.logY;
     if (o.logZ !== undefined) state.logZ = !!o.logZ;
     if (o.nimLogY !== undefined) state.nimLogY = !!o.nimLogY;
+    if (o.xyLogZ !== undefined) state.xyLogZ = !!o.xyLogZ;
   } catch (e) { /* defaults are fine */ }
 }
 

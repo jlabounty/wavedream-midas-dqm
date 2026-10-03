@@ -10,6 +10,8 @@ over one subrun file and gets the same numbers the pages would have shown::
     mdqm-sma-file FILE --settings my-sma-settings.json --frames 50 --skip 10
     mdqm-sma-file FILE --merge         # counters = merged TOT + NIM hits (NIM/merge = y)
     mdqm-sma-file FILE --no-merge      # TOT words only, even if --settings merges
+    mdqm-sma-file FILE --stage 5 -2.5  # MuPix x/y: the XY table at x = 5, y = -2.5 mm
+                                       # (default: the file's begin-of-run ODB)
 
 What it does
 ------------
@@ -30,7 +32,12 @@ Differences from the daemon, all deliberate:
   seconds and a rerun gives the same output;
 * there is no run: the summary is asked for with ``run_active=false``, so the
   "no SMA frames for > 5 s while a run is active" flag cannot fire;
-* ``Sampling`` is ignored: every frame is processed.
+* ``Sampling`` is ignored: every frame is processed;
+* MuPix x/y takes the XY table's position (``/Equipment/XYTable/Variables/
+  Measured``) from the file's begin-of-run ODB dump, as the nearline does,
+  not from a live ODB; ``--stage X Y`` (mm) overrides it. The summary says
+  which (``xy.stage.source`` "file" or "manual"; "missing", with (0, 0) and a
+  note, when the dump has no such key).
 
 Outputs (``--out``, default ``./sma-file-<run>_<subrun>/``)
 ------------------------------------------------------------
@@ -44,6 +51,8 @@ Outputs (``--out``, default ``./sma-file-<run>_<subrun>/``)
 ``trend.json``     exactly what ``sma::trend`` returns (1 s rows).
 ``summary.png``    one page (unless ``--no-png``; needs matplotlib).
 ``nim.png``        the TOT + NIM page, when a counter has a NIM copy (same condition).
+``mupix_xy.png``   the MuPix x/y page (hit maps, tracks all / light / heavy, ToT map),
+                   when MuPix/XY is on (same condition).
 
 A short text summary goes to stdout.
 
@@ -139,11 +148,66 @@ class DataClock:
         return self.t
 
 
-def make_plugin(settings: dict, clock) -> P.SmaPlugin:
-    """Build the plugin the way the analyzer does: defaults, then the first apply."""
+def make_plugin(settings: dict, clock, stage=None) -> P.SmaPlugin:
+    """Build the plugin the way the analyzer does: defaults, then the first apply.
+
+    ``stage``: the XY table's position for MuPix x/y, in place of the daemon's
+    ODB read (`SmaPlugin.poll_odb`): ``(x, y)`` in mm (source "manual") or
+    ``(x, y, source, note)`` (`stage_of`); None leaves it at (0, 0).
+    """
     plugin = P.SmaPlugin(HistStore(), clock=clock)
     plugin.apply_settings(settings, rebuild=True)
+    if stage is not None:
+        x, y, source, note = (*stage, "manual", None) if len(stage) == 2 else stage
+        plugin.set_stage(x, y, source=source, note=note)
     return plugin
+
+
+def _odb_value(payload: bytes, path: str):
+    """The value at ``path`` in a begin-of-run ODB dump (MIDAS JSON or XML); None if absent."""
+    text = payload.rstrip(b"\0").decode("utf-8", errors="replace").lstrip()
+    parts = [p for p in path.split("/") if p]
+    if text.startswith("{"):
+        node = json.loads(text, strict=False)
+        for part in parts:
+            if not isinstance(node, dict):
+                return None
+            hit = [k for k in node if k.lower() == part.lower()]
+            if not hit:
+                return None
+            node = node[hit[0]]
+        return node
+    if text.startswith("<"):
+        import xml.etree.ElementTree as ET
+
+        node = ET.fromstring(text)
+        for part in parts:
+            nxt = [c for c in node if (c.get("name") or "").lower() == part.lower()]
+            if not nxt:
+                return None
+            node = nxt[0]
+        vals = [v.text for v in node.iter("value")] if node.tag == "keyarray" else [node.text]
+        return vals
+    return None
+
+
+def stage_of(payload: bytes | None) -> tuple:
+    """``(x, y, source, note)``: the XY table's position from a begin-of-run ODB dump."""
+    from mdqm.plugins import sma_mupix_xy as X
+
+    if payload:
+        try:
+            v = _odb_value(payload, X.STAGE_PATH)
+            if v is not None:
+                v = v if isinstance(v, list) else [v]
+                x, y = float(v[0]), float(v[1])
+                if np.isfinite(x) and np.isfinite(y):
+                    return x, y, "file", None
+        except (ValueError, TypeError, IndexError, SyntaxError):
+            pass
+    where = "the file's begin-of-run ODB" if payload else "the file (no begin-of-run ODB)"
+    return (0.0, 0.0, "missing",
+            f"{X.STAGE_PATH} not in {where}: (0, 0) mm used; --stage X Y sets it")
 
 
 @dataclass
@@ -158,14 +222,15 @@ class FeedStats:
 
 
 def feed(events, settings: dict, run_number, *, frames: int | None = None, skip: int = 0,
-         clock: DataClock | None = None) -> tuple[P.SmaPlugin, FeedStats]:
+         clock: DataClock | None = None, stage=None) -> tuple[P.SmaPlugin, FeedStats]:
     """Feed every readout event of `events` to a fresh plugin.
 
     `events` is any iterable of event objects: this module's `MidasFile`, or
     ``midas.file_reader.MidasFile(path, use_numpy=True)`` (the compare script
     uses both). The plugin is built at the first readout frame, with the
     clock already at that frame's time, so the trend does not start with ten
-    minutes of empty seconds before the data.
+    minutes of empty seconds before the data. ``stage``: see `make_plugin`; None
+    with a `MidasFile` takes it from the file's begin-of-run ODB (`stage_of`).
     """
     clock = clock or DataClock(time.time())
     stats = FeedStats()
@@ -182,7 +247,10 @@ def feed(events, settings: dict, run_number, *, frames: int | None = None, skip:
             break
         clock.t = float(h.timestamp)
         if plugin is None:
-            plugin = make_plugin(settings, clock)
+            if stage is None and hasattr(events, "bor_odb"):
+                # A MidasFile: its begin-of-run ODB has been read by now, as the CLI does.
+                stage = stage_of(events.bor_odb)
+            plugin = make_plugin(settings, clock, stage)
         err = getattr(ev, "bank_error", None)
         if err:
             stats.bank_errors.append(f"serial {h.serial_number}: {err}")
@@ -193,7 +261,7 @@ def feed(events, settings: dict, run_number, *, frames: int | None = None, skip:
         if not plugin.process(ev, run_number=run_number):
             stats.frames_rejected += 1
     if plugin is None:
-        plugin = make_plugin(settings, clock)
+        plugin = make_plugin(settings, clock, stage)
     return plugin, stats
 
 
@@ -350,6 +418,8 @@ def text_summary(summary: dict, stats: FeedStats, file_label: str, elapsed_s: fl
     mp = summary.get("mupix")
     if mp:
         lines.append(mupix_line(mp))
+    if summary.get("xy"):
+        lines.append(mupix_xy_line(summary["xy"]))
     lines += nim_lines(summary)
     flags = summary["flags"]
     if flags:
@@ -608,6 +678,81 @@ def nim_figure(summary: dict, store: HistStore, title: str):
     return fig
 
 
+def mupix_xy_line(xy: dict) -> str:
+    """One line on MuPix x/y: the track states, the ToT classes, the stage, the cuts."""
+    if not xy.get("enabled"):
+        return "MuPix x/y: off (MuPix/XY/enable = n, or the MuPix analysis is off)"
+    f, c, st = xy["fractions"], xy["cuts"], xy["stage"]
+    return (f"MuPix x/y ({xy['geometry']}): {xy['n_s1']} S1 hits judged: track "
+            f"{_frac(f['track'])}, ambiguous {_frac(f['ambiguous'])}, no L1 "
+            f"{_frac(f['no_l1'])}, no L2 {_frac(f['no_l2'])}; of the {xy['tracks']} tracks light "
+            f"(ToT <= {c['tot_light_max']}) {_frac(xy['light_frac'])}, heavy (ToT >= "
+            f"{c['tot_heavy_min']}) {_frac(xy['heavy_frac'])}; cluster square "
+            f"{c['cluster_box_px']} px; stage x {st['x_mm']}, y {st['y_mm']} mm ({st['source']}"
+            + (f", shift {st['shift_mm'][0]:+g}, {st['shift_mm'][1]:+g} mm" if st["applied"]
+               else ", not applied") + ")")
+
+
+def _map(fig, ax, h, title, xlabel, ylabel):
+    """A 2D histogram as an image, empty bins blank, with its colour bar."""
+    c = h.counts[1:-1, 1:-1].astype(np.float64)
+    img = np.where(c > 0, c, np.nan)
+    m = ax.pcolormesh(_edges(h, "x"), _edges(h, "y"), img, cmap="viridis", shading="flat")
+    if np.isfinite(img).any():
+        cb = fig.colorbar(m, ax=ax, fraction=0.046, pad=0.03)
+        cb.ax.tick_params(labelsize=7)
+    ax.set_xlabel(xlabel, fontsize=8)
+    ax.set_ylabel(ylabel, fontsize=8)
+    ax.tick_params(labelsize=7)
+    ax.set_title(f"{title} ({h.entries})", fontsize=9)
+
+
+def mupix_xy_figure(summary: dict, store: HistStore, title: str):
+    """The MuPix x/y page: hit maps, ToT map, tracks all / light / heavy; None when off."""
+    xy = summary.get("xy") or {}
+    if not xy.get("enabled") or store.get("sma/mupix_track_xy") is None:
+        return None
+    from matplotlib.backends.backend_agg import FigureCanvasAgg
+    from matplotlib.figure import Figure
+
+    text = textwrap.wrap(mupix_xy_line(xy), width=125, subsequent_indent="    ")
+    line_in = TEXT_PT * 1.2 / 72
+    plots_in, gap_in, top_in, bottom_in = 13.0, 0.8, 0.75, 0.3
+    text_in = (len(text) + 1.5) * line_in
+    height = top_in + plots_in + gap_in + text_in + bottom_in
+    fig = Figure(figsize=(11, height), dpi=100)
+    FigureCanvasAgg(fig)
+    gs = fig.add_gridspec(4, 3, hspace=0.55, wspace=0.5, left=0.07, right=0.93,
+                          top=1 - top_in / height,
+                          bottom=(bottom_in + text_in + gap_in) / height)
+    fig.suptitle(title + "  -  MuPix x/y (+x beam-left)", fontsize=13)
+
+    def get(name):
+        return store.get(f"sma/{name}")
+
+    c = xy["cuts"]
+    _map(fig, fig.add_subplot(gs[0, 0]), get("mupix_hits_xy_L1"), "L1 pixel hits in time",
+         "x (mm)", "y (mm)")
+    _map(fig, fig.add_subplot(gs[0, 1]), get("mupix_hits_xy_L2"), "L2 pixel hits in time",
+         "x (mm)", "y (mm)")
+    _map(fig, fig.add_subplot(gs[0, 2]), get("mupix_track_tot"), "Tracks: max ToT",
+         "L1 max ToT", "L2 max ToT")
+    rows = (("", "all tracks"), ("_light", f"light, ToT <= {c['tot_light_max']}"),
+            ("_heavy", f"heavy, ToT >= {c['tot_heavy_min']}"))
+    for r, (suf, what) in enumerate(rows, start=1):
+        _map(fig, fig.add_subplot(gs[r, 0]), get(f"mupix_track_xy{suf}"), f"L1 y / x, {what}",
+             "x (mm)", "y (mm)")
+        _map(fig, fig.add_subplot(gs[r, 1]), get(f"mupix_track_xxp{suf}"), f"x' / x, {what}",
+             "x (mm)", "x' (mrad)")
+        _map(fig, fig.add_subplot(gs[r, 2]), get(f"mupix_track_yyp{suf}"), f"y' / y, {what}",
+             "y (mm)", "y' (mrad)")
+    y0 = (bottom_in + text_in) / height
+    fig.text(0.07, y0, "S1-seeded tracks", va="top", ha="left", fontsize=10, weight="bold")
+    fig.text(0.07, y0 - 1.5 * line_in / height, "\n".join(text), va="top", ha="left",
+             fontsize=TEXT_PT, family="monospace")
+    return fig
+
+
 # ---------------------------------------------------------------------------
 # main
 # ---------------------------------------------------------------------------
@@ -632,7 +777,13 @@ def _parser() -> argparse.ArgumentParser:
     ap.add_argument("--settings", default=None,
                     help="settings over the defaults: inline JSON or a JSON file, same "
                          "tree as /DQM/SMA, e.g. '{\"Cuts\": {\"coinc window ns\": 30}}'")
-    ap.add_argument("--no-png", action="store_true", help="skip summary.png and nim.png")
+    ap.add_argument("--no-png", action="store_true",
+                    help="skip summary.png, nim.png and mupix_xy.png")
+    ap.add_argument("--stage", type=float, nargs=2, default=None, metavar=("X", "Y"),
+                    help="the XY table's position in mm (/Equipment/XYTable/Variables/Measured) "
+                         "for MuPix x/y; default: from the file's begin-of-run ODB, else 0 0. "
+                         "Applied as (-X, +Y) unless "
+                         "MuPix/XY/apply stage shift = n")
     mg = ap.add_mutually_exclusive_group()
     mg.add_argument("--merge", action="store_true",
                     help="counters are the merged TOT + NIM hits (NIM/merge = y; the default "
@@ -823,7 +974,10 @@ def main(argv=None) -> int:
                 yield first
             yield from events
 
-        plugin, stats = feed(chained(), settings, run, frames=args.frames, skip=args.skip)
+        # The BOR event precedes the first readout frame: its ODB is read by now.
+        stage = tuple(args.stage) if args.stage is not None else stage_of(reader.bor_odb)
+        plugin, stats = feed(chained(), settings, run, frames=args.frames, skip=args.skip,
+                             stage=stage)
     except (OSError, RuntimeError, ValueError) as exc:
         print(f"mdqm-sma-file: cannot read {path}: {exc}", file=sys.stderr)
         return EXIT_USAGE
@@ -857,6 +1011,9 @@ def main(argv=None) -> int:
             nfig = nim_figure(summary, plugin.store, title)
             if nfig is not None:
                 nfig.savefig(out / "nim.png")
+            xfig = mupix_xy_figure(summary, plugin.store, title)
+            if xfig is not None:
+                xfig.savefig(out / "mupix_xy.png")
         except ImportError:
             print("mdqm-sma-file: matplotlib not installed, no summary.png "
                   "(pip install 'mdqm[offline]', or pass --no-png)", file=sys.stderr)
@@ -869,7 +1026,8 @@ def main(argv=None) -> int:
             print("warning: no SMA readout frames (event 301) were processed")
         print(f"wrote {out}/: hists.npz, summary.json, trend.json"
               + (", summary.png" if png else "")
-              + (", nim.png" if png and (out / "nim.png").exists() else ""))
+              + (", nim.png" if png and (out / "nim.png").exists() else "")
+              + (", mupix_xy.png" if png and (out / "mupix_xy.png").exists() else ""))
     errors = [f for f in summary["flags"] if f["severity"] == "error"]
     return EXIT_ERROR_FLAG if errors else EXIT_OK
 

@@ -362,6 +362,12 @@ class Analyzer:
         The DAQ-loss counter to watch; empty disables the throttle.
     ``commands()``
         Extra brpc commands, ``{cmd: fn(args) -> framed bytes}``.
+    ``poll_odb(odb_get)``
+        Called with ``client.odb_get`` on every settings poll (every 2 s), for
+        ODB values outside the plugin's tree that change no histogram (the SMA
+        plugin: the XY table's position). Not part of the settings, so never
+        in a fingerprint and never a rebuild. An exception is logged once per
+        distinct error (stderr and a MIDAS message) and the loop goes on.
     """
 
     def __init__(self, plugin_factory, *, rate=20.0, buffer_name="SYSTEM",
@@ -419,6 +425,7 @@ class Analyzer:
         self.settings = None
         self._settings_shape = None
         self._settings_error = None
+        self._poll_error = None
         self._settings_checked = 0.0
         self.reconfigures = 0
 
@@ -508,6 +515,21 @@ class Analyzer:
         if not force and now - self._settings_checked < 2.0:
             return False
         self._settings_checked = now
+        if hasattr(self.plugin, "poll_odb"):
+            # Before the settings: the plugin reads with the settings it has,
+            # and a settings change takes effect at the next poll anyway.
+            try:
+                self.plugin.poll_odb(client.odb_get)
+                self._poll_error = None
+            except Exception as exc:                   # noqa: BLE001
+                error = f"{type(exc).__name__}: {exc}"
+                if error != self._poll_error:
+                    self._poll_error = error
+                    print(f"{self.client_name}: plugin ODB poll failed: {error}",
+                          file=sys.stderr, flush=True)
+                    with contextlib.suppress(Exception):
+                        client.msg(f"{self.client_name}: reading the ODB for the plugin failed "
+                                   f"({error}); its last values are kept", is_error=True)
 
         try:
             new = odb_settings.read(client, self.settings_root, self.settings_defaults)

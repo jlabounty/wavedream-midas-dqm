@@ -218,7 +218,9 @@ class MidasFile:
     ``event_ids``: only these events have their banks unpacked and are yielded
     (the others are still read past; lz4 cannot seek). Internal events
     (BOR/EOR/messages) are yielded only with ``include_internal=True``, but the
-    begin-of-run serial is always recorded as `bor_run_number`.
+    begin-of-run serial is always recorded as `bor_run_number`, and the
+    begin-of-run ODB dump (its payload, JSON or XML as the logger wrote it) as
+    `bor_odb`.
 
     After iteration, `truncated` says whether the file ended inside an event,
     `events_read` counts every event header read, and `last_timestamp` is the
@@ -239,6 +241,7 @@ class MidasFile:
         self.truncated = False
         self.events_read = 0
         self.bor_run_number: int | None = None
+        self.bor_odb: bytes | None = None
         self.first_timestamp: int | None = None
         self.last_timestamp: int | None = None
 
@@ -297,6 +300,7 @@ class MidasFile:
             if eid in INTERNAL_IDS:
                 if eid == EVID_BOR and self.bor_run_number is None:
                     self.bor_run_number = serial
+                    self.bor_odb = bytes(buf[start:start + dsz])
                 if self.include_internal:
                     ev = Event(header)
                     ev.position = self.events_read - 1

@@ -157,3 +157,48 @@ table.dqm-sma-table th { white-space: nowrap; }
 .dqm-sma-flaglink { -webkit-appearance: none; appearance: none; border: 0; background: none;
                     padding: 0 2px; font: inherit; color: #06c; text-decoration: underline;
                     cursor: pointer; white-space: nowrap; }
+
+/* SMAPlots MuPix tab, x/y: the note above the maps, and the maps in rows --
+   the two hit maps side by side, each track map all / light / heavy side by
+   side -- that stack on a narrow window. The row's wraps share the row's grid
+   lines (subgrid), so plots stay level when titles wrap to different heights.
+   A plot box in a row is as wide as its column and about square in its frame:
+   the heatmap's margins take ~106 px across and ~46 px down, so a box 60 px
+   less tall than wide frames a square. The column width comes from the row's
+   width in container units (the row is the container: a wrap cannot be one
+   and a subgrid too). */
+.dqm-sma-xyhead  { flex: 1 1 100%; display: flex; flex-wrap: wrap; align-items: center;
+                   gap: 4px 16px; margin: 10px 0 0 0; padding: 6px 2px 4px 2px;
+                   border-top: 1px solid #c8c8c8; }
+.dqm-sma-xynote  { flex: 1 1 520px; min-width: 0; line-height: 1.4; }
+.dqm-sma-xy-label { font-weight: 700; }
+.dqm-sma-xy-muted { color: var(--mgray, #777); }
+.dqm-sma-xy-warn { color: #8a5a00; background: #fff4d6; padding: 0 4px; border-radius: 3px; }
+.dqm-sma-xy-tip  { cursor: help; text-decoration: underline dotted #999; text-underline-offset: 2px; }
+.dqm-sma-xytools { flex: none; }
+.dqm-sma-row     { --dqm-sma-cols: 2; --dqm-sma-gap: 16px;
+                   flex: 1 1 100%; min-width: 0; display: grid; gap: 4px var(--dqm-sma-gap);
+                   grid-template-columns: repeat(var(--dqm-sma-cols), minmax(0, 1fr));
+                   container-type: inline-size; }
+.dqm-sma-row2    { max-width: 1180px; }
+.dqm-sma-row3    { --dqm-sma-cols: 3; max-width: 1720px; }
+.dqm-sma-row > .dqm-sma-plotwrap { max-width: none; display: grid; grid-row: span 3;
+                   grid-template-rows: subgrid; }
+.dqm-sma-row > .dqm-sma-plotwrap > .dqm-histtitle { align-self: end; }
+.dqm-grid > .dqm-sma-row > div > .dqm-plot { width: 100%; height: auto; aspect-ratio: 8 / 7; }
+/* aspect-ratio off here: with it, a grid item takes its width from the height
+   (wider than its column, colour bar cut off) whatever width says. */
+.dqm-grid > .dqm-sma-row > div.dqm-sma-square > .dqm-plot { aspect-ratio: auto; min-height: 240px;
+  height: calc((100cqw - (var(--dqm-sma-cols) - 1) * var(--dqm-sma-gap)) / var(--dqm-sma-cols) - 60px); }
+.dqm-grid > div.dqm-sma-square > .dqm-plot { width: 460px; height: 400px; max-width: 100%; }
+@media (max-width: 900px) { .dqm-sma-row3 { --dqm-sma-cols: 1; } }
+@media (max-width: 640px) { .dqm-sma-row2 { --dqm-sma-cols: 1; } }
+
+/* A tab with a short label (the MuPix tabs): the full one, the short one on a
+   phone, where the full one stays readable to a screen reader only. */
+.dqm-sma-tabshort { display: none; }
+@media (max-width: 640px) {
+  .dqm-sma-tab .dqm-sma-tabshort { display: inline; }
+  .dqm-sma-tab .dqm-sma-tabfull { position: absolute; width: 1px; height: 1px; overflow: hidden;
+                                  clip: rect(0 0 0 0); white-space: nowrap; }
+}

@@ -361,14 +361,26 @@ vetoed fraction.
 * **RF / delayed**: RF pulses per S1 gate, RF phase, RF period, phase vs S1 ToT,
   delayed channels minus S1 (one plot per entry of `Channel roles/delayed`; none
   by default).
-* **MuPix**: above the plots, the share of S1 hits with an L1, an L2 and an
+* **MuPix phase space** ("MuPix x/y" on a phone; the next one is "MuPix diag."):
+  a one-line note (track and ambiguous fractions, the
+  light/heavy shares with the ToT cuts, the stage shift and where it came from,
+  the geometry tag, the chips as drawn per plane), a "log z for the track maps"
+  switch (off by default; the hit maps and the ToT map follow the toolbar's log
+  z), the in-time hit maps L1 and L2 side by side, the tracks x/y, x/x', y/y'
+  as rows of all / light / heavy, `mupix_track_tot` and `mupix_track_state`.
+  The rows stack one plot per line on a phone. See [MuPix
+  x/y](#mupix-xy-positions-and-s1-seeded-tracks).
+* **MuPix diagnostics**: above the plots, the share of S1 hits with an L1, an L2 and an
   L1+L2 pixel hit in time, in the sideband, and with the accidentals taken out
   (over the last 60 s), and the time-sync chip. Plots: t(pixel) - t(S1) per
   plane (every pair, [-2560, +2000) ns, 8 ns bins; the in-time window outlined
   green, the sideband grey), the S1-match counts since the last Clear (the
   footnote gives them as fractions), pixel ToT per plane (0-31 counts of 256
   ns), column and row occupancy per plane with one line per chip, pixel hits
-  per frame per chip. See [MuPix](#mupix-the-pixel-words-in-the-sma-frames).
+  per frame per chip, and any other `mupix_*` histogram that is not a
+  phase-space plot. The MuPix flags link here. A page that remembered the old
+  single MuPix tab opens this one. See
+  [MuPix](#mupix-the-pixel-words-in-the-sma-frames).
 * **Trends**: rate per channel, live fraction, efficiency given S1, RF valid
   fraction, the MuPix in-time fractions (L1, L2, L1+L2 accidental-corrected,
   and L1+L2 raw and in the sideband), 1 s rows over the last 10 min. The
@@ -641,13 +653,13 @@ check/mupix sync window s`), with at least 200 analysed S1 hits in it (`mupix
 sync min S1`): below 30 % (`mupix sync min fraction`; run 1008 sits at 88 %,
 run 682 at 85 %) for more than 30 s (`mupix sync hold s`) it raises the
 warning `mupix_sync`, and it clears above 35 % (plus `mupix sync clear margin`).
-With no S1 hits (no beam) there is no verdict and no flag. The MuPix tab's chip
+With no S1 hits (no beam) there is no verdict and no flag. The MuPix diagnostics tab's chip
 says *in sync*, *low for N s*, **SYNC LOST?**, *no verdict* or *MuPix analysis
 off*.
 
 When `mupix_sync` is up:
 
-1. Look at the MuPix tab's t(pixel) - t(S1) plots. **No peak in either plane**:
+1. Look at the MuPix diagnostics tab's t(pixel) - t(S1) plots. **No peak in either plane**:
    the time bases disagree. Check the SMA coarse-shift banner first (a wrong
    `Coarse shift` moves every SMA time), then whether the MuPix or SMA readout
    was restarted or reconfigured; write it in the elog and tell the SMA/MuPix
@@ -660,6 +672,131 @@ When `mupix_sync` is up:
    fault if that is the run plan.
 4. "No MuPix pixel words in the SMA frames": the MuPix readout, its link or
    its chips are off.
+
+### MuPix x/y: positions and S1-seeded tracks
+
+The analyzer also places the pixels in mm and builds one track per sampled S1
+hit when it can (`src/mdqm/plugins/sma_mupix_xy.py`), so the beam spot and the
+x/x' and y/y' phase space build up live on the MuPix phase space tab. Settings are under
+`/DQM/SMA/MuPix/XY`; `enable` = n books and fills none of it.
+
+**The frame** is the reco's, geometry tag `bt2026-v4`: +x is **beam-left**, +y
+up, so a map with x to the right is the view looking upstream (beam coming at
+you), as on the nearline pages. Each plane is four chips around the beam axis:
+chip centres at x = +-10.40 mm, y = +-10.16 mm (the 0.32 mm gap between the
+chips of a quad is PROVISIONAL), L1 at z = 0, L2 at z = 30 mm.
+
+**The chip lists place the chips.** A chip's quadrant is its position in
+`MuPix/L1 chips` / `L2 chips`: first = beam-left bottom, then beam-right
+bottom, beam-left top, beam-right top (the two upper chips are mounted turned
+by 180 degrees). With the defaults chip 0 is L1 beam-left bottom and chip 4 is
+L2 beam-left bottom. So for x/y each list must have **exactly four entries**,
+distinct chip ids, with **-1 for an empty quadrant** (a dead or missing chip:
+`[0, -1, 2, 3]`, never `[0, 2, 3]`, which would move chips 2 and 3 to the
+wrong quadrants). A list that does not fit turns x/y off with one `settings`
+error naming the problem; the rest of the MuPix analysis keeps the chips it
+lists. The summary's `xy.quadrants` says where every chip is drawn. A FEB slot
+mapped to an id above 31 (e.g. 99) aliases onto a 5-bit chip id and lands on
+that chip's quadrant; the reco has the same limit. The per-chip hit-rate plot
+shows it.
+
+**The XY table** moves the whole telescope: its position
+(`/Equipment/XYTable/Variables/Measured`) is re-read every 2 s and added as
+(-x, +y) to every position (the table's +x is beam-right), as the nearline does
+(`COND:isel`). Moving the table resets no plot: a stage scan builds one beam
+spot. The frames up to ~2 s after a move (plus the table frontend's own
+readback period) still take the old shift, so a stage step blurs for that
+long. Without the key (a standalone rig, an old ODB) the shift is 0 and the
+summary says so (`xy.stage.source` "missing"); a failing read keeps the last
+position (source "error", the error in the note, logged once). `apply stage
+shift` = n leaves it out.
+
+**The rule**, per sampled S1 hit: of the MuPix sample, the S1 hits whose
+window lies inside the frame's pixel data, at most `XY/max S1 per frame` (250)
+of them. The pixels of each plane in [-150, +450) ns (`MuPix/window lo ns`,
+`hi ns`, raw times; rows >= 250 are not pixels and are dropped). A plane is
+accepted when all of them sit on one chip inside a 3 x 3 pixel square
+(`cluster box px`); its position is the mean of the pixel centres and its ToT
+the largest pixel ToT. The square agrees with reco's 0.12 mm linkage on
+touching clusters inside 3 x 3; it also accepts non-touching pixels inside the
+square and rejects a 4-in-a-row cluster. A pixel firing twice in one window
+counts twice in the mean (rare). Each S1 hit gets one state, in this order:
+*no L1*, *no L2*, *ambiguous* (a plane failed the square: two particles, a
+noise burst, a hot pixel next to the hit), *track*. A track fills the L1
+position and the slopes x' = 1000 (x2 - x1) / 30 mm in mrad (one pixel of
+difference is 2.667 mrad, one bin). `xy.n_s1` counts these S1 hits; it is not
+the same number as `mupix.n_s1` (the in-time fractions' S1 hits, whose sideband
+must also lie in the pixel data, and which are not capped at 250).
+
+**Light and heavy.** A track is *light* when both planes' ToT is <= `tot light
+max` (9) and *heavy* when both are >= `tot heavy min` (13), in 256 ns counts. The
+two defaults are PROVISIONAL starting values, to be tuned on beam: on run 1008
+(S1-seeded, mostly muons and pions) the track ToT peaks at 6-8. Set the cuts
+from `mupix_track_tot` (L1 ToT vs L2 ToT): a real particle class is a blob on
+the diagonal.
+
+**What an XY edit resets: only the x/y maps.** No `MuPix/XY` key rebuilds the
+other SMA plots or starts a new summary epoch. The ToT cuts reset only the six
+light and heavy maps (`mupix_track_tot`, which they are read from, keeps
+filling); `cluster box px`, `apply stage shift` and `enable` reset (or book,
+or remove) all thirteen x/y maps; `max S1 per frame` resets nothing. The `xy`
+summary counters restart with the maps they belong to. (The chip lists and
+the window are `MuPix` keys: editing them rebuilds every plot, as before.)
+
+| Plot | What it shows |
+|---|---|
+| `mupix_hits_xy_L1`, `_L2` | every pixel in time with a sampled S1 hit, once, per plane: the beam spot, dead chips, the quad gap |
+| `mupix_track_xy` (`_light`, `_heavy`) | L1 position of the tracks |
+| `mupix_track_xxp`, `mupix_track_yyp` (and light, heavy) | x vs x', y vs y': the phase space; the band's tilt is the beam's correlation |
+| `mupix_track_tot` | track ToT, L1 vs L2: where to put the light/heavy cuts |
+| `mupix_track_state` | no L1 / no L2 / ambiguous / track per judged S1 hit |
+
+Axes: x, y in 130 bins of 0.64 mm over +-41.6 mm (shifted by a quarter pixel
+so that no pixel centre sits on an edge); slopes in 77 bins of 2.667 mrad over
++-102.7 mrad, centred on 0: the nearline's `track_xy_expanded` at half its
+bins and exactly its `xxp_central`, bias included. A cluster of two pixels in
+one plane and one in the other gives a half-step slope, which sits exactly on
+a bin edge; float rounding picks the bin (mostly the lower: 3-5 % of the
+tracks, about -0.05 mrad on the mean, a faint comb). The summary's `xy` block
+has the state fractions, the light and heavy shares, the quadrant map, the
+stage used and the cuts (60 s window).
+
+The thirteen maps are counted in uint32 (4 bytes a bin on the wire: a full
+phase-space-tab refresh is 0.78 MB instead of 1.39 MB). A map is switched to uint64
+before any bin could pass 2^32 - 1 (when its entries reach that), so a count
+never wraps; from then on it travels at 8 bytes a bin.
+
+**The nearline's maps are a different selection.** `PIPSMMuPixMonitor`'s
+`track_xy` / `xxp` / `yyp` (and `_expanded` / `_central`) come from
+`MakePairs` (`PIPSMMuPixCore.hh:131-170`): every L1 pixel paired with the
+nearest L2 pixel within +-40 ns (time-walk corrected), with no S1 and no
+clustering, and one L2 pixel may serve several L1 pixels. The track counts and
+widths therefore differ from the DQM's by construction. The like-for-like
+reference is the reco's `AllTrackReco` tracks (S1-seeded, clustered,
+time-walk corrected; the `exp_all_tracks` of the rec file). **Compared on run
+1008 subrun 0** (stage at 0; `mdqm-sma-file` with every S1 hit vs the
+`release-1003` rec file; `scratch/sma-mupix-xy/nearline-cmp/alltracks.py`):
+
+| | tracks | x mean | x RMS | y mean | y RMS | x' mean | x' RMS | y' mean | y' RMS | x/x' slope |
+|---|---|---|---|---|---|---|---|---|---|---|
+| DQM | 575k | -1.95 mm | 8.87 mm | -1.33 mm | 8.63 mm | -0.32 mrad | 24.19 mrad | -5.65 mrad | 15.17 mrad | 1.425 mrad/mm |
+| AllTrackReco, L1+L2 position | 1190k | -1.90 mm | 8.87 mm | -1.31 mm | 8.61 mm | -0.25 mrad | 24.20 mrad | -5.65 mrad | 15.16 mrad | 1.422 mrad/mm |
+| AllTrackReco, L-pair owners | 639k | -1.93 mm | 8.86 mm | -1.31 mm | 8.55 mm | -0.24 mrad | 24.12 mrad | -5.68 mrad | 15.13 mrad | 1.424 mrad/mm |
+
+Means agree within 0.05 mm and 0.08 mrad, widths within 0.03 mm and 0.1
+mrad. AllTrackReco has about twice the tracks (1.56M rows, 1.19M with an L1
+and an L2 position, against 0.73M S1 hits): its seeding and cluster rules are
+not the DQM's (it also keeps tracks the DQM calls ambiguous), so only the
+distributions are compared, not the counts. Against the pair-based
+monitor maps of the same subrun the positions agree as well (x mean -1.89 mm)
+but the slopes are wider there (x' RMS 24.5, y' RMS 15.8 mrad): the
+unclustered pairs, not a placement difference.
+
+**Cost** (`scratch/sma-mupix-xy/bench_xy.py`, one core, loaded laptop): the
+track finder and the fills take 0.4-0.5 ms per dense frame (run 1008, 7300
+pixel words; synthetic 52000 words with 12800 pixel words) at 250 S1 hits,
+0.5-0.6 ms at 500. `XY/max S1 per frame` (1-2000; it is always a cap) changes
+the cost without resetting a plot.
 
 ## NIM copies of the counters (TOT + NIM)
 
@@ -840,7 +977,7 @@ after any change to the NIM cables, thresholds or delays.
 
 The analyzer re-reads the tree every 2 s (`analyzer.py:231-233`); edits take
 effect without a restart. Changing the coarse shift, channel roles (except
-labels), anything under Cuts, Binning, MuPix or NIM (except its two CPU knobs) **rebuilds the histograms and zeroes
+labels), anything under Cuts, Binning, MuPix (except `MuPix/XY`) or NIM (except its two CPU knobs) **rebuilds the histograms and zeroes
 them** (`SmaPlugin.apply_settings`) and posts a MIDAS message. Labels, Self check
 and Sampling never reset a plot. Defaults: `SETTINGS_DEFAULTS` in `sma.py`.
 
@@ -906,12 +1043,17 @@ histograms.
 | `Binning/...` | `SETTINGS_DEFAULTS` in `sma.py` | histogram ranges and bin counts | yes |
 | `Binning/mupix dt min ns`, `mupix dt max ns`, `mupix dt bin ns` | -2560, 2000, 8 | the t(pixel) - t(S1) axes (the default reaches back to the sideband) | yes |
 | `Binning/mupix hits per chip max` | 4000 | axis of pixel hits per frame per chip | yes |
-| `MuPix/L1 chips`, `L2 chips` | [0, 1, 2, 3], [4, 5, 6, 7] | chip ids (the pixel word's global ASIC id) of each plane; runs up to 186 need [1, 2, 3, 4], [5, 6, 7, 0]. An id in both lists is an error (defaults used) | yes |
+| `MuPix/L1 chips`, `L2 chips` | [0, 1, 2, 3], [4, 5, 6, 7] | chip ids (the pixel word's global ASIC id) of each plane, in quadrant order for x/y (beam-left bottom, beam-right bottom, beam-left top, beam-right top; four entries, -1 = an empty quadrant); runs up to 186 need [1, 2, 3, 4], [5, 6, 7, 0]. An id in both lists is an error (defaults used) | yes |
 | `MuPix/ts2 shift` | 5 | log2(ckdivend2 + 1): ToT = (TS2 - ((time >> shift) & 31)) & 31, 2^shift x 8 ns a count | yes |
 | `MuPix/window lo ns`, `window hi ns` | -150, 450 | t(pixel) - t(S1) called in time, half open | yes |
 | `MuPix/sideband lo ns`, `sideband hi ns` | -2400, -1800 | the accidentals' window; must end at or before `window lo ns` | yes |
 | `MuPix/max pixel hits per frame` | 20000 | pixel hits examined per frame (the latest); 0 = MuPix analysis off (pixel words still counted) | yes |
 | `MuPix/max S1 per frame` | 500 | S1 hits per frame matched against the pixels (evenly spread); 0 = all | yes |
+| `MuPix/XY/enable` | y | MuPix x/y histograms (see [MuPix x/y](#mupix-xy-positions-and-s1-seeded-tracks)); n = none booked or filled | the x/y maps only |
+| `MuPix/XY/cluster box px` | 3 | a plane is accepted when its in-window pixels lie on one chip in this square (1-64) | the x/y maps only |
+| `MuPix/XY/tot light max`, `tot heavy min` | 9, 13 | track ToT classes (both planes' max pixel ToT, 0-31); light max must be below heavy min. PROVISIONAL | the light/heavy maps only |
+| `MuPix/XY/apply stage shift` | y | add (-x, +y) of `/Equipment/XYTable/Variables/Measured` (re-read every 2 s; 0 when absent) to every position | the x/y maps only |
+| `MuPix/XY/max S1 per frame` | 250 | S1 hits per frame given to the track finder, from the MuPix sample; 1-2000 (outside: clamped, with a `settings` note; 0 is not "all"). A CPU knob | **no** |
 | `NIM/channels` | [3, 9, 10, 11, 12] | NIM copy of each counter (per `Channel roles/counters` entry); -1 = none, [-1] alone = no NIM at all. A NIM channel that is also S1, a counter, the RF, `current` or `delayed` turns NIM off (a `settings` flag); a repeated one drops that entry | yes |
 | `NIM/offset ns` | [0, 0, 0, 0, 0] | per counter, t'_NIM = t - offset in whole ns (a fraction is rounded, with a `settings` note); set from the `nim_dt` peak | yes |
 | `NIM/lag nominal ns` | [0, 0, 0, 0, 0] | per counter, the NIM copy's expected fine - fine(S1) (cable delay, flight); the lag vote is "faulted" beyond `lag tolerance ns` of it | yes |
@@ -1097,7 +1239,9 @@ mdqm-sma-file FILE --settings my-sma-settings.json --skip 10 --frames 50
 Options (`sma_file.py:489-511`): `--shift N` (default 14), `--frames N`,
 `--skip N`, `--out DIR` (default `./sma-file-<run>_<subrun>/`), `--settings`
 (inline JSON or a JSON file in the `/DQM/SMA` layout; unknown keys are an error),
-`--no-png`, `--quiet`, `--merge` / `--no-merge` (`NIM/merge`, default n).
+`--no-png`, `--quiet`, `--merge` / `--no-merge` (`NIM/merge`, default n), `--stage X Y`
+(the XY table's position in mm for MuPix x/y; by default it is read from the file's
+begin-of-run ODB, as the nearline does, and 0 0 with a note when the dump has no XY table).
 
 Outputs in the output directory:
 
@@ -1107,6 +1251,8 @@ Outputs in the output directory:
 | `summary.json` | exactly what the SMAPlots page shows (chips, table, flags, shift check) |
 | `trend.json` | the 1 s trend rows |
 | `summary.png` | one-page overview |
+| `nim.png` | the TOT + NIM page, when a counter has a NIM copy |
+| `mupix_xy.png` | the MuPix x/y page (hit maps, ToT map, tracks all / light / heavy), when `MuPix/XY/enable` = y |
 
 A text summary goes to the terminal: frame classes, live fraction, shift check,
 rates, mismatch per channel, efficiencies, the MuPix in-time fractions, flags.

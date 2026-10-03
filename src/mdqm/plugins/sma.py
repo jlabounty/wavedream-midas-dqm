@@ -88,6 +88,15 @@ TOT + NIM (good frames; one set per counter k with a NIM copy, ``/DQM/SMA/NIM``)
                        filled in the voted frames only (``NIM/lag vote every``)
 ``s1_coinc_tot``       ``s1_coinc`` on the TOT words alone (no merge), beside the merged one
 
+MuPix x/y (good frames, ``/DQM/SMA/MuPix/XY``; booked only with ``enable``; mm in the reco
+frame bt2026-v4, +x beam-left, plus the XY table's shift; see ``sma_mupix_xy``):
+
+``mupix_hits_xy_L1``/``_L2``    pixels in time with a sampled S1 hit, each once, 130 x 130
+``mupix_track_xy[_light|_heavy]``   L1 position of the S1-seeded tracks (all, light, heavy)
+``mupix_track_xxp[...]``, ``mupix_track_yyp[...]``  x vs x', y vs y' (mrad), 130 x 77
+``mupix_track_tot``     tracks: max pixel ToT of the L1 cluster x of the L2 cluster, 32 x 32
+``mupix_track_state``   per judged S1 hit: 0 no L1, 1 no L2, 2 ambiguous, 3 track
+
 With ``NIM/merge`` on (off by default), the counters (S1 included) are the
 merged hits wherever counter times are used: ``dt_S*``, ``pattern``,
 ``s1_coinc``, ``s1_partner_hits``, ``s1_spacing_us``, the RF and delayed
@@ -112,6 +121,7 @@ import numpy as np
 
 from mdqm.dqm import framing
 from mdqm.dqm.hist import Axis, Hist1D, Hist2D
+from mdqm.plugins import sma_mupix_xy as X
 from mdqm.plugins import sma_nim as N
 from mdqm.plugins import sma_words as W
 
@@ -243,6 +253,30 @@ SETTINGS_DEFAULTS: dict[str, object] = {
         #: t(pixel) - t(S1)), an evenly spread subset of those the S1-seeded
         #: analyses use. 0 = all of them.
         "max S1 per frame": W.MUPIX_MAX_S1,
+        #: MuPix positions in mm (reco geometry bt2026-v4, +x beam-left) and
+        #: S1-seeded tracks: one accepted cluster in L1 and one in L2 in the
+        #: in-time window of a sampled S1 hit (sma_mupix_xy). Editing these
+        #: rebuilds, except "max S1 per frame" (a CPU knob).
+        "XY": {
+            #: n: no x/y histograms are booked or filled.
+            "enable": True,
+            #: A plane is accepted when all its in-window pixels lie on one chip
+            #: within a box x box pixel square (1-64); position = their mean.
+            "cluster box px": X.CLUSTER_BOX_PX,
+            #: Track ToT classes, from the largest pixel ToT of the L1 and the L2
+            #: cluster (ToT counts, 0-31): light = both <= this, heavy = both >=
+            #: "tot heavy min". PROVISIONAL: set them from mupix_track_tot.
+            "tot light max": X.TOT_LIGHT_MAX,
+            "tot heavy min": X.TOT_HEAVY_MIN,
+            #: Add the XY table's position (-x, +y of
+            #: /Equipment/XYTable/Variables/Measured, re-read every 2 s) to every
+            #: position, as the nearline does (COND:isel). Without the key: 0.
+            "apply stage shift": True,
+            #: S1 hits per frame given to the track finder, an evenly spread
+            #: subset of the MuPix sample above (0 = all of it). The cost is
+            #: ~0.1 ms + ~1 us per row on a dense frame. A CPU knob: no plot resets.
+            "max S1 per frame": X.XY_MAX_S1,
+        },
     },
     #: The NIM copies of the counters (since run 1015) and how they are paired
     #: with the TOT words (sma_nim.pair_counter, reco's rule). The per-counter
@@ -450,6 +484,7 @@ class Config:
     seed_ring_frames: int = 8
     seed_ring_bytes: int = 24 << 20
     mupix: W.MuPixCuts = field(default_factory=W.MuPixCuts)
+    xy: X.XYSettings = field(default_factory=X.XYSettings)
     nim: NimSettings = field(default_factory=NimSettings)
     binning: dict = field(default_factory=dict)
     check: dict = field(default_factory=dict)
@@ -492,9 +527,14 @@ def parse_settings(settings: dict | None) -> Config:
     d = SETTINGS_DEFAULTS
     errors: list[str] = []
 
+    def at(tree, section):
+        for part in section.split("/"):     # "MuPix/XY": a directory in a directory
+            tree = tree[part]
+        return tree
+
     def get(section, key, conv, check=None):
-        raw = s[section][key] if section else s[key]
-        dflt = d[section][key] if section else d[key]
+        raw = at(s, section)[key] if section else s[key]
+        dflt = at(d, section)[key] if section else d[key]
         try:
             v = conv(raw)
             if check is not None and not check(v):
@@ -602,16 +642,20 @@ def parse_settings(settings: dict | None) -> Config:
     M = "MuPix"
 
     def chip_ids(v):
+        # -1 is an empty quadrant slot (MuPix x/y): no chip, left out of the planes.
         v = [int(x) for x in (v if isinstance(v, list | tuple) else [v])]
-        if any(not 0 <= x < W.N_CHIP_IDS for x in v):
-            raise ValueError("not a chip id 0-31")
+        if any(not (0 <= x < W.N_CHIP_IDS or x == X.EMPTY_SLOT) for x in v):
+            raise ValueError("not a chip id 0-31 (or -1, an empty quadrant)")
         return tuple(v)
 
-    l1, l2 = get(M, "L1 chips", chip_ids), get(M, "L2 chips", chip_ids)
+    # The lists as written (quadrant order, -1 slots: x/y) and the plane members.
+    slots1, slots2 = get(M, "L1 chips", chip_ids), get(M, "L2 chips", chip_ids)
+    l1 = tuple(c for c in slots1 if c != X.EMPTY_SLOT)
+    l2 = tuple(c for c in slots2 if c != X.EMPTY_SLOT)
     if set(l1) & set(l2):
         errors.append(f"MuPix/L1 chips and L2 chips share chip(s) {sorted(set(l1) & set(l2))}; "
                       "using the defaults")
-        l1, l2 = W.L1_CHIPS, W.L2_CHIPS
+        l1, l2 = slots1, slots2 = W.L1_CHIPS, W.L2_CHIPS
     window = (get(M, "window lo ns", int), get(M, "window hi ns", int))
     sideband = (get(M, "sideband lo ns", int), get(M, "sideband hi ns", int))
     if window[1] <= window[0]:
@@ -629,6 +673,40 @@ def parse_settings(settings: dict | None) -> Config:
         window_ns=window, sideband_ns=sideband,
         max_pixels=get(M, "max pixel hits per frame", int, lambda v: v >= 0),
         max_s1=get(M, "max S1 per frame", int, lambda v: v >= 0) or None)
+
+    XY = "MuPix/XY"
+    tot_code = lambda v: 0 <= v <= W.TS2_MASK  # noqa: E731
+    light, heavy = get(XY, "tot light max", int, tot_code), get(XY, "tot heavy min", int, tot_code)
+    if light >= heavy:
+        errors.append(f"MuPix/XY/tot light max ({light}) must be below tot heavy min ({heavy}); "
+                      "using the defaults")
+        light, heavy = X.TOT_LIGHT_MAX, X.TOT_HEAVY_MIN
+    xy_max_s1 = get(XY, "max S1 per frame", int)
+    if not 1 <= xy_max_s1 <= X.XY_MAX_S1_LIMIT:
+        clamped = min(max(xy_max_s1, 1), X.XY_MAX_S1_LIMIT)
+        errors.append(f"MuPix/XY/max S1 per frame={xy_max_s1}: a cap within 1-"
+                      f"{X.XY_MAX_S1_LIMIT} (0 is not 'all'); using {clamped}")
+        xy_max_s1 = clamped
+    xy_enable = get(XY, "enable", _as_bool)
+    # Placed only from lists that say where each chip is (one per quadrant);
+    # anything else turns x/y off with one settings error, rather than putting
+    # chips silently in the wrong quadrant.
+    bad_lists = X.check_chip_lists(slots1, slots2)
+    off_reason = None
+    if not mupix.enabled:
+        off_reason = "the MuPix analysis is off (MuPix/max pixel hits per frame = 0)"
+    elif bad_lists:
+        off_reason = bad_lists
+        if xy_enable:
+            errors.append(f"MuPix/XY: {bad_lists}; MuPix x/y is off")
+    xy = X.XYSettings(
+        enable=xy_enable,
+        box=get(XY, "cluster box px", int, lambda v: 1 <= v <= X.MAX_BOX_PX),
+        tot_light_max=light, tot_heavy_min=heavy,
+        apply_stage=get(XY, "apply stage shift", _as_bool),
+        max_s1=xy_max_s1,
+        placement=X.placement(slots1, slots2) if not bad_lists else X.placement((), ()),
+        off_reason=off_reason)
 
     nim = _parse_nim(s, roles, get, opt_chan, errors)
 
@@ -652,7 +730,7 @@ def parse_settings(settings: dict | None) -> Config:
                                 lambda v: 0 <= v <= 1024) * (1 << 20)),
         max_gap_ns=int(get(C, "max gap s", float, pos) * 1e9),
         max_overlap_ns=int(get(C, "max overlap ms", float, lambda v: v >= 0) * 1e6),
-        mupix=mupix, nim=nim, binning=binning, check=check, errors=errors)
+        mupix=mupix, xy=xy, nim=nim, binning=binning, check=check, errors=errors)
 
 
 def _as_bool(v) -> bool:
@@ -808,14 +886,17 @@ def shape_fingerprint(settings: dict) -> str:
 
     Labels are left out on purpose -- renaming a channel must never reset an
     afternoon of plots. The self-check and sampling settings change no plot,
-    nor do NIM's CPU knobs (`NIM_CPU_KEYS`).
+    nor do NIM's CPU knobs (`NIM_CPU_KEYS`). ``MuPix/XY`` is left out too: its
+    keys reset only the x/y maps (`SmaPlugin.apply_settings`), and the XY
+    table's position is no setting at all (`SmaPlugin.poll_odb`).
     """
     s = _merge(SETTINGS_DEFAULTS, settings)
     roles = {k: v for k, v in s["Channel roles"].items() if k != "labels"}
     # NIM's CPU knobs change how much is filled, not what a plot means.
     nim = {k: v for k, v in s["NIM"].items() if k not in NIM_CPU_KEYS}
+    mupix = {k: v for k, v in s["MuPix"].items() if k != "XY"}
     return json.dumps({"shift": s["Coarse shift"], "roles": roles, "Cuts": s["Cuts"],
-                       "Binning": s["Binning"], "MuPix": s["MuPix"], "NIM": nim},
+                       "Binning": s["Binning"], "MuPix": mupix, "NIM": nim},
                       sort_keys=True,
                       default=str)
 
@@ -1078,7 +1159,8 @@ class _Second:
                  "mismatch", "tot_bad",
                  "stale_words", "n_s1", "n_s1_kept", "eff", "rf_valid", "rf_vetoed", "scan",
                  "shift_counts", "shift_n", "mp_frames", "mp_pix", "mp_examined", "mp_skipped",
-                 "mp_n", "mp_in", "mp_side", "mp_chip", "mp_rows", "mp_unsorted", "nim")
+                 "mp_n", "mp_in", "mp_side", "mp_chip", "mp_rows", "mp_unsorted", "nim",
+                 "xy_state", "xy_light", "xy_heavy", "xy_ctrk")
 
     def __init__(self, t: int, epoch: int, n_counters: int, scan: tuple):
         self.t = t
@@ -1115,6 +1197,11 @@ class _Second:
         #: TOT + NIM, per counter (rows) and NIM_COLS (columns); all zero for
         #: a counter without a NIM copy.
         self.nim = np.zeros((n_counters, len(NIM_COLS)), dtype=np.int64)
+        #: MuPix x/y: judged S1 rows per track state (sma_mupix_xy.STATE_NAMES),
+        #: the tracks of the light and heavy ToT classes, and the tracks classed
+        #: (xy_ctrk, their denominator: restarts with a ToT-cut edit).
+        self.xy_state = np.zeros(len(X.STATE_NAMES), dtype=np.int64)
+        self.xy_light = self.xy_heavy = self.xy_ctrk = 0
 
     def nim_eff(self) -> list | None:
         """Pair efficiency paired / (paired + TOT-only) per counter (S1 first),
@@ -1380,6 +1467,12 @@ class SmaPlugin:
         #: Per counter index k: its NIM channel's lag state this epoch
         #: (`LagMemory`: the sticky state, the vote cadence); cleared with each epoch.
         self._nim_mem: dict[int, LagMemory] = {}
+        #: The XY table's position for MuPix x/y: (xpos, ypos) in mm as the
+        #: table reads it, where it came from, and a note when it is not the
+        #: ODB's (see poll_odb, set_stage). One tuple, swapped whole.
+        self._stage: tuple = (0.0, 0.0, "none", "no stage reading yet: (0, 0) mm used")
+        #: x/y map resets by MuPix/XY edits (no rebuild; see apply_settings).
+        self.xy_resets = 0
         self._build()
 
     # -- settings --------------------------------------------------------------
@@ -1394,7 +1487,15 @@ class SmaPlugin:
         efficiency measured under the old shift or cuts is not comparable with
         one under the new, so the summary does not average across the change.
         The trend keeps its rows (rates do not depend on the cuts).
+
+        ``MuPix/XY`` edits never rebuild: enable, the cluster square and
+        ``apply stage shift`` (and a chip-list change that only moves x/y)
+        re-book the x/y maps alone; the ToT cuts re-book only the light and
+        heavy maps (``mupix_track_tot``, which the cuts are read from, keeps
+        filling). The x/y summary counters restart with them; nothing else
+        does, and the epoch stays.
         """
+        old = self.cfg.xy
         self.cfg = parse_settings(settings)
         if rebuild:
             for name in self.store.names():
@@ -1403,6 +1504,74 @@ class SmaPlugin:
             self._build()
             self.rebuilds += 1
             self._new_epoch()
+            return
+        new = self.cfg.xy
+        if new.reset_key() != old.reset_key():
+            self._build_xy()
+            self._reset_xy_counters(classes_only=False)
+            self.xy_resets += 1
+        elif (new.tot_light_max, new.tot_heavy_min) != (old.tot_light_max, old.tot_heavy_min):
+            self._build_xy(classes_only=True)
+            self._reset_xy_counters(classes_only=True)
+            self.xy_resets += 1
+
+    def _reset_xy_counters(self, classes_only: bool) -> None:
+        for sec in {id(x): x for x in (*self._seconds, self._cur) if x is not None}.values():
+            sec.xy_light = sec.xy_heavy = sec.xy_ctrk = 0
+            if not classes_only:
+                sec.xy_state[:] = 0
+
+    # -- the XY table ---------------------------------------------------------------
+
+    def poll_odb(self, odb_get) -> None:
+        """Read the ODB values that change no histogram: the XY table's position.
+
+        Called by the analyzer on every settings poll (every 2 s) with
+        ``client.odb_get``. Not a setting (`shape_fingerprint` never sees it):
+        a moving stage resets no plot, the frames after the poll take the new
+        shift. Only read while MuPix x/y is on with ``apply stage shift``; a
+        missing or unreadable key (a standalone rig, an old ODB) gives (0, 0)
+        with a note in the summary, never an error. The table's own readback
+        period comes on top of the 2 s: frames up to a few seconds after a
+        move take the old shift, so a stage step blurs that long.
+
+        Any other exception (a bug here) keeps the last position, marks the
+        source "error" with the exception in the note, and is raised for the
+        analyzer to log once.
+        """
+        try:
+            xy = self.cfg.xy
+            if not (xy.active and xy.apply_stage):
+                return
+            try:
+                v = odb_get(X.STAGE_PATH)
+                v = list(v) if isinstance(v, list | tuple | np.ndarray) else [v]
+                x, y = float(v[0]), float(v[1])
+                if not (math.isfinite(x) and math.isfinite(y)):
+                    raise ValueError("not finite")
+            except Exception as exc:                # noqa: BLE001
+                self._stage = (0.0, 0.0, "missing",
+                               f"{X.STAGE_PATH} not readable ({type(exc).__name__}): "
+                               "(0, 0) mm used")
+                return
+            self._stage = (x, y, "odb", None)
+        except Exception as exc:
+            x, y = self._stage[:2]
+            self._stage = (x, y, "error", f"reading the XY table failed ({type(exc).__name__}: "
+                           f"{exc}); the last position ({x:g}, {y:g}) mm is kept")
+            raise
+
+    def set_stage(self, xpos: float, ypos: float, source: str = "manual",
+                  note: str | None = None) -> None:
+        """Set the XY table's position without the ODB (the offline CLI: the file's
+        begin-of-run ODB or ``--stage``; tests)."""
+        self._stage = (float(xpos), float(ypos), source, note)
+
+    def _xy_shift(self) -> tuple[float, float]:
+        """The (dx, dy) in mm added to every MuPix position."""
+        if not self.cfg.xy.apply_stage:
+            return 0.0, 0.0
+        return X.stage_shift(self._stage[0], self._stage[1])
 
     def _new_epoch(self) -> None:
         self.epoch += 1
@@ -1414,11 +1583,11 @@ class SmaPlugin:
 
     # -- histograms ------------------------------------------------------------
 
-    def _h1(self, name, axis, title):
-        return self.store.add(Hist1D(f"sma/{name}", axis, title=title, dtype=np.uint64))
+    def _h1(self, name, axis, title, dtype=np.uint64):
+        return self.store.add(Hist1D(f"sma/{name}", axis, title=title, dtype=dtype))
 
-    def _h2(self, name, x, y, title):
-        return self.store.add(Hist2D(f"sma/{name}", x, y, title=title, dtype=np.uint64))
+    def _h2(self, name, x, y, title, dtype=np.uint64):
+        return self.store.add(Hist2D(f"sma/{name}", x, y, title=title, dtype=dtype))
 
     def _build(self) -> None:
         cfg, b, c = self.cfg, self.cfg.binning, self.cfg.cuts
@@ -1599,6 +1768,72 @@ class SmaPlugin:
         h["mupix_row_chip"] = self._h2("mupix_row_chip", cax, Axis(256, -0.5, 255.5, "row"),
                                        f"Row occupancy per chip (rows >= {W.PIXEL_ROWS} are not on "
                                        "the sensor)")
+        self._build_xy()
+
+    #: The x/y maps of each class (``_build_xy``); the ToT cuts re-book only these.
+    _XY_CLASS_KEYS = tuple(f"{k}{c}" for c in ("_light", "_heavy") for k in ("xy", "xxp", "yyp"))
+
+    def _build_xy(self, classes_only: bool = False) -> None:
+        """MuPix x/y (MuPix/XY; see _fill_xy): booked only while x/y is active.
+
+        Removes and re-books the x/y maps (only the light and heavy ones with
+        ``classes_only``): a re-book is how an XY edit resets them without
+        touching any other plot (apply_settings).
+
+        Fixed axes, the nearline's: x, y in 130 bins of 0.64 mm (8 pixels) over
+        +-41.6 mm, shifted by a quarter pixel so that no pixel centre sits on an
+        edge (track_xy_expanded at half its 260 bins); slopes one bin per 2.667
+        mrad step (one pixel over 30 mm) on +-102.67 mrad (xxp_central), with
+        its half-step edge bias (sma_mupix_xy.SLOPE_BINS). 150850 bins in all,
+        booked uint32 so that a page refresh carries 4 bytes a bin (600 kB, not
+        1.2 MB); a map is widened to uint64 before any bin could pass 2^32 - 1
+        (`_widen`), so a count never wraps.
+        """
+        cfg, h = self.cfg, self.h
+        xy, m = cfg.xy, cfg.mupix
+        old = h.get("xy") or {}
+        drop = self._XY_CLASS_KEYS if classes_only else tuple(old)
+        for k in drop:
+            if k in old:
+                self.store.remove(old[k].name)
+        if not xy.active:
+            h["xy"] = None
+            return
+        out = {k: v for k, v in old.items() if k not in drop}
+        g = f"{X.GEOMETRY_TAG}, +x beam-left"
+        pos = lambda u: Axis(X.POS_BINS, X.POS_LO_MM, X.POS_HI_MM, f"{u} (mm)")  # noqa: E731
+        slope = lambda u: Axis(X.SLOPE_BINS, -X.SLOPE_HALF_MRAD, X.SLOPE_HALF_MRAD,  # noqa: E731
+                               f"{u} (mrad)")
+        h2 = lambda *a: self._h2(*a, dtype=np.uint32)  # noqa: E731
+        win = f"[{m.window_ns[0]}, {m.window_ns[1]}) ns"
+        cls = {"": "all tracks",
+               "_light": f"light: max pixel ToT <= {xy.tot_light_max} in L1 and L2",
+               "_heavy": f"heavy: max pixel ToT >= {xy.tot_heavy_min} in L1 and L2"}
+        if not classes_only:
+            for p in (W.PLANE_L1, W.PLANE_L2):
+                n = W.PLANE_NAMES[p]
+                out[f"hits_{n}"] = h2(
+                    f"mupix_hits_xy_{n}", pos("x"), pos("y"),
+                    f"MuPix {n} pixel hits in time {win} with a sampled S1 hit ({g})")
+        for suf, what in cls.items():
+            if classes_only and not suf:
+                continue
+            out[f"xy{suf}"] = h2(f"mupix_track_xy{suf}", pos("x"), pos("y"),
+                                 f"S1-seeded MuPix tracks at L1, {what} ({g})")
+            out[f"xxp{suf}"] = h2(f"mupix_track_xxp{suf}", pos("x"), slope("x'"),
+                                  f"S1-seeded MuPix tracks x / x' at L1, {what} ({g})")
+            out[f"yyp{suf}"] = h2(f"mupix_track_yyp{suf}", pos("y"), slope("y'"),
+                                  f"S1-seeded MuPix tracks y / y' at L1, {what} ({g})")
+        if not classes_only:
+            tax = lambda n: Axis(32, -0.5, 31.5,  # noqa: E731
+                                 f"max pixel ToT {n} ({m.tot_ns} ns counts)")
+            out["tot"] = h2("mupix_track_tot", tax("L1"), tax("L2"),
+                            "S1-seeded MuPix tracks: max pixel ToT, L1 vs L2")
+            out["state"] = self._h1(
+                "mupix_track_state", Axis(4, -0.5, 3.5, "0 no L1, 1 no L2, 2 ambiguous, 3 track"),
+                f"Sampled S1 hits by MuPix track state ({xy.box} x {xy.box} pixel cluster "
+                "square; entries = S1 hits judged)", dtype=np.uint32)
+        h["xy"] = out
 
     # -- per event -------------------------------------------------------------
 
@@ -2202,6 +2437,7 @@ class SmaPlugin:
             return
         if m.max_s1 is not None and t_s1.size > m.max_s1:
             t_s1 = t_s1[W.even_sample(t_s1.size, m.max_s1)]
+        self._fill_xy(t_s1, px, sec)
         mt = W.mupix_match(t_s1, px, m.window_ns, m.sideband_ns)
         n, fin, fside = mt.counts()
         sec.mp_n += n
@@ -2217,6 +2453,63 @@ class SmaPlugin:
             if dt.size:
                 hh = h["mupix_dt"][p]
                 _fill_1d_index(hh, (dt - int(hh.x.lo)) // b["mupix dt bin"] + 1)
+
+    def _fill_xy(self, t_s1, px: W.Pixels, sec: _Second) -> None:
+        """MuPix x/y of a good frame, on the MuPix S1 sample.
+
+        Of that sample, the S1 hits whose window lies in the frame's pixel data
+        (the rest cannot be judged: on run 1008 the pixels start ~0.5 ms after
+        the SMA hits), at most MuPix/XY/max S1 per frame of them, evenly spread.
+        sma_mupix_xy.s1_tracks: per S1 hit the track state, and for the tracks
+        the L1 position, the slopes and the max pixel ToT of each plane. The
+        hit maps take every pixel in at least one window, once. The shift of
+        the XY table (as of the last poll) is added to every position.
+        """
+        hx = self.h.get("xy")
+        if hx is None:
+            return
+        xy, m = self.cfg.xy, self.cfg.mupix
+        t_s1 = t_s1[W.mupix_coverage(t_s1, px, *m.window_ns)]
+        if t_s1.size > xy.max_s1:
+            t_s1 = t_s1[W.even_sample(t_s1.size, xy.max_s1)]
+        tr = X.s1_tracks(t_s1, px, m.window_ns, xy.box, xy.placement, self._xy_shift())
+        sc = tr.state_counts()
+        sec.xy_state += sc
+        n = int(sc.sum())
+        if n:
+            _widen(hx["state"], n)
+            hx["state"].add_counts(np.array([0, *sc, 0], dtype=np.int64), entries=n)
+        # Few entries into large maps: in-place adds of flat bin indices
+        # (_add_flat), each index computed once and reused by the light and
+        # heavy maps, which take a subset of the tracks.
+        pax = hx["xy"].x
+        nxp = pax.n + 2
+        for p in (W.PLANE_L1, W.PLANE_L2):
+            u, v = tr.hits[p]
+            if u.size:
+                _add_flat(hx[f"hits_{W.PLANE_NAMES[p]}"], _bin_of(v, pax) * nxp + _bin_of(u, pax))
+        trk = tr.track
+        if not trk.any():
+            return
+        sax = hx["xxp"].y
+        ix, iy = _bin_of(tr.x1[trk], pax), _bin_of(tr.y1[trk], pax)
+        flat = {"xy": iy * nxp + ix, "xxp": _bin_of(tr.xp[trk], sax) * nxp + ix,
+                "yyp": _bin_of(tr.yp[trk], sax) * nxp + iy}
+        t1, t2 = tr.tot1[trk], tr.tot2[trk]
+        light = (t1 <= xy.tot_light_max) & (t2 <= xy.tot_light_max)
+        heavy = (t1 >= xy.tot_heavy_min) & (t2 >= xy.tot_heavy_min)
+        nl, nh = int(np.count_nonzero(light)), int(np.count_nonzero(heavy))
+        sec.xy_light += nl
+        sec.xy_heavy += nh
+        sec.xy_ctrk += int(t1.size)
+        for k, f in flat.items():
+            _add_flat(hx[k], f)
+            if nl:
+                _add_flat(hx[f"{k}_light"], f[light])
+            if nh:
+                _add_flat(hx[f"{k}_heavy"], f[heavy])
+        # ToT 0..31 on a 32-bin axis from -0.5: bin index = ToT + 1, never out of range.
+        _add_flat(hx["tot"], (t2.astype(np.intp) + 1) * (hx["tot"].x.n + 2) + t1 + 1)
 
     def _mupix_widths(self) -> tuple[float, float]:
         m = self.cfg.mupix
@@ -2495,6 +2788,7 @@ class SmaPlugin:
             #: rule); SMAEvents' "incomplete pattern" leaves them out.
             "timestamp_faults": self._timestamp_faults(hits, mism, shift["verdict"]),
             "mupix": self._mupix_summary(secs, now),
+            "xy": self._xy_summary(secs),
             #: The channel map, so the pages need not guess roles from labels;
             #: "nim" follows "counters" (-1 = no NIM copy).
             "roles": {"s1": cfg.roles.s1, "counters": list(cfg.roles.counters),
@@ -2674,6 +2968,56 @@ class SmaPlugin:
             "chips": chips,
             "fractions": fractions,
             "sync": dict(self._mp_last),
+        }
+
+    def _xy_summary(self, secs: list) -> dict:
+        """The MuPix x/y part of sma::summary, over the summary window.
+
+        Fractions of the judged S1 hits per track state (``n_s1``: the S1 hits
+        x/y judged -- window inside the pixel data, at most XY/max S1 per frame
+        -- not the same count as ``mupix.n_s1``, whose S1 hits also need the
+        sideband inside); ``light_frac`` and ``heavy_frac`` are of the tracks
+        classed since the last ToT-cut edit (None right after one).
+        ``enabled``: x/y is booked and filled; ``off_reason`` why not with
+        XY/enable = y. ``quadrants``: where each placed chip is. ``stage``: the
+        XY table as read (``x_mm``, ``y_mm``), where from (``source``: "odb";
+        "file" -- the begin-of-run ODB of the offline CLI's file --; "manual"
+        -- set by hand, ``--stage`` --; "missing" -- the key was not readable,
+        0 used --; "error" -- the read failed, see the note --; "none" -- no
+        reading yet), whether it is applied, the shift added to every position
+        (``shift_mm``, (-x, +y)) and a ``note`` when it is not a plain reading.
+        ``resets``: x/y map resets by XY edits since the start.
+        """
+        xy, m = self.cfg.xy, self.cfg.mupix
+        state = sum((x.xy_state for x in secs), np.zeros(len(X.STATE_NAMES), dtype=np.int64))
+        n, trk = int(state.sum()), int(state[X.TRACK])
+        light = sum(x.xy_light for x in secs)
+        heavy = sum(x.xy_heavy for x in secs)
+        ctrk = sum(x.xy_ctrk for x in secs)
+        sx, sy, src, note = self._stage
+        dx, dy = self._xy_shift()
+        return {
+            "enabled": bool(xy.active),
+            "off_reason": (None if xy.active else xy.off_reason if xy.enable
+                           else "MuPix/XY/enable = n"),
+            "geometry": X.GEOMETRY_TAG,
+            "quadrants": xy.placement.quadrant_map() if xy.active else [],
+            "resets": self.xy_resets,
+            "n_s1": n, "tracks": trk,
+            "fractions": {"track": _ratio(trk, n, 4),
+                          "ambiguous": _ratio(state[X.AMBIGUOUS], n, 4),
+                          "no_l1": _ratio(state[X.NO_L1], n, 4),
+                          "no_l2": _ratio(state[X.NO_L2], n, 4)},
+            "light_frac": _ratio(light, ctrk, 4),
+            "heavy_frac": _ratio(heavy, ctrk, 4),
+            "stage": {"x_mm": _num(sx, 6), "y_mm": _num(sy, 6), "source": src,
+                      "applied": bool(xy.apply_stage),
+                      "shift_mm": [_num(dx, 6) or 0.0, _num(dy, 6) or 0.0],
+                      "note": note if xy.apply_stage else None},
+            "cuts": {"cluster_box_px": xy.box, "tot_light_max": xy.tot_light_max,
+                     "tot_heavy_min": xy.tot_heavy_min, "tot_ns": m.tot_ns,
+                     "window_ns": list(m.window_ns), "max_s1": xy.max_s1},
+            "unplaced_chips": list(xy.placement.unplaced),
         }
 
     def _flags(self, s: dict, now: float, run_active) -> list[dict]:
@@ -3525,8 +3869,9 @@ def _merge_seconds(secs: list[_Second]) -> _Second:
         for a in ("frames", "offered", "stale", "empty", "suspect", "span_ns", "cover_ns",
                   "delta_ns", "live_ns", "n_s1", "n_s1_kept", "rf_valid", "rf_vetoed",
                   "oversize", "mp_frames", "mp_pix", "mp_examined", "mp_skipped", "mp_n",
-                  "mp_rows", "mp_unsorted"):
+                  "mp_rows", "mp_unsorted", "xy_light", "xy_heavy", "xy_ctrk"):
             setattr(out, a, getattr(out, a) + getattr(s, a))
+        out.xy_state += s.xy_state
         out.hits += s.hits
         out.rate_hits += s.rate_hits
         out.mismatch += s.mismatch
@@ -3603,6 +3948,45 @@ def _fill_2d_index(h: Hist2D, ix, iy) -> None:
     flat = iy * (h.x.n + 2) + ix
     h.add_counts(np.bincount(flat, minlength=h.counts.size).reshape(h.counts.shape),
                  entries=ix.size)
+
+
+def _add_flat(h: Hist2D, flat) -> None:
+    """Add one count per flat index (``iy * (nx + 2) + ix``) in place.
+
+    For fills of a few hundred entries into a large 2D histogram: no
+    histogram-sized temporary, unlike the bincount of `_fill_2d_index` (a
+    130 x 130 map costs ~30 us that way, whatever the entries).
+    """
+    flat = np.asarray(flat, dtype=np.intp).ravel()
+    if not flat.size:
+        return
+    _widen(h, flat.size)
+    if h.counts.flags.c_contiguous:             # always (np.zeros): reshape is a view
+        np.add.at(h.counts.reshape(-1), flat, h.counts.dtype.type(1))
+        h.entries += int(flat.size)
+    else:
+        h.add_counts(np.bincount(flat, minlength=h.counts.size).reshape(h.counts.shape))
+
+
+def _widen(h, n: int) -> None:
+    """Make a uint32 histogram uint64 before ``n`` more counts could wrap a bin.
+
+    No bin holds more than ``entries`` (every fill adds as many entries as
+    counts, Clear zeroes both), so below 2^32 - 1 entries nothing can wrap.
+    Past it the map travels as f64 (8 bytes a bin) from then on: at the
+    sampled rates that takes weeks of one run.
+    """
+    if h.counts.dtype == np.uint32 and h.entries + int(n) >= np.iinfo(np.uint32).max:
+        h.counts = h.counts.astype(np.uint64)
+        h.dtype = np.uint64
+
+
+def _bin_of(values, ax: Axis) -> np.ndarray:
+    """`_index` for finite values, with fewer numpy calls (no clip wrapper)."""
+    i = np.floor((np.asarray(values, dtype=np.float64) - ax.lo) * (ax.n / (ax.hi - ax.lo)))
+    np.maximum(i, -1.0, out=i)
+    np.minimum(i, float(ax.n), out=i)
+    return i.astype(np.intp) + 1
 
 
 def _fill_2d(h: Hist2D, xs, ys) -> None:

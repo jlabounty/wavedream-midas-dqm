@@ -211,7 +211,7 @@ test("only the visible tab is polled", async () => {
 
 test("the tab strip is a tablist: aria-selected follows the tab, arrows move it", async () => {
   const page = await boot();
-  const ids = ["health", "tot", "timing", "rf", "mupix", "nim", "trends"];
+  const ids = ["health", "tot", "timing", "rf", "mupixxy", "mupix", "nim", "trends"];
   const tab = (id) => byId(page, `dqm-sma-tab-${id}`);
   const strip = tab("health").parent;
   assert.strictEqual(strip.getAttribute("role"), "tablist");
@@ -239,10 +239,12 @@ test("the tab strip is a tablist: aria-selected follows the tab, arrows move it"
                                 preventDefault() { prevented = true; } });
     return prevented; };
   assert.ok(key("ArrowRight"));
-  assert.deepStrictEqual(selected(), ["mupix"]);
-  assert.strictEqual(El.focused, tab("mupix"), "the new tab has the focus");
+  assert.deepStrictEqual(selected(), ["mupixxy"], "MuPix phase space follows RF");
+  assert.strictEqual(El.focused, tab("mupixxy"), "the new tab has the focus");
   key("ArrowRight");
-  assert.deepStrictEqual(selected(), ["nim"], "NIM / TOT sits between MuPix and Trends");
+  assert.deepStrictEqual(selected(), ["mupix"], "then MuPix diagnostics");
+  key("ArrowRight");
+  assert.deepStrictEqual(selected(), ["nim"], "NIM / TOT sits between the MuPix tabs and Trends");
   key("ArrowRight"); key("ArrowRight");
   assert.deepStrictEqual(selected(), ["health"], "Right wraps past the last tab");
   key("ArrowLeft");
@@ -743,6 +745,16 @@ test("the MuPix tab: in-time fractions per plane, the sync state, and its plots"
             "only the MuPix tab's histograms are asked for");
 });
 
+test("a remembered tab of the old single MuPix tab opens MuPix diagnostics", async () => {
+  const page = await boot(undefined, { tab: "mupix" });
+  assert.strictEqual(byId(page, "dqm-sma-tab-mupix").getAttribute("aria-selected"), "true");
+  assert.strictEqual(byId(page, "dqm-sma-tab-mupix").byClass("dqm-sma-tabfull")[0].textContent, "MuPix diagnostics");
+  assert.strictEqual(byId(page, "dqm-sma-tab-mupix").byClass("dqm-sma-tabshort")[0].textContent, "MuPix diag.");
+  assert.ok(byId(page, "dqm-sma-grid-mupix").byClass("dqm-histtitle").length > 0);
+  const odd = await boot(undefined, { tab: "no-such-tab" });
+  assert.strictEqual(byId(odd, "dqm-sma-tab-health").getAttribute("aria-selected"), "true");
+});
+
 test("a lost MuPix time sync is a red chip and a warning flag", async () => {
   const page = await boot({ "sma::summary": () => json(FX.summary_mupix_sync) });
   byId(page, "dqm-sma-tab-mupix").onclick();
@@ -752,6 +764,13 @@ test("a lost MuPix time sync is a red chip and a warning flag", async () => {
   const flag = byId(page, "dqm-sma-flags").byClass("dqm-sma-flag").find((f) => f.attrs["data-code"] === "mupix_sync");
   assert.ok(flag && flag.classList.contains("yellow"), "a warning");
   assert.ok(/lost sync/.test(flag.textContent));
+  // The flag leads to the diagnostics tab, where the t(pixel) - t(S1) plots are.
+  byId(page, "dqm-sma-tab-health").onclick();
+  const go = flag.byTag("button")[0];
+  assert.strictEqual(go.textContent, "MuPix diagnostics tab ›");
+  go.onclick();
+  await settle(page);
+  assert.strictEqual(byId(page, "dqm-sma-tab-mupix").getAttribute("aria-selected"), "true");
 });
 
 test("a plane-map edit lays the MuPix tab out again", async () => {
@@ -766,6 +785,161 @@ test("a plane-map edit lays the MuPix tab out again", async () => {
   await settle(page);
   assert.ok(titles().some((t) => /occupancy, L1 \(chips 1, 2, 3, 4\)/.test(t)), titles().join(" | "));
   assert.ok(!titles().some((t) => /chips 0, 1, 2, 3/.test(t)));
+});
+
+// -- MuPix x/y ------------------------------------------------------------------------------
+
+async function mupixTab(summary, stored) {
+  const page = await boot(summary ? { "sma::summary": () => json(summary) } : undefined, stored);
+  byId(page, "dqm-sma-tab-mupixxy").onclick();
+  await settle(page);
+  return page;
+}
+const xyNote = (page) => byId(page, "dqm-sma-xynote").textContent;
+const mupixGrid = (page) => byId(page, "dqm-sma-grid-mupixxy");
+const XY_ORDER = ["mupix_hits_xy_L1", "mupix_hits_xy_L2",
+  "mupix_track_xy", "mupix_track_xy_light", "mupix_track_xy_heavy",
+  "mupix_track_xxp", "mupix_track_xxp_light", "mupix_track_xxp_heavy",
+  "mupix_track_yyp", "mupix_track_yyp_light", "mupix_track_yyp_heavy",
+  "mupix_track_tot", "mupix_track_state"];
+
+test("MuPix phase space: the x/y plots alone, in rows, in their order; the rest on diagnostics", async () => {
+  const page = await mupixTab();
+  const grid = mupixGrid(page);
+  const shortNames = (g) => g.byClass("dqm-histtitle").map((t) => /\[(\w+)\]$/.exec(t.textContent)[1]);
+  assert.deepStrictEqual(shortNames(grid), XY_ORDER);
+  assert.ok(histCalls(page).filter((n) => /mupix_/.test(n)).every((n) => XY_ORDER.includes(n.slice(4))),
+            "only the phase-space histograms are asked for");
+  byId(page, "dqm-sma-tab-mupix").onclick();
+  await settle(page);
+  const diag = shortNames(byId(page, "dqm-sma-grid-mupix"));
+  assert.deepStrictEqual(diag.slice(0, 5), ["mupix_dt_L1", "mupix_dt_L2", "mupix_s1_match",
+                                            "mupix_tot_L1", "mupix_tot_L2"]);
+  for (const n of ["mupix_col_chip", "mupix_row_chip", "mupix_hits_chip"]) assert.ok(diag.includes(n), n);
+  assert.ok(!diag.some((n) => XY_ORDER.includes(n)), diag.join(" "));
+  // The rows: the two hit maps, then all / light / heavy per track map; the
+  // ToT map and the state outside any row.
+  const rows = grid.byClass("dqm-sma-row");
+  assert.deepStrictEqual(rows.map((r) => r.attrs["data-row"]), ["xyhits", "xyxy", "xyxxp", "xyyyp"]);
+  assert.deepStrictEqual(rows.map((r) => r.className), ["dqm-sma-row dqm-sma-row2",
+    "dqm-sma-row dqm-sma-row3", "dqm-sma-row dqm-sma-row3", "dqm-sma-row dqm-sma-row3"]);
+  const inRow = (r) => r.byClass("dqm-histtitle").map((t) => /\[(\w+)\]$/.exec(t.textContent)[1]);
+  assert.deepStrictEqual(inRow(rows[2]), ["mupix_track_xxp", "mupix_track_xxp_light", "mupix_track_xxp_heavy"]);
+  const tot = grid.byClass("dqm-sma-plotwrap").find((w) => /\[mupix_track_tot\]$/.test(w.children[0].textContent));
+  assert.strictEqual(tot.parent, grid, "the ToT map is not in a row");
+  assert.ok(tot.classList.contains("dqm-sma-square"));
+  // The note heads the tab.
+  assert.strictEqual(grid.children[0], byId(page, "dqm-sma-xyhead"));
+});
+
+test("MuPix x/y track maps are linear z by default, the hit maps follow the toolbar", async () => {
+  const page = await mupixTab();
+  const heat = (n) => mupixGrid(page).byClass("dqm-sma-plotwrap")
+    .find((w) => new RegExp(`\\[${n}\\]$`).test(w.children[0].textContent)).children[1].heatmap;
+  for (const n of ["mupix_track_xy", "mupix_track_xxp_light", "mupix_track_yyp_heavy"]) {
+    assert.strictEqual(heat(n).logZ, false, n);
+  }
+  assert.strictEqual(heat("mupix_hits_xy_L1").logZ, true);
+  assert.strictEqual(heat("mupix_track_tot").logZ, true);
+  const box = byId(page, "dqm-sma-xylogz");
+  assert.strictEqual(box.checked, false);
+  box.checked = true;
+  box.onchange.call(box);
+  await settle(page);
+  assert.strictEqual(heat("mupix_track_xy").logZ, true);
+  assert.ok(/"xyLogZ":true/.test(globalThis.localStorage._d["dqm-sma-settings"]), "remembered");
+});
+
+test("the MuPix x/y note: fractions, ToT cuts, stage, geometry", async () => {
+  const s = clone(FX.summary);
+  Object.assign(s.xy, { n_s1: 2211, light_frac: 0.014, heavy_frac: 0.2918,
+                        fractions: { track: 0.6137, ambiguous: 0.2479, no_l1: 0.1, no_l2: 0.04 } });
+  s.xy.stage = { x_mm: 1.5, y_mm: -2, source: "odb", applied: true, shift_mm: [-1.5, -2], note: null };
+  const page = await mupixTab(s);
+  const t = xyNote(page);
+  assert.ok(t.startsWith("MuPix x/y: tracks 61.4 % of 2,211 S1 hits judged, ambiguous 24.8 %"), t);
+  const c = FX.summary.xy.cuts;
+  assert.ok(t.includes(`light 1.4 %, heavy 29.2 % of the tracks (light: both planes' max ToT ≤ ` +
+                       `${c.tot_light_max} (×${c.tot_ns} ns) · heavy: ≥ ${c.tot_heavy_min})`), t);
+  assert.ok(t.includes("stage shift x −1.50, y −2.00 mm (XY table)"), t);
+  assert.ok(t.includes("bt2026-v4, +x beam-left"), t);
+  // The chips as drawn (x to the right = beam-left), names of the quadrants on hover.
+  assert.ok(t.includes("chips as drawn: L1 ↖3 ↗2 ↙1 ↘0 · L2 ↖7 ↗6 ↙5 ↘4"), t);
+  const q = byId(page, "dqm-sma-xynote").find((e) => /^chips as drawn/.test(e.textContent) && e.tagName === "SPAN");
+  assert.ok(/chip 0: L1 beam-left bottom/.test(q.getAttribute("title")), q.getAttribute("title"));
+  assert.ok(!/no place|reset/.test(t));
+  assert.strictEqual(byId(page, "dqm-sma-xynote").byClass("dqm-sma-xy-warn").length, 0);
+  // Titles leave the frame to the note.
+  const titles = mupixGrid(page).byClass("dqm-histtitle").map((x) => x.textContent);
+  assert.ok(!titles.some((x) => /beam-left\)/.test(x)), titles.join(" | "));
+});
+
+test("the MuPix x/y note: a stage that cannot be read is a muted warning; unplaced chips too", async () => {
+  const s = clone(FX.summary);
+  s.xy.stage = { x_mm: 0, y_mm: 0, source: "missing", applied: true, shift_mm: [0, 0],
+                 note: "/Equipment/XYTable/Variables/Measured not readable (KeyError): (0, 0) mm used" };
+  s.xy.unplaced_chips = [8, 9];
+  const page = await mupixTab(s);
+  const warns = byId(page, "dqm-sma-xynote").byClass("dqm-sma-xy-warn");
+  assert.deepStrictEqual(warns.map((w) => w.textContent),
+                         ["stage: missing, (0, 0) mm used", "chips with no place: 8, 9"]);
+  assert.ok(/not readable/.test(warns[0].getAttribute("title")), "the reason on hover");
+});
+
+test("the MuPix x/y note: a failed stage read is a warning with the reason; file and resets", async () => {
+  const s = clone(FX.summary);
+  s.xy.stage = { x_mm: 2, y_mm: 1, source: "error", applied: true, shift_mm: [-2, 1],
+                 note: "reading the XY table failed (TypeError: x); the last position (2, 1) mm is kept" };
+  s.xy.resets = 2;
+  let page = await mupixTab(s);
+  const warn = byId(page, "dqm-sma-xynote").byClass("dqm-sma-xy-warn");
+  assert.deepStrictEqual(warn.map((w) => w.textContent), ["stage: read failed, last shift kept (x −2.00, y +1.00 mm)"]);
+  assert.ok(/last position \(2, 1\) mm is kept/.test(warn[0].getAttribute("title")));
+  assert.ok(xyNote(page).includes("maps reset 2× by XY edits"), xyNote(page));
+  s.xy.stage = { x_mm: 2, y_mm: 1, source: "file", applied: true, shift_mm: [-2, 1], note: null };
+  page = await mupixTab(s);
+  assert.ok(xyNote(page).includes("stage shift x −2.00, y +1.00 mm (the file's begin-of-run ODB)"), xyNote(page));
+});
+
+test("the MuPix x/y note: XY off says why", async () => {
+  const s = clone(FX.summary);
+  Object.assign(s.xy, { enabled: false, quadrants: [],
+                        off_reason: "L1 chips: chip 3 is listed twice" });
+  const page = await mupixTab(s);
+  const t = xyNote(page);
+  assert.strictEqual(t, "MuPix x/y: XY off: L1 chips: chip 3 is listed twice");
+  assert.strictEqual(byId(page, "dqm-sma-xynote").byClass("dqm-sma-xy-warn").length, 1, "a fault, not a choice");
+});
+
+test("the MuPix x/y note: XY off says so, and the note stays on the tab", async () => {
+  const s = clone(FX.summary);
+  s.xy.enabled = false;
+  s.xy.off_reason = "MuPix/XY/enable = n";
+  const names = FX.hist_names.filter((n) => !/mupix_(hits_xy|track)_/.test(n) && !/mupix_track_/.test(n));
+  const page = await boot({ "sma::summary": () => json(s),
+    "dqm::list": () => envelope("list", new TextEncoder().encode(names.join("\n"))) });
+  byId(page, "dqm-sma-tab-mupixxy").onclick();
+  await settle(page);
+  assert.strictEqual(xyNote(page), "MuPix x/y: XY off: MuPix/XY/enable = n");
+  assert.strictEqual(byId(page, "dqm-sma-xynote").byClass("dqm-sma-xy-warn").length, 0, "a choice, not a fault");
+  const grid = mupixGrid(page);
+  assert.strictEqual(grid.byClass("dqm-sma-row").length, 0);
+  assert.deepStrictEqual(grid.children, [byId(page, "dqm-sma-xyhead")], "the note alone, no 'no histograms' line");
+});
+
+test("the MuPix x/y note: no S1 hits judged yet gives dashes, not NaN", async () => {
+  const s = clone(FX.summary);
+  Object.assign(s.xy, { n_s1: 0, tracks: 0, light_frac: null, heavy_frac: null,
+                        fractions: { track: null, ambiguous: null, no_l1: null, no_l2: null } });
+  s.xy.stage = { x_mm: 0, y_mm: 0, source: "none", applied: true, shift_mm: [0, 0],
+                 note: "no stage reading yet: (0, 0) mm used" };
+  const page = await mupixTab(s);
+  const t = xyNote(page);
+  assert.ok(t.includes("tracks — of 0 S1 hits judged, ambiguous —"), t);
+  assert.ok(t.includes("light —, heavy — of the tracks"), t);
+  assert.ok(!/NaN|undefined|null/.test(t), t);
+  const muted = byId(page, "dqm-sma-xynote").byClass("dqm-sma-xy-muted");
+  assert.deepStrictEqual(muted.map((m) => m.textContent), ["stage: no reading yet, (0, 0) mm used"]);
 });
 
 test("a reply that grows between the truncated call and its retry still arrives", async () => {

@@ -445,6 +445,95 @@
     "low_for_s": null
    }
   },
+  "xy": {
+   "enabled": true,
+   "off_reason": null,
+   "geometry": "bt2026-v4",
+   "quadrants": [
+    {
+     "chip": 0,
+     "plane": "L1",
+     "quadrant": 0,
+     "where": "beam-left bottom"
+    },
+    {
+     "chip": 1,
+     "plane": "L1",
+     "quadrant": 1,
+     "where": "beam-right bottom"
+    },
+    {
+     "chip": 2,
+     "plane": "L1",
+     "quadrant": 2,
+     "where": "beam-left top"
+    },
+    {
+     "chip": 3,
+     "plane": "L1",
+     "quadrant": 3,
+     "where": "beam-right top"
+    },
+    {
+     "chip": 4,
+     "plane": "L2",
+     "quadrant": 0,
+     "where": "beam-left bottom"
+    },
+    {
+     "chip": 5,
+     "plane": "L2",
+     "quadrant": 1,
+     "where": "beam-right bottom"
+    },
+    {
+     "chip": 6,
+     "plane": "L2",
+     "quadrant": 2,
+     "where": "beam-left top"
+    },
+    {
+     "chip": 7,
+     "plane": "L2",
+     "quadrant": 3,
+     "where": "beam-right top"
+    }
+   ],
+   "resets": 0,
+   "n_s1": 2211,
+   "tracks": 1357,
+   "fractions": {
+    "track": 0.6137,
+    "ambiguous": 0.2479,
+    "no_l1": 0.09905,
+    "no_l2": 0.03935
+   },
+   "light_frac": 0.4547,
+   "heavy_frac": 0.1466,
+   "stage": {
+    "x_mm": 0.0,
+    "y_mm": 0.0,
+    "source": "none",
+    "applied": true,
+    "shift_mm": [
+     0.0,
+     0.0
+    ],
+    "note": "no stage reading yet: (0, 0) mm used"
+   },
+   "cuts": {
+    "cluster_box_px": 3,
+    "tot_light_max": 9,
+    "tot_heavy_min": 13,
+    "tot_ns": 256,
+    "window_ns": [
+     -150,
+     450
+    ],
+    "max_s1": 250
+   },
+   "unplaced_chips": []
+  },
   "roles": {
    "s1": 1,
    "counters": [
@@ -937,6 +1026,95 @@
     "low_for_s": null
    }
   },
+  "xy": {
+   "enabled": true,
+   "off_reason": null,
+   "geometry": "bt2026-v4",
+   "quadrants": [
+    {
+     "chip": 0,
+     "plane": "L1",
+     "quadrant": 0,
+     "where": "beam-left bottom"
+    },
+    {
+     "chip": 1,
+     "plane": "L1",
+     "quadrant": 1,
+     "where": "beam-right bottom"
+    },
+    {
+     "chip": 2,
+     "plane": "L1",
+     "quadrant": 2,
+     "where": "beam-left top"
+    },
+    {
+     "chip": 3,
+     "plane": "L1",
+     "quadrant": 3,
+     "where": "beam-right top"
+    },
+    {
+     "chip": 4,
+     "plane": "L2",
+     "quadrant": 0,
+     "where": "beam-left bottom"
+    },
+    {
+     "chip": 5,
+     "plane": "L2",
+     "quadrant": 1,
+     "where": "beam-right bottom"
+    },
+    {
+     "chip": 6,
+     "plane": "L2",
+     "quadrant": 2,
+     "where": "beam-left top"
+    },
+    {
+     "chip": 7,
+     "plane": "L2",
+     "quadrant": 3,
+     "where": "beam-right top"
+    }
+   ],
+   "resets": 0,
+   "n_s1": 0,
+   "tracks": 0,
+   "fractions": {
+    "track": null,
+    "ambiguous": null,
+    "no_l1": null,
+    "no_l2": null
+   },
+   "light_frac": null,
+   "heavy_frac": null,
+   "stage": {
+    "x_mm": 0.0,
+    "y_mm": 0.0,
+    "source": "none",
+    "applied": true,
+    "shift_mm": [
+     0.0,
+     0.0
+    ],
+    "note": "no stage reading yet: (0, 0) mm used"
+   },
+   "cuts": {
+    "cluster_box_px": 3,
+    "tot_light_max": 9,
+    "tot_heavy_min": 13,
+    "tot_ns": 256,
+    "window_ns": [
+     -150,
+     450
+    ],
+    "max_s1": 250
+   },
+   "unplaced_chips": []
+  },
   "roles": {
    "s1": 1,
    "counters": [
@@ -1413,6 +1591,95 @@
     "hold_s": 30.0,
     "low_for_s": null
    }
+  },
+  "xy": {
+   "enabled": true,
+   "off_reason": null,
+   "geometry": "bt2026-v4",
+   "quadrants": [
+    {
+     "chip": 0,
+     "plane": "L1",
+     "quadrant": 0,
+     "where": "beam-left bottom"
+    },
+    {
+     "chip": 1,
+     "plane": "L1",
+     "quadrant": 1,
+     "where": "beam-right bottom"
+    },
+    {
+     "chip": 2,
+     "plane": "L1",
+     "quadrant": 2,
+     "where": "beam-left top"
+    },
+    {
+     "chip": 3,
+     "plane": "L1",
+     "quadrant": 3,
+     "where": "beam-right top"
+    },
+    {
+     "chip": 4,
+     "plane": "L2",
+     "quadrant": 0,
+     "where": "beam-left bottom"
+    },
+    {
+     "chip": 5,
+     "plane": "L2",
+     "quadrant": 1,
+     "where": "beam-right bottom"
+    },
+    {
+     "chip": 6,
+     "plane": "L2",
+     "quadrant": 2,
+     "where": "beam-left top"
+    },
+    {
+     "chip": 7,
+     "plane": "L2",
+     "quadrant": 3,
+     "where": "beam-right top"
+    }
+   ],
+   "resets": 0,
+   "n_s1": 0,
+   "tracks": 0,
+   "fractions": {
+    "track": null,
+    "ambiguous": null,
+    "no_l1": null,
+    "no_l2": null
+   },
+   "light_frac": null,
+   "heavy_frac": null,
+   "stage": {
+    "x_mm": 0.0,
+    "y_mm": 0.0,
+    "source": "none",
+    "applied": true,
+    "shift_mm": [
+     0.0,
+     0.0
+    ],
+    "note": "no stage reading yet: (0, 0) mm used"
+   },
+   "cuts": {
+    "cluster_box_px": 3,
+    "tot_light_max": 9,
+    "tot_heavy_min": 13,
+    "tot_ns": 256,
+    "window_ns": [
+     -150,
+     450
+    ],
+    "max_s1": 250
+   },
+   "unplaced_chips": []
   },
   "roles": {
    "s1": 1,
@@ -1891,6 +2158,95 @@
     "hold_s": 30.0,
     "low_for_s": null
    }
+  },
+  "xy": {
+   "enabled": true,
+   "off_reason": null,
+   "geometry": "bt2026-v4",
+   "quadrants": [
+    {
+     "chip": 0,
+     "plane": "L1",
+     "quadrant": 0,
+     "where": "beam-left bottom"
+    },
+    {
+     "chip": 1,
+     "plane": "L1",
+     "quadrant": 1,
+     "where": "beam-right bottom"
+    },
+    {
+     "chip": 2,
+     "plane": "L1",
+     "quadrant": 2,
+     "where": "beam-left top"
+    },
+    {
+     "chip": 3,
+     "plane": "L1",
+     "quadrant": 3,
+     "where": "beam-right top"
+    },
+    {
+     "chip": 4,
+     "plane": "L2",
+     "quadrant": 0,
+     "where": "beam-left bottom"
+    },
+    {
+     "chip": 5,
+     "plane": "L2",
+     "quadrant": 1,
+     "where": "beam-right bottom"
+    },
+    {
+     "chip": 6,
+     "plane": "L2",
+     "quadrant": 2,
+     "where": "beam-left top"
+    },
+    {
+     "chip": 7,
+     "plane": "L2",
+     "quadrant": 3,
+     "where": "beam-right top"
+    }
+   ],
+   "resets": 0,
+   "n_s1": 738,
+   "tracks": 453,
+   "fractions": {
+    "track": 0.6138,
+    "ambiguous": 0.2507,
+    "no_l1": 0.09892,
+    "no_l2": 0.03659
+   },
+   "light_frac": 0.4393,
+   "heavy_frac": 0.1501,
+   "stage": {
+    "x_mm": 0.0,
+    "y_mm": 0.0,
+    "source": "none",
+    "applied": true,
+    "shift_mm": [
+     0.0,
+     0.0
+    ],
+    "note": "no stage reading yet: (0, 0) mm used"
+   },
+   "cuts": {
+    "cluster_box_px": 3,
+    "tot_light_max": 9,
+    "tot_heavy_min": 13,
+    "tot_ns": 256,
+    "window_ns": [
+     -150,
+     450
+    ],
+    "max_s1": 250
+   },
+   "unplaced_chips": []
   },
   "roles": {
    "s1": 1,
@@ -2450,6 +2806,95 @@
     "low_for_s": null
    }
   },
+  "xy": {
+   "enabled": true,
+   "off_reason": null,
+   "geometry": "bt2026-v4",
+   "quadrants": [
+    {
+     "chip": 0,
+     "plane": "L1",
+     "quadrant": 0,
+     "where": "beam-left bottom"
+    },
+    {
+     "chip": 1,
+     "plane": "L1",
+     "quadrant": 1,
+     "where": "beam-right bottom"
+    },
+    {
+     "chip": 2,
+     "plane": "L1",
+     "quadrant": 2,
+     "where": "beam-left top"
+    },
+    {
+     "chip": 3,
+     "plane": "L1",
+     "quadrant": 3,
+     "where": "beam-right top"
+    },
+    {
+     "chip": 4,
+     "plane": "L2",
+     "quadrant": 0,
+     "where": "beam-left bottom"
+    },
+    {
+     "chip": 5,
+     "plane": "L2",
+     "quadrant": 1,
+     "where": "beam-right bottom"
+    },
+    {
+     "chip": 6,
+     "plane": "L2",
+     "quadrant": 2,
+     "where": "beam-left top"
+    },
+    {
+     "chip": 7,
+     "plane": "L2",
+     "quadrant": 3,
+     "where": "beam-right top"
+    }
+   ],
+   "resets": 0,
+   "n_s1": 1056,
+   "tracks": 648,
+   "fractions": {
+    "track": 0.6136,
+    "ambiguous": 0.2472,
+    "no_l1": 0.09943,
+    "no_l2": 0.03977
+   },
+   "light_frac": 0.4537,
+   "heavy_frac": 0.1481,
+   "stage": {
+    "x_mm": 0.0,
+    "y_mm": 0.0,
+    "source": "none",
+    "applied": true,
+    "shift_mm": [
+     0.0,
+     0.0
+    ],
+    "note": "no stage reading yet: (0, 0) mm used"
+   },
+   "cuts": {
+    "cluster_box_px": 3,
+    "tot_light_max": 9,
+    "tot_heavy_min": 13,
+    "tot_ns": 256,
+    "window_ns": [
+     -150,
+     450
+    ],
+    "max_s1": 250
+   },
+   "unplaced_chips": []
+  },
   "roles": {
    "s1": 1,
    "counters": [
@@ -2999,6 +3444,95 @@
     "hold_s": 30.0,
     "low_for_s": null
    }
+  },
+  "xy": {
+   "enabled": true,
+   "off_reason": null,
+   "geometry": "bt2026-v4",
+   "quadrants": [
+    {
+     "chip": 0,
+     "plane": "L1",
+     "quadrant": 0,
+     "where": "beam-left bottom"
+    },
+    {
+     "chip": 1,
+     "plane": "L1",
+     "quadrant": 1,
+     "where": "beam-right bottom"
+    },
+    {
+     "chip": 2,
+     "plane": "L1",
+     "quadrant": 2,
+     "where": "beam-left top"
+    },
+    {
+     "chip": 3,
+     "plane": "L1",
+     "quadrant": 3,
+     "where": "beam-right top"
+    },
+    {
+     "chip": 4,
+     "plane": "L2",
+     "quadrant": 0,
+     "where": "beam-left bottom"
+    },
+    {
+     "chip": 5,
+     "plane": "L2",
+     "quadrant": 1,
+     "where": "beam-right bottom"
+    },
+    {
+     "chip": 6,
+     "plane": "L2",
+     "quadrant": 2,
+     "where": "beam-left top"
+    },
+    {
+     "chip": 7,
+     "plane": "L2",
+     "quadrant": 3,
+     "where": "beam-right top"
+    }
+   ],
+   "resets": 0,
+   "n_s1": 852,
+   "tracks": 525,
+   "fractions": {
+    "track": 0.6162,
+    "ambiguous": 0.2441,
+    "no_l1": 0.1009,
+    "no_l2": 0.03873
+   },
+   "light_frac": 0.4438,
+   "heavy_frac": 0.1524,
+   "stage": {
+    "x_mm": 0.0,
+    "y_mm": 0.0,
+    "source": "none",
+    "applied": true,
+    "shift_mm": [
+     0.0,
+     0.0
+    ],
+    "note": "no stage reading yet: (0, 0) mm used"
+   },
+   "cuts": {
+    "cluster_box_px": 3,
+    "tot_light_max": 9,
+    "tot_heavy_min": 13,
+    "tot_ns": 256,
+    "window_ns": [
+     -150,
+     450
+    ],
+    "max_s1": 250
+   },
+   "unplaced_chips": []
   },
   "roles": {
    "s1": 1,
@@ -3584,10 +4118,23 @@
   "sma/mupix_dt_L1",
   "sma/mupix_dt_L2",
   "sma/mupix_hits_chip",
+  "sma/mupix_hits_xy_L1",
+  "sma/mupix_hits_xy_L2",
   "sma/mupix_row_chip",
   "sma/mupix_s1_match",
   "sma/mupix_tot_L1",
   "sma/mupix_tot_L2",
+  "sma/mupix_track_state",
+  "sma/mupix_track_tot",
+  "sma/mupix_track_xxp",
+  "sma/mupix_track_xxp_heavy",
+  "sma/mupix_track_xxp_light",
+  "sma/mupix_track_xy",
+  "sma/mupix_track_xy_heavy",
+  "sma/mupix_track_xy_light",
+  "sma/mupix_track_yyp",
+  "sma/mupix_track_yyp_heavy",
+  "sma/mupix_track_yyp_light",
   "sma/pattern",
   "sma/rate_vs_ch",
   "sma/rf_npulses",
@@ -3639,10 +4186,23 @@
   "sma/mupix_dt_L1": 1,
   "sma/mupix_dt_L2": 1,
   "sma/mupix_hits_chip": 2,
+  "sma/mupix_hits_xy_L1": 2,
+  "sma/mupix_hits_xy_L2": 2,
   "sma/mupix_row_chip": 2,
   "sma/mupix_s1_match": 1,
   "sma/mupix_tot_L1": 1,
   "sma/mupix_tot_L2": 1,
+  "sma/mupix_track_state": 1,
+  "sma/mupix_track_tot": 2,
+  "sma/mupix_track_xxp": 2,
+  "sma/mupix_track_xxp_heavy": 2,
+  "sma/mupix_track_xxp_light": 2,
+  "sma/mupix_track_xy": 2,
+  "sma/mupix_track_xy_heavy": 2,
+  "sma/mupix_track_xy_light": 2,
+  "sma/mupix_track_yyp": 2,
+  "sma/mupix_track_yyp_heavy": 2,
+  "sma/mupix_track_yyp_light": 2,
   "sma/pattern": 1,
   "sma/rate_vs_ch": 2,
   "sma/rf_npulses": 1,
@@ -4125,6 +4685,95 @@
     "hold_s": 30.0,
     "low_for_s": null
    }
+  },
+  "xy": {
+   "enabled": true,
+   "off_reason": null,
+   "geometry": "bt2026-v4",
+   "quadrants": [
+    {
+     "chip": 0,
+     "plane": "L1",
+     "quadrant": 0,
+     "where": "beam-left bottom"
+    },
+    {
+     "chip": 1,
+     "plane": "L1",
+     "quadrant": 1,
+     "where": "beam-right bottom"
+    },
+    {
+     "chip": 2,
+     "plane": "L1",
+     "quadrant": 2,
+     "where": "beam-left top"
+    },
+    {
+     "chip": 3,
+     "plane": "L1",
+     "quadrant": 3,
+     "where": "beam-right top"
+    },
+    {
+     "chip": 4,
+     "plane": "L2",
+     "quadrant": 0,
+     "where": "beam-left bottom"
+    },
+    {
+     "chip": 5,
+     "plane": "L2",
+     "quadrant": 1,
+     "where": "beam-right bottom"
+    },
+    {
+     "chip": 6,
+     "plane": "L2",
+     "quadrant": 2,
+     "where": "beam-left top"
+    },
+    {
+     "chip": 7,
+     "plane": "L2",
+     "quadrant": 3,
+     "where": "beam-right top"
+    }
+   ],
+   "resets": 0,
+   "n_s1": 99,
+   "tracks": 61,
+   "fractions": {
+    "track": 0.6162,
+    "ambiguous": 0.2626,
+    "no_l1": 0.09091,
+    "no_l2": 0.0303
+   },
+   "light_frac": 0.4754,
+   "heavy_frac": 0.1148,
+   "stage": {
+    "x_mm": 0.0,
+    "y_mm": 0.0,
+    "source": "none",
+    "applied": true,
+    "shift_mm": [
+     0.0,
+     0.0
+    ],
+    "note": "no stage reading yet: (0, 0) mm used"
+   },
+   "cuts": {
+    "cluster_box_px": 3,
+    "tot_light_max": 9,
+    "tot_heavy_min": 13,
+    "tot_ns": 256,
+    "window_ns": [
+     -150,
+     450
+    ],
+    "max_s1": 250
+   },
+   "unplaced_chips": []
   },
   "roles": {
    "s1": 1,
@@ -4617,6 +5266,95 @@
     "low_for_s": null
    }
   },
+  "xy": {
+   "enabled": true,
+   "off_reason": null,
+   "geometry": "bt2026-v4",
+   "quadrants": [
+    {
+     "chip": 0,
+     "plane": "L1",
+     "quadrant": 0,
+     "where": "beam-left bottom"
+    },
+    {
+     "chip": 1,
+     "plane": "L1",
+     "quadrant": 1,
+     "where": "beam-right bottom"
+    },
+    {
+     "chip": 2,
+     "plane": "L1",
+     "quadrant": 2,
+     "where": "beam-left top"
+    },
+    {
+     "chip": 3,
+     "plane": "L1",
+     "quadrant": 3,
+     "where": "beam-right top"
+    },
+    {
+     "chip": 4,
+     "plane": "L2",
+     "quadrant": 0,
+     "where": "beam-left bottom"
+    },
+    {
+     "chip": 5,
+     "plane": "L2",
+     "quadrant": 1,
+     "where": "beam-right bottom"
+    },
+    {
+     "chip": 6,
+     "plane": "L2",
+     "quadrant": 2,
+     "where": "beam-left top"
+    },
+    {
+     "chip": 7,
+     "plane": "L2",
+     "quadrant": 3,
+     "where": "beam-right top"
+    }
+   ],
+   "resets": 0,
+   "n_s1": 750,
+   "tracks": 624,
+   "fractions": {
+    "track": 0.832,
+    "ambiguous": 0.096,
+    "no_l1": 0.052,
+    "no_l2": 0.02
+   },
+   "light_frac": 0.3702,
+   "heavy_frac": 0.01923,
+   "stage": {
+    "x_mm": 0.0,
+    "y_mm": 0.0,
+    "source": "none",
+    "applied": true,
+    "shift_mm": [
+     0.0,
+     0.0
+    ],
+    "note": "no stage reading yet: (0, 0) mm used"
+   },
+   "cuts": {
+    "cluster_box_px": 3,
+    "tot_light_max": 9,
+    "tot_heavy_min": 13,
+    "tot_ns": 256,
+    "window_ns": [
+     -150,
+     450
+    ],
+    "max_s1": 250
+   },
+   "unplaced_chips": []
+  },
   "roles": {
    "s1": 1,
    "counters": [
@@ -5106,6 +5844,95 @@
     "hold_s": 30.0,
     "low_for_s": null
    }
+  },
+  "xy": {
+   "enabled": true,
+   "off_reason": null,
+   "geometry": "bt2026-v4",
+   "quadrants": [
+    {
+     "chip": 0,
+     "plane": "L1",
+     "quadrant": 0,
+     "where": "beam-left bottom"
+    },
+    {
+     "chip": 1,
+     "plane": "L1",
+     "quadrant": 1,
+     "where": "beam-right bottom"
+    },
+    {
+     "chip": 2,
+     "plane": "L1",
+     "quadrant": 2,
+     "where": "beam-left top"
+    },
+    {
+     "chip": 3,
+     "plane": "L1",
+     "quadrant": 3,
+     "where": "beam-right top"
+    },
+    {
+     "chip": 4,
+     "plane": "L2",
+     "quadrant": 0,
+     "where": "beam-left bottom"
+    },
+    {
+     "chip": 5,
+     "plane": "L2",
+     "quadrant": 1,
+     "where": "beam-right bottom"
+    },
+    {
+     "chip": 6,
+     "plane": "L2",
+     "quadrant": 2,
+     "where": "beam-left top"
+    },
+    {
+     "chip": 7,
+     "plane": "L2",
+     "quadrant": 3,
+     "where": "beam-right top"
+    }
+   ],
+   "resets": 0,
+   "n_s1": 1056,
+   "tracks": 648,
+   "fractions": {
+    "track": 0.6136,
+    "ambiguous": 0.2472,
+    "no_l1": 0.09943,
+    "no_l2": 0.03977
+   },
+   "light_frac": 0.4537,
+   "heavy_frac": 0.1481,
+   "stage": {
+    "x_mm": 0.0,
+    "y_mm": 0.0,
+    "source": "none",
+    "applied": true,
+    "shift_mm": [
+     0.0,
+     0.0
+    ],
+    "note": "no stage reading yet: (0, 0) mm used"
+   },
+   "cuts": {
+    "cluster_box_px": 3,
+    "tot_light_max": 9,
+    "tot_heavy_min": 13,
+    "tot_ns": 256,
+    "window_ns": [
+     -150,
+     450
+    ],
+    "max_s1": 250
+   },
+   "unplaced_chips": []
   },
   "roles": {
    "s1": 1,
@@ -5835,6 +6662,95 @@
     "low_for_s": null
    }
   },
+  "xy": {
+   "enabled": true,
+   "off_reason": null,
+   "geometry": "bt2026-v4",
+   "quadrants": [
+    {
+     "chip": 0,
+     "plane": "L1",
+     "quadrant": 0,
+     "where": "beam-left bottom"
+    },
+    {
+     "chip": 1,
+     "plane": "L1",
+     "quadrant": 1,
+     "where": "beam-right bottom"
+    },
+    {
+     "chip": 2,
+     "plane": "L1",
+     "quadrant": 2,
+     "where": "beam-left top"
+    },
+    {
+     "chip": 3,
+     "plane": "L1",
+     "quadrant": 3,
+     "where": "beam-right top"
+    },
+    {
+     "chip": 4,
+     "plane": "L2",
+     "quadrant": 0,
+     "where": "beam-left bottom"
+    },
+    {
+     "chip": 5,
+     "plane": "L2",
+     "quadrant": 1,
+     "where": "beam-right bottom"
+    },
+    {
+     "chip": 6,
+     "plane": "L2",
+     "quadrant": 2,
+     "where": "beam-left top"
+    },
+    {
+     "chip": 7,
+     "plane": "L2",
+     "quadrant": 3,
+     "where": "beam-right top"
+    }
+   ],
+   "resets": 0,
+   "n_s1": 1056,
+   "tracks": 648,
+   "fractions": {
+    "track": 0.6136,
+    "ambiguous": 0.2472,
+    "no_l1": 0.09943,
+    "no_l2": 0.03977
+   },
+   "light_frac": 0.4537,
+   "heavy_frac": 0.1481,
+   "stage": {
+    "x_mm": 0.0,
+    "y_mm": 0.0,
+    "source": "none",
+    "applied": true,
+    "shift_mm": [
+     0.0,
+     0.0
+    ],
+    "note": "no stage reading yet: (0, 0) mm used"
+   },
+   "cuts": {
+    "cluster_box_px": 3,
+    "tot_light_max": 9,
+    "tot_heavy_min": 13,
+    "tot_ns": 256,
+    "window_ns": [
+     -150,
+     450
+    ],
+    "max_s1": 250
+   },
+   "unplaced_chips": []
+  },
   "roles": {
    "s1": 1,
    "counters": [
@@ -6305,6 +7221,95 @@
     "low_for_s": 3.4
    }
   },
+  "xy": {
+   "enabled": true,
+   "off_reason": null,
+   "geometry": "bt2026-v4",
+   "quadrants": [
+    {
+     "chip": 0,
+     "plane": "L1",
+     "quadrant": 0,
+     "where": "beam-left bottom"
+    },
+    {
+     "chip": 1,
+     "plane": "L1",
+     "quadrant": 1,
+     "where": "beam-right bottom"
+    },
+    {
+     "chip": 2,
+     "plane": "L1",
+     "quadrant": 2,
+     "where": "beam-left top"
+    },
+    {
+     "chip": 3,
+     "plane": "L1",
+     "quadrant": 3,
+     "where": "beam-right top"
+    },
+    {
+     "chip": 4,
+     "plane": "L2",
+     "quadrant": 0,
+     "where": "beam-left bottom"
+    },
+    {
+     "chip": 5,
+     "plane": "L2",
+     "quadrant": 1,
+     "where": "beam-right bottom"
+    },
+    {
+     "chip": 6,
+     "plane": "L2",
+     "quadrant": 2,
+     "where": "beam-left top"
+    },
+    {
+     "chip": 7,
+     "plane": "L2",
+     "quadrant": 3,
+     "where": "beam-right top"
+    }
+   ],
+   "resets": 0,
+   "n_s1": 0,
+   "tracks": 0,
+   "fractions": {
+    "track": null,
+    "ambiguous": null,
+    "no_l1": null,
+    "no_l2": null
+   },
+   "light_frac": null,
+   "heavy_frac": null,
+   "stage": {
+    "x_mm": 0.0,
+    "y_mm": 0.0,
+    "source": "none",
+    "applied": true,
+    "shift_mm": [
+     0.0,
+     0.0
+    ],
+    "note": "no stage reading yet: (0, 0) mm used"
+   },
+   "cuts": {
+    "cluster_box_px": 3,
+    "tot_light_max": 9,
+    "tot_heavy_min": 13,
+    "tot_ns": 256,
+    "window_ns": [
+     -150,
+     450
+    ],
+    "max_s1": 250
+   },
+   "unplaced_chips": []
+  },
   "roles": {
    "s1": 1,
    "counters": [
@@ -6749,10 +7754,23 @@
   "sma/mupix_dt_L1",
   "sma/mupix_dt_L2",
   "sma/mupix_hits_chip",
+  "sma/mupix_hits_xy_L1",
+  "sma/mupix_hits_xy_L2",
   "sma/mupix_row_chip",
   "sma/mupix_s1_match",
   "sma/mupix_tot_L1",
   "sma/mupix_tot_L2",
+  "sma/mupix_track_state",
+  "sma/mupix_track_tot",
+  "sma/mupix_track_xxp",
+  "sma/mupix_track_xxp_heavy",
+  "sma/mupix_track_xxp_light",
+  "sma/mupix_track_xy",
+  "sma/mupix_track_xy_heavy",
+  "sma/mupix_track_xy_light",
+  "sma/mupix_track_yyp",
+  "sma/mupix_track_yyp_heavy",
+  "sma/mupix_track_yyp_light",
   "sma/nim_candidates_S1",
   "sma/nim_candidates_S2",
   "sma/nim_candidates_S3",
@@ -6837,10 +7855,23 @@
   "sma/mupix_dt_L1": 1,
   "sma/mupix_dt_L2": 1,
   "sma/mupix_hits_chip": 2,
+  "sma/mupix_hits_xy_L1": 2,
+  "sma/mupix_hits_xy_L2": 2,
   "sma/mupix_row_chip": 2,
   "sma/mupix_s1_match": 1,
   "sma/mupix_tot_L1": 1,
   "sma/mupix_tot_L2": 1,
+  "sma/mupix_track_state": 1,
+  "sma/mupix_track_tot": 2,
+  "sma/mupix_track_xxp": 2,
+  "sma/mupix_track_xxp_heavy": 2,
+  "sma/mupix_track_xxp_light": 2,
+  "sma/mupix_track_xy": 2,
+  "sma/mupix_track_xy_heavy": 2,
+  "sma/mupix_track_xy_light": 2,
+  "sma/mupix_track_yyp": 2,
+  "sma/mupix_track_yyp_heavy": 2,
+  "sma/mupix_track_yyp_light": 2,
   "sma/nim_candidates_S1": 1,
   "sma/nim_candidates_S2": 1,
   "sma/nim_candidates_S3": 1,
@@ -7350,6 +8381,95 @@
     "absent": true,
     "low_for_s": 3.4
    }
+  },
+  "xy": {
+   "enabled": true,
+   "off_reason": null,
+   "geometry": "bt2026-v4",
+   "quadrants": [
+    {
+     "chip": 0,
+     "plane": "L1",
+     "quadrant": 0,
+     "where": "beam-left bottom"
+    },
+    {
+     "chip": 1,
+     "plane": "L1",
+     "quadrant": 1,
+     "where": "beam-right bottom"
+    },
+    {
+     "chip": 2,
+     "plane": "L1",
+     "quadrant": 2,
+     "where": "beam-left top"
+    },
+    {
+     "chip": 3,
+     "plane": "L1",
+     "quadrant": 3,
+     "where": "beam-right top"
+    },
+    {
+     "chip": 4,
+     "plane": "L2",
+     "quadrant": 0,
+     "where": "beam-left bottom"
+    },
+    {
+     "chip": 5,
+     "plane": "L2",
+     "quadrant": 1,
+     "where": "beam-right bottom"
+    },
+    {
+     "chip": 6,
+     "plane": "L2",
+     "quadrant": 2,
+     "where": "beam-left top"
+    },
+    {
+     "chip": 7,
+     "plane": "L2",
+     "quadrant": 3,
+     "where": "beam-right top"
+    }
+   ],
+   "resets": 0,
+   "n_s1": 0,
+   "tracks": 0,
+   "fractions": {
+    "track": null,
+    "ambiguous": null,
+    "no_l1": null,
+    "no_l2": null
+   },
+   "light_frac": null,
+   "heavy_frac": null,
+   "stage": {
+    "x_mm": 0.0,
+    "y_mm": 0.0,
+    "source": "none",
+    "applied": true,
+    "shift_mm": [
+     0.0,
+     0.0
+    ],
+    "note": "no stage reading yet: (0, 0) mm used"
+   },
+   "cuts": {
+    "cluster_box_px": 3,
+    "tot_light_max": 9,
+    "tot_heavy_min": 13,
+    "tot_ns": 256,
+    "window_ns": [
+     -150,
+     450
+    ],
+    "max_s1": 250
+   },
+   "unplaced_chips": []
   },
   "roles": {
    "s1": 1,
@@ -8077,6 +9197,95 @@
     "hold_s": 3.0,
     "low_for_s": 7.4
    }
+  },
+  "xy": {
+   "enabled": true,
+   "off_reason": null,
+   "geometry": "bt2026-v4",
+   "quadrants": [
+    {
+     "chip": 0,
+     "plane": "L1",
+     "quadrant": 0,
+     "where": "beam-left bottom"
+    },
+    {
+     "chip": 1,
+     "plane": "L1",
+     "quadrant": 1,
+     "where": "beam-right bottom"
+    },
+    {
+     "chip": 2,
+     "plane": "L1",
+     "quadrant": 2,
+     "where": "beam-left top"
+    },
+    {
+     "chip": 3,
+     "plane": "L1",
+     "quadrant": 3,
+     "where": "beam-right top"
+    },
+    {
+     "chip": 4,
+     "plane": "L2",
+     "quadrant": 0,
+     "where": "beam-left bottom"
+    },
+    {
+     "chip": 5,
+     "plane": "L2",
+     "quadrant": 1,
+     "where": "beam-right bottom"
+    },
+    {
+     "chip": 6,
+     "plane": "L2",
+     "quadrant": 2,
+     "where": "beam-left top"
+    },
+    {
+     "chip": 7,
+     "plane": "L2",
+     "quadrant": 3,
+     "where": "beam-right top"
+    }
+   ],
+   "resets": 0,
+   "n_s1": 2824,
+   "tracks": 0,
+   "fractions": {
+    "track": 0.0,
+    "ambiguous": 0.002833,
+    "no_l1": 0.9972,
+    "no_l2": 0.0
+   },
+   "light_frac": null,
+   "heavy_frac": null,
+   "stage": {
+    "x_mm": 0.0,
+    "y_mm": 0.0,
+    "source": "none",
+    "applied": true,
+    "shift_mm": [
+     0.0,
+     0.0
+    ],
+    "note": "no stage reading yet: (0, 0) mm used"
+   },
+   "cuts": {
+    "cluster_box_px": 3,
+    "tot_light_max": 9,
+    "tot_heavy_min": 13,
+    "tot_ns": 256,
+    "window_ns": [
+     1000,
+     1600
+    ],
+    "max_s1": 250
+   },
+   "unplaced_chips": []
   },
   "roles": {
    "s1": 1,
