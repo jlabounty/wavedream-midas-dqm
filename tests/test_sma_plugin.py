@@ -12,6 +12,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+from sma_layouts import OLD_LAYOUT, OLD_ROLES, old_layout  # noqa: F401 (re-exported)
 
 from mdqm.dqm import analyzer as A
 from mdqm.dqm import framing
@@ -64,7 +65,8 @@ EXPECTED_CLASS = ["stale", "stale", "good", "good", "good", "good"]
 
 
 def _plugin(settings=None, clock=None):
-    return P.SmaPlugin(HistStore(), settings=settings, clock=clock or _Clock())
+    """A plugin cabled as the test frames are (OLD_LAYOUT), `settings` on top."""
+    return P.SmaPlugin(HistStore(), settings=old_layout(settings), clock=clock or _Clock())
 
 
 def _feed(p, words, serial=0, run=682):
@@ -506,7 +508,9 @@ def test_the_plugin_is_built_by_the_analyzer_with_its_own_tree():
     assert isinstance(a.plugin, P.SmaPlugin)
     assert a.settings_root == "/DQM/SMA"
     assert c.tree["/DQM/SMA/Coarse shift"] == 14
-    assert c.tree["/DQM/SMA/Channel roles/counters"] == [1, 2, 3, 4, 5]
+    assert c.tree["/DQM/SMA/Channel roles/counters"] == [1, 2, 7, 4, 5]
+    assert c.tree["/DQM/SMA/Channel roles/current"] == -1
+    assert c.tree["/DQM/SMA/Channel roles/delayed"] == [-1], "an ODB array cannot be empty"
     assert c.tree["/DQM/SMA/Sampling/CPU budget %"] == 20.0
     assert "/DQM/SMA/Sampling/process all" not in c.tree, "the budget replaced it"
     assert c.tree["/DQM/SMA/Cuts/max S1 per frame"] == 2000
@@ -571,7 +575,7 @@ def test_garbage_in_the_odb_falls_back_and_is_reported():
     assert p.cfg.shift == 14
     assert p.cfg.cuts.n_seeds == W.N_SEEDS
     assert p.cfg.roles.rf == 6
-    assert p.cfg.roles.counters == (1, 2, 3, 4, 5)
+    assert p.cfg.roles.counters == (1, 2, 7, 4, 5), "the default, not the old layout"
     assert len(p.cfg.errors) == 4
     assert p.status()["settings_errors"] == p.cfg.errors
     assert any(f["code"] == "settings" for f in p.summary()["flags"])
@@ -581,6 +585,132 @@ def test_a_single_element_array_from_midas_is_still_a_list():
     p = _plugin({"Channel roles": {"delayed": 9, "labels": "only"}})
     assert p.cfg.roles.delayed == (9,)
     assert p.labels()[0] == "only"
+
+
+# --- the default roles: the run-1015 cabling ------------------------------------------------
+
+def synth_1015(t0_ns, n=300, spacing_ns=3000, shift=14, seed=1):
+    """Words of a healthy frame cabled as since run 1015.
+
+    S1 on ch 1, S2 2, S3 (TOT) 7, S4 4, S5 5 a few ns apart, each NIM copy
+    (S1L 3, S2L-S5L 9-12) 1 ns after its counter, two RF pulses on ch 6, the
+    WD trigger copy on ch 8. No proton current.
+    """
+    rng = np.random.default_rng(seed)
+    t1 = t0_ns + np.arange(n, dtype=np.int64) * spacing_ns + rng.integers(0, 500, n)
+    ts, chs = [], []
+    for k, (tot, nim) in enumerate(((1, 3), (2, 9), (7, 10), (4, 11), (5, 12))):
+        for c, d in ((tot, k), (nim, k + 1)):
+            ts.append(t1 + d)
+            chs.append(np.full(n, c))
+    for c, d in ((6, 40), (6, 60), (8, 100)):
+        ts.append(t1 + d)
+        chs.append(np.full(n, c))
+    t, ch = np.concatenate(ts), np.concatenate(chs)
+    o = np.argsort(t, kind="stable")
+    coarse, fine = W.fields_of(t[o], shift)
+    return W.encode(ch[o], np.full(t.size, 20), coarse, fine)
+
+
+def test_the_defaults_are_the_1015_cabling():
+    cfg = P.parse_settings(None)
+    assert cfg.errors == []
+    r = cfg.roles
+    assert (r.s1, r.counters, r.rf, r.current, r.delayed) == (1, (1, 2, 7, 4, 5), 6, -1, ())
+    assert r.counters[0] == r.s1, "pattern bit 0 is S1"
+    assert cfg.flag_channels == (1, 2, 4, 5, 6, 7)
+    assert cfg.role_channels() == {1, 2, 3, 4, 5, 6, 7, 9, 10, 11, 12}, \
+        "-1 is no channel; the NIM copies have a role"
+    assert cfg.nim.channels == (3, 9, 10, 11, 12) and not cfg.merging, \
+        "merge off until the NIM offsets are measured"
+    assert cfg.nim.echo == (False, False, True, False, False), "the echo rule on S3"
+    assert W.Roles() == r, "the dataclass and the ODB defaults agree"
+
+
+def test_every_default_list_can_be_an_odb_array():
+    """MIDAS cannot create a zero-length array (odb_set raises): the seed would fail."""
+    def leaves(tree):
+        for v in tree.values():
+            yield from (leaves(v) if isinstance(v, dict) else [v])
+    assert all(len(v) for v in leaves(P.SETTINGS_DEFAULTS) if isinstance(v, list))
+
+
+def test_no_current_channel_parses_and_has_no_label():
+    p = P.SmaPlugin(HistStore(), settings={"Channel roles": {"current": -1}})
+    assert p.cfg.errors == [] and p.cfg.roles.current == -1
+    assert -1 not in p.cfg.role_channels()
+    assert "current" not in p.labels()
+    assert p.labels()[15] == "ch15", "the last channel keeps its name"
+    assert all(p._role_of(c) != "current" for c in range(16))
+    assert p._role_of(-1) == ""
+    q = P.SmaPlugin(HistStore(), settings={"Channel roles": {"current": 13}})
+    assert q.labels()[13] == "current" and q._role_of(13) == "current"
+    assert 13 in q.cfg.role_channels()
+
+
+@pytest.mark.parametrize("value", [99, -2, "x"])
+def test_a_bad_current_channel_is_a_settings_error(value):
+    p = P.SmaPlugin(HistStore(), settings={"Channel roles": {"current": value}})
+    assert p.cfg.roles.current == -1, "the default"
+    assert len(p.cfg.errors) == 1 and p.cfg.errors[0].startswith("Channel roles/current=")
+    assert any(f["code"] == "settings" for f in p.summary()["flags"])
+
+
+def test_more_than_eight_counters_is_a_settings_error():
+    """The coincidence pattern is one byte per seed."""
+    p = P.SmaPlugin(HistStore(), settings={"Channel roles": {"counters": list(range(1, 10))}})
+    assert p.cfg.roles.counters == (1, 2, 7, 4, 5)
+    assert [e for e in p.cfg.errors if e.startswith("Channel roles/counters=")]
+    ok = P.SmaPlugin(HistStore(), settings={"Channel roles": {"counters": list(range(1, 9))},
+                                            "NIM": {"channels": [-1]}})
+    assert ok.cfg.errors == [] and len(ok.cfg.roles.counters) == W.MAX_COUNTERS
+
+
+@pytest.mark.parametrize("delayed", [[], [-1], -1, [-1, -1]])
+def test_no_delayed_channel_works_end_to_end(delayed):
+    p = P.SmaPlugin(HistStore(), settings={"Channel roles": {"delayed": delayed}})
+    assert p.cfg.errors == [] and p.cfg.roles.delayed == ()
+    assert not [n for n in p.store.names() if "delayed" in n]
+    fr = _feed(p, synth_1015(10**12))
+    assert fr.cls == "good"
+    s = p.summary(True)
+    assert not [c for c in s["channels"] if c["role"] == "delayed"]
+    for view in ("seeded", "raster"):
+        assert p.frame_blob(view) is not None
+    # A delayed channel among others: -1 entries are dropped.
+    q = P.SmaPlugin(HistStore(), settings={"Channel roles": {"delayed": [-1, 8]}})
+    assert q.cfg.errors == [] and q.cfg.roles.delayed == (8,)
+    assert "sma/delayed_dt_ch08" in q.store
+
+
+def test_a_1015_frame_with_the_default_roles():
+    p = P.SmaPlugin(HistStore(), clock=_Clock())
+    fr = _feed(p, synth_1015(10**12))
+    assert fr.cls == "good"
+    h = _h(p, "pattern")
+    assert h.counts[1 + 0b11111] == h.entries > 0, "every S1 with S1..S5, S3 on ch 7"
+    labels = p.labels()
+    assert [labels[c] for c in (1, 2, 7, 4, 5, 6)] == ["S1", "S2", "S3", "S4", "S5", "RF"]
+    assert [labels[c] for c in (3, 9, 10, 11, 12)] == ["S1L", "S2L", "S3L", "S4L", "S5L"]
+    assert labels[8] == "ch08", "no role for the WD trigger copy"
+    s = p.summary(True)
+    assert [e["counter"] for e in s["efficiency"]] == ["S2", "S3", "S4", "S5"]
+    assert all(e["eff"] == 1.0 for e in s["efficiency"])
+    assert [c["ch"] for c in s["channels"] if c["flagged"]] == [1, 2, 4, 5, 6, 7]
+    # A page asking to drop "no channel" (-1) gets the whole raster.
+    d = framing.decode_sma_frame(p.frame_blob("raster", drop=[-1]))
+    assert d["meta"]["dropped"] == [] and d["n_hits"] == fr.fr.s_ch.size
+    assert framing.decode_sma_frame(p.frame_blob("raster", drop=[7]))["meta"]["dropped"] == [7]
+
+
+def test_the_stale_rule_counts_channel_15_as_junk_without_a_current():
+    """-1 must not index the last channel: with "no current" ch 15 still has no role."""
+    t = 10**12 + np.arange(500, dtype=np.int64) * 1000
+    c, f = W.fields_of(t, 14)
+    junk = W.encode(np.full(t.size, 15), np.full(t.size, 20), c, f)
+    p = P.SmaPlugin(HistStore(), clock=_Clock())
+    fr = _feed(p, junk)
+    assert fr.cls == "stale" and "no role" in fr.reason
 
 
 # --- summary and trend ------------------------------------------------------------------------

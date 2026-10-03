@@ -8,13 +8,16 @@ over one subrun file and gets the same numbers the pages would have shown::
     mdqm-sma-file run00682_00005.mid.lz4 --shift 3 --out /tmp/682-5
     mdqm-sma-file FILE --settings '{"Cuts": {"coinc window ns": 30}}' --no-png
     mdqm-sma-file FILE --settings my-sma-settings.json --frames 50 --skip 10
+    mdqm-sma-file FILE --merge         # counters = merged TOT + NIM hits (NIM/merge = y)
+    mdqm-sma-file FILE --no-merge      # TOT words only, even if --settings merges
 
 What it does
 ------------
 The plugin is built with the daemon's defaults (``SETTINGS_DEFAULTS``, what a
 fresh ``/DQM/SMA`` holds), overridden by ``--settings`` (inline JSON or a JSON
 file, same tree as ``/DQM/SMA``; unknown keys are an error) and then
-``--shift``, and applied with ``apply_settings(settings, rebuild=True)`` as the
+``--shift`` and ``--merge`` / ``--no-merge``, and applied with ``apply_settings(settings,
+rebuild=True)`` as the
 analyzer does on its first ODB read. Every readout event (id 301, bank H000)
 is fed to ``process(event, run_number)``, as the daemon does with
 ``Sampling/process all`` on (the default); the file's own run number (the
@@ -40,6 +43,7 @@ Outputs (``--out``, default ``./sma-file-<run>_<subrun>/``)
                    envelope).
 ``trend.json``     exactly what ``sma::trend`` returns (1 s rows).
 ``summary.png``    one page (unless ``--no-png``; needs matplotlib).
+``nim.png``        the TOT + NIM page, when a counter has a NIM copy (same condition).
 
 A short text summary goes to stdout.
 
@@ -109,11 +113,15 @@ def load_settings_arg(arg: str | None) -> dict:
     return obj
 
 
-def build_settings(overrides: dict | None = None, shift: int | None = None) -> dict:
-    """The full ``/DQM/SMA`` tree the daemon would read from a fresh ODB, overridden."""
+def build_settings(overrides: dict | None = None, shift: int | None = None,
+                   merge: bool | None = None) -> dict:
+    """The full ``/DQM/SMA`` tree the daemon would read from a fresh ODB, overridden;
+    ``merge`` sets ``NIM/merge`` (``--merge`` / ``--no-merge``)."""
     s = merge_strict(P.SETTINGS_DEFAULTS, overrides or {})
     if shift is not None:
         s["Coarse shift"] = int(shift)
+    if merge is not None:
+        s["NIM"]["merge"] = bool(merge)
     return s
 
 
@@ -281,6 +289,30 @@ def mupix_line(mp: dict) -> str:
             + f"; time sync {mp.get('sync', {}).get('state', '?')}")
 
 
+def nim_lines(summary: dict) -> list[str]:
+    """The TOT + NIM lines: merge state, then per counter pair efficiency, purity,
+    NIM-only share, median NIM - TOT, the lag votes and the lag state now."""
+    nim = summary.get("nim") or {}
+    rows = nim.get("counters") or []
+    if not rows:
+        return []
+    held = summary.get("nim_lag_held") or []
+    out = [f"TOT + NIM: merge {'on' if summary.get('nim_merge') else 'off'}"
+           + (f", NIM-only hits held back (lag) on ch {', '.join(map(str, held))}" if held
+              else "")]
+    for r in rows:
+        lg = r["lag"]
+        med = r["median_dt_ns"]
+        name = r["label"] if r["label"] == r["counter"] else f"{r['counter']} {r['label']}"
+        out.append(f"  {name} + {r['nim_label']} (ch {r['ch']}+{r['nim_ch']}): "
+                   f"pair eff {_frac(r['pair_eff'])}, purity {_frac(r['purity'])}, NIM-only "
+                   f"{_frac(r['nim_only_frac'])} of hits, median NIM - TOT "
+                   f"{'-' if med is None else f'{med:g} ns'}; lag ok {lg['ok']}, faulted "
+                   f"{lg['faulted']}, ambiguous {lg['ambiguous']}, none {lg['none']}, not "
+                   f"voted {lg.get('skipped', 0)}, state {lg.get('state') or '-'}")
+    return out
+
+
 def text_summary(summary: dict, stats: FeedStats, file_label: str, elapsed_s: float) -> str:
     f = summary["frames"]
     sh = summary["shift"]
@@ -318,6 +350,7 @@ def text_summary(summary: dict, stats: FeedStats, file_label: str, elapsed_s: fl
     mp = summary.get("mupix")
     if mp:
         lines.append(mupix_line(mp))
+    lines += nim_lines(summary)
     flags = summary["flags"]
     if flags:
         lines.append(f"flags ({len(flags)}):")
@@ -504,6 +537,77 @@ def summary_figure(summary: dict, store: HistStore, title: str):
     return fig
 
 
+def nim_figure(summary: dict, store: HistStore, title: str):
+    """The TOT + NIM page: NIM - TOT (near and wide), hit classes and the lag
+    votes' input, per counter with a NIM copy; None when there is none."""
+    rows = (summary.get("nim") or {}).get("counters") or []
+    if not rows:
+        return None
+    from matplotlib.backends.backend_agg import FigureCanvasAgg
+    from matplotlib.figure import Figure
+
+    text = [ln for line in nim_lines(summary)
+            for ln in (textwrap.wrap(line, width=125, subsequent_indent="    ") or [""])]
+    line_in = TEXT_PT * 1.2 / 72
+    plots_in, gap_in, top_in, bottom_in = 7.0, 0.8, 0.75, 0.3
+    text_in = (len(text) + 1.5) * line_in
+    height = top_in + plots_in + gap_in + text_in + bottom_in
+    fig = Figure(figsize=(11, height), dpi=100)
+    FigureCanvasAgg(fig)
+    gs = fig.add_gridspec(2, 2, hspace=0.45, wspace=0.25, left=0.08, right=0.97,
+                          top=1 - top_in / height,
+                          bottom=(bottom_in + text_in + gap_in) / height)
+    fig.suptitle(title + "  -  TOT + NIM", fontsize=13)
+
+    def get(name):
+        return store.get(f"sma/{name}")
+
+    def overlay(ax, stem, xlabel, ylabel, ttl, xlim=None):
+        drawn = False
+        for k, r in enumerate(rows):
+            h = get(f"{stem}_{r['counter']}")
+            if h is None or not h.counts[1:-1].sum():
+                continue
+            _step(ax, h, label=f"{r['nim_label']} - {r['label']}", color=COLORS[k % len(COLORS)])
+            drawn = True
+        if drawn:
+            ax.set_yscale("log")
+            ax.legend(fontsize=8, loc="upper right")
+        if xlim is not None:
+            ax.set_xlim(*xlim)
+        ax.set_xlabel(xlabel)
+        ax.set_ylabel(ylabel)
+        ax.set_title(ttl, fontsize=10)
+
+    overlay(fig.add_subplot(gs[0, 0]), "nim_dt", "t'_NIM - t'_TOT (ns)", "NIM words",
+            "NIM minus the nearest TOT word (after the offsets)", (-60, 60))
+    overlay(fig.add_subplot(gs[1, 0]), "nim_dt_wide", "t_NIM - t_TOT (ns)", "pairs",
+            "NIM minus TOT within +-2^19 ns (a lag fault shows off 0)")
+    overlay(fig.add_subplot(gs[1, 1]), "nim_lag", "(fine - fine(S1)) mod 2^20 (ns)", "NIM words",
+            "Lag vote input: NIM fine minus S1 fine")
+
+    # Hit classes, as shares of each counter's hits.
+    ax = fig.add_subplot(gs[0, 1])
+    names = ("paired", "tot_only", "nim_only", "echo")
+    xs = np.arange(len(rows))
+    width = 0.8 / len(names)
+    for j, name in enumerate(names):
+        tot = np.array([max(1, sum(r[x] for x in names)) for r in rows], dtype=np.float64)
+        ax.bar(xs + (j - 1.5) * width, [r[name] for r in rows] / tot, width,
+               label=name.replace("_", "-"), color=COLORS[j])
+    ax.set_xticks(xs, [r["counter"] for r in rows])
+    ax.set_ylim(0, 1.05)
+    ax.set_ylabel("share of hits")
+    ax.legend(fontsize=8, loc="upper right", ncol=2)
+    ax.set_title("Hits by class (merged counter hits)", fontsize=10)
+
+    y0 = (bottom_in + text_in) / height
+    fig.text(0.08, y0, "Pairing per counter", va="top", ha="left", fontsize=10, weight="bold")
+    fig.text(0.08, y0 - 1.5 * line_in / height, "\n".join(text), va="top", ha="left",
+             fontsize=TEXT_PT, family="monospace")
+    return fig
+
+
 # ---------------------------------------------------------------------------
 # main
 # ---------------------------------------------------------------------------
@@ -528,7 +632,14 @@ def _parser() -> argparse.ArgumentParser:
     ap.add_argument("--settings", default=None,
                     help="settings over the defaults: inline JSON or a JSON file, same "
                          "tree as /DQM/SMA, e.g. '{\"Cuts\": {\"coinc window ns\": 30}}'")
-    ap.add_argument("--no-png", action="store_true", help="skip summary.png")
+    ap.add_argument("--no-png", action="store_true", help="skip summary.png and nim.png")
+    mg = ap.add_mutually_exclusive_group()
+    mg.add_argument("--merge", action="store_true",
+                    help="counters are the merged TOT + NIM hits (NIM/merge = y; the default "
+                         "is n until the NIM offsets are measured)")
+    mg.add_argument("--no-merge", action="store_true",
+                    help="counters are the TOT words alone (NIM/merge = n, the default); the "
+                         "NIM pairing is still measured")
     ap.add_argument("--quiet", action="store_true", help="no stdout summary")
     g = ap.add_argument_group(
         "find one event (the tag copied from SMAEvents: run + serial)",
@@ -691,7 +802,8 @@ def main(argv=None) -> int:
         print(f"mdqm-sma-file: --shift must be 0..{W.MAX_COARSE_SHIFT}", file=sys.stderr)
         return EXIT_USAGE
     try:
-        settings = build_settings(load_settings_arg(args.settings), args.shift)
+        settings = build_settings(load_settings_arg(args.settings), args.shift,
+                                  True if args.merge else False if args.no_merge else None)
     except (OSError, ValueError, KeyError) as exc:
         print(f"mdqm-sma-file: bad --settings: {exc}", file=sys.stderr)
         return EXIT_USAGE
@@ -742,6 +854,9 @@ def main(argv=None) -> int:
             fig = summary_figure(summary, plugin.store, title)
             png = out / "summary.png"
             fig.savefig(png)
+            nfig = nim_figure(summary, plugin.store, title)
+            if nfig is not None:
+                nfig.savefig(out / "nim.png")
         except ImportError:
             print("mdqm-sma-file: matplotlib not installed, no summary.png "
                   "(pip install 'mdqm[offline]', or pass --no-png)", file=sys.stderr)
@@ -753,7 +868,8 @@ def main(argv=None) -> int:
         if stats.frames_fed == 0:
             print("warning: no SMA readout frames (event 301) were processed")
         print(f"wrote {out}/: hists.npz, summary.json, trend.json"
-              + (", summary.png" if png else ""))
+              + (", summary.png" if png else "")
+              + (", nim.png" if png and (out / "nim.png").exists() else ""))
     errors = [f for f in summary["flags"] if f["severity"] == "error"]
     return EXIT_ERROR_FLAG if errors else EXIT_OK
 

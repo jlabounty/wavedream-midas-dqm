@@ -398,8 +398,9 @@ def decode_scope_frame(payload: bytes) -> dict:
 # Layout, offsets relative to the payload start (the envelope sliced off, as
 # for every other tag; JS typed arrays throw on a misaligned offset)::
 #
-#     0   u8   version = 1
+#     0   u8   version = 1 (2 with words, 3 with pairing: see below)
 #     1   u8   flags        SMAF_SEEDED | SMAF_STALE | SMAF_TRUNCATED | SMAF_SUSPECT
+#                           (| SMAF_WORDS | SMAF_PIXELS | SMAF_PAIRING, below)
 #     2   u16  time_shift   k: a hit's time is meta["t0_ns"] + t_rel_ns * 2^k
 #     4   u32  n_hits       n
 #     8   u64  frame_seq    the plugin's frame counter (the cache/freeze key)
@@ -434,14 +435,48 @@ def decode_scope_frame(payload: bytes) -> dict:
 #     A + 16n  u8  ch[n];  A + 17n u8 tot[n];  A + 18n u8 hit_flags[n]
 #     total = A + 19n
 #
-# Without word data the payload is exactly version 1 (7 bytes a hit). The
-# seeded view is always v2 (a few hundred hits); the raster only on request
+# Without word data and without pairing (below) the payload is exactly version
+# 1 (7 bytes a hit). The seeded view always carries words (a few hundred hits); the raster only on request
 # (``{"words": true}``): 19 instead of 7 bytes a hit is +170 %, 0.6 MB instead
 # of 0.23 MB for a 40000-word frame at 2 Hz, so the page asks for it once, for a
 # frozen frame.
 #
+# Version 3 (header flag SMAF_PAIRING, version byte 3) adds the TOT + NIM
+# pairing of each hit (since run 1015 every counter reaches the board twice: its
+# TOT word and a NIM discriminator copy, see plugins/sma_nim.py). Words are
+# optional in v3 (header flag SMAF_WORDS), and the partner index ``pair`` comes
+# with the words only: the live raster (the heavy reply, up to 60000 hits at
+# 2 Hz) needs the classes for its marks but not the partners, which only the
+# seed panels' ticks and a hovered hit's line use. The multi-byte arrays come
+# first::
+#
+#     without words                    with words (SMAF_WORDS)
+#     A        u32 t_rel_ns[n]         A         u64 raw_word[n]
+#     A + 4n   u8  ch[n]               A + 8n    u32 t_rel_ns[n]
+#     A + 5n   u8  tot[n]              A + 12n   u32 word_index[n]
+#     A + 6n   u8  hit_flags[n]        A + 16n   i32 pair[n]
+#     A + 7n   u8  cls[n]              A + 20n   u8 ch, tot, hit_flags, cls [n each]
+#     8 bytes a hit (+14 % on v1)      24 bytes a hit (+26 % on v2)
+#
+# ``pair``: the index, in this payload's hit list, of the word this hit is
+# paired with (a TOT word's NIM word and the other way round); -1 when it has
+# none or its partner was not shipped (outside the seed windows, dropped,
+# truncated) -- the class still says "paired" then. ``cls`` packs the class and
+# the sub-flags of `sma_nim` into one byte::
+#
+#     bits 2:0  PAIR_CLASS_MASK: sma_nim.PAIRED 0, TOT_ONLY 1, ECHO_WORD 2,
+#               NIM_ONLY 3; PAIR_NONE 7 = not a paired counter's word (RF, ...)
+#     bit 3     PAIR_MULTI      more than one NIM candidate in the window
+#     bit 4     PAIR_SHADOW     the NIM word lies in the previous TOT word's shadow
+#     bit 5     PAIR_EDGE       near the frame's first/last hit (partner may be cut)
+#     bit 6     PAIR_LAG_HELD   a NIM-only word held back from the merge (lag fault)
+#     bit 7     PAIR_NIM_SIDE   the word is a NIM copy (else a TOT word)
+#
+# A frame without pairing (no NIM copies configured) is v1 or v2 exactly as
+# before; a v1/v2 decoder refuses v3 rather than misreading it.
+#
 # The pixel block (header flag SMAF_PIXELS) carries the frame's MuPix pixel hits
-# after the trigger-hit arrays, in either version. It is an addition at the end
+# after the trigger-hit arrays, in any version. It is an addition at the end
 # that the version byte does not announce, so a v1/v2 decoder that knows nothing
 # of it reads the same trigger hits and ignores the tail. P is the end of the
 # hit arrays rounded up to a multiple of 8::
@@ -470,6 +505,7 @@ SMAF_HEADER = struct.Struct("<BBHIQIIQ")
 
 SMAF_VERSION = 1
 SMAF_VERSION_WORDS = 2
+SMAF_VERSION_PAIRING = 3
 
 #: Header `flags` bits.
 SMAF_SEEDED = 1 << 0        # the seeded view (hits inside seed windows only); else raster
@@ -478,6 +514,16 @@ SMAF_TRUNCATED = 1 << 2     # more hits than max_hits; the latest ones were kept
 SMAF_SUSPECT = 1 << 3       # no usable time base (most hits outside the time clusters)
 SMAF_WORDS = 1 << 4         # v2: raw words and word indices follow (see above)
 SMAF_PIXELS = 1 << 5        # a MuPix pixel block follows the hit arrays (see above)
+SMAF_PAIRING = 1 << 6       # v3: per-hit TOT + NIM pairing (pair, cls; see above)
+
+#: The v3 ``cls`` byte (see above).
+PAIR_CLASS_MASK = 0x07      # bits 2:0: sma_nim's class, or PAIR_NONE
+PAIR_NONE = 7               # not a paired counter's word
+PAIR_MULTI = 1 << 3         # more than one NIM candidate (sma_nim.MULTI_CANDIDATE)
+PAIR_SHADOW = 1 << 4        # in the previous TOT word's shadow (sma_nim.IN_TOT_SHADOW)
+PAIR_EDGE = 1 << 5          # near the frame edge (sma_nim.NEAR_FRAME_EDGE)
+PAIR_LAG_HELD = 1 << 6      # a NIM-only word held back from the merge (lag fault)
+PAIR_NIM_SIDE = 1 << 7      # the word is a NIM copy
 
 #: Pixel block flags and version.
 PIXB_VERSION = 1
@@ -515,11 +561,16 @@ def encode_sma_frame(
     raw_words=None,
     word_index=None,
     pixels: dict | None = None,
+    pair=None,
+    cls=None,
 ) -> bytes:
     """Encode one SMA frame; the arrays must all have the same length.
 
-    With `raw_words` and `word_index` (both or neither) the payload is version
-    2 (`SMAF_WORDS`), else version 1. `pixels`: the pixel block, ``{t_rel,
+    With `raw_words` and `word_index` (both or neither) the payload carries
+    words (`SMAF_WORDS`). With `cls` (the TOT + NIM pairing, see "Version 3"
+    above) it is version 3 (`SMAF_PAIRING`), with or without words; `pair`
+    then goes with the words: required with them, refused without. Otherwise
+    version 2 with words, 1 without. `pixels`: the pixel block, ``{t_rel,
     time_shift, chip, col, row, tot, flags}`` and optionally ``raw_words`` and
     ``word_index`` (both or neither), all of one length (`SMAF_PIXELS`).
 
@@ -544,13 +595,27 @@ def encode_sma_frame(
         wi = np.ascontiguousarray(word_index, dtype="<u4")
         if not rw.size == wi.size == n:
             raise ValueError(f"word arrays differ in length: {n}, {rw.size}, {wi.size}")
+    paired = cls is not None
+    if pair is not None and not paired:
+        raise ValueError("pair needs cls")
+    if paired:
+        if (pair is not None) != words:
+            raise ValueError("pair goes with the words: give it with raw_words, not without")
+        pc = np.ascontiguousarray(cls, dtype=np.uint8)
+        pr = np.ascontiguousarray(pair if words else [], dtype="<i4")
+        if pc.size != n or (words and pr.size != n):
+            raise ValueError(f"pairing arrays differ in length: {n}, {pr.size}, {pc.size}")
+        if words and n and (pr.min() < -1 or pr.max() >= n):
+            raise ValueError("pair must be -1 or an index into the hit list")
 
     if not 0 <= int(time_shift) <= 32:
         raise ValueError(f"time_shift must be 0..32, got {time_shift}")
     flags = ((SMAF_SEEDED if seeded else 0) | (SMAF_STALE if stale else 0)
              | (SMAF_TRUNCATED if truncated else 0) | (SMAF_SUSPECT if suspect else 0)
-             | (SMAF_WORDS if words else 0) | (SMAF_PIXELS if pixels is not None else 0))
-    version = SMAF_VERSION_WORDS if words else SMAF_VERSION
+             | (SMAF_WORDS if words else 0) | (SMAF_PIXELS if pixels is not None else 0)
+             | (SMAF_PAIRING if paired else 0))
+    version = (SMAF_VERSION_PAIRING if paired else
+               SMAF_VERSION_WORDS if words else SMAF_VERSION)
     buf = bytearray(SMAF_HEADER.pack(version, flags, int(time_shift), n, int(frame_seq),
                                      int(run_number) & 0xFFFFFFFF, len(blob), 0))
     buf.extend(blob)
@@ -561,9 +626,13 @@ def encode_sma_frame(
         buf.extend(wi.tobytes())
     else:
         buf.extend(t.tobytes())
+    if paired and words:
+        buf.extend(pr.tobytes())
     buf.extend(c.tobytes())
     buf.extend(k.tobytes())
     buf.extend(f.tobytes())
+    if paired:
+        buf.extend(pc.tobytes())
     if pixels is not None:
         _align(buf, 8)
         buf.extend(_pixel_block(pixels))
@@ -599,14 +668,20 @@ def _pixel_block(px: dict) -> bytes:
     return bytes(out)
 
 
+def smaf_bytes_per_hit(flags: int) -> int:
+    """Bytes a hit takes in the hit arrays, from the header flags (any version)."""
+    words, paired = bool(flags & SMAF_WORDS), bool(flags & SMAF_PAIRING)
+    return 7 + (12 if words else 0) + (1 if paired else 0) + (4 if paired and words else 0)
+
+
 def _pixel_block_offset(payload: bytes) -> tuple[int, int] | None:
     """``(start of the pixel block, end of the hit arrays)``; None without a block."""
-    (version, flags, _ts, n, _seq, _run, json_len, _r) = SMAF_HEADER.unpack_from(payload, 0)
+    (_version, flags, _ts, n, _seq, _run, json_len, _r) = SMAF_HEADER.unpack_from(payload, 0)
     if not flags & SMAF_PIXELS:
         return None
     off = SMAF_HEADER.size + json_len
     off += (-off) % 8
-    end = off + (19 if version == SMAF_VERSION_WORDS else 7) * n
+    end = off + smaf_bytes_per_hit(flags) * n
     return end + (-end) % 8, end
 
 
@@ -695,10 +770,11 @@ def decode_sma_frame(payload: bytes) -> dict:
 
     (version, flags, time_shift, n, frame_seq, run_number, json_len,
      _r1) = SMAF_HEADER.unpack_from(payload, 0)
-    if version not in (SMAF_VERSION, SMAF_VERSION_WORDS):
+    if version not in (SMAF_VERSION, SMAF_VERSION_WORDS, SMAF_VERSION_PAIRING):
         raise ValueError(f"unknown smaf version {version}")
-    words = version == SMAF_VERSION_WORDS
-    if words != bool(flags & SMAF_WORDS):
+    paired = version == SMAF_VERSION_PAIRING
+    words = bool(flags & SMAF_WORDS)
+    if paired != bool(flags & SMAF_PAIRING) or (not paired and words != (version == 2)):
         raise ValueError(f"smaf version {version} with flags {flags:#x}")
     off = SMAF_HEADER.size
     meta = json.loads(bytes(payload[off:off + json_len]).decode())
@@ -706,10 +782,10 @@ def decode_sma_frame(payload: bytes) -> dict:
     rem = off % 8
     if rem:
         off += 8 - rem
-    per_hit = 19 if words else 7
+    per_hit = smaf_bytes_per_hit(flags)
     if len(payload) < off + per_hit * n:
         raise ValueError(f"short smaf payload: {len(payload)} bytes for {n} hits at {off}")
-    rw = wi = None
+    rw = wi = pr = pc = None
     if words:
         rw = np.frombuffer(payload, dtype="<u8", count=n, offset=off)
         t = np.frombuffer(payload, dtype="<u4", count=n, offset=off + 8 * n)
@@ -718,12 +794,18 @@ def decode_sma_frame(payload: bytes) -> dict:
     else:
         t = np.frombuffer(payload, dtype="<u4", count=n, offset=off)
         b0 = off + 4 * n
+    if paired and words:
+        pr = np.frombuffer(payload, dtype="<i4", count=n, offset=b0)
+        b0 += 4 * n
     c = np.frombuffer(payload, dtype=np.uint8, count=n, offset=b0)
     k = np.frombuffer(payload, dtype=np.uint8, count=n, offset=b0 + n)
     f = np.frombuffer(payload, dtype=np.uint8, count=n, offset=b0 + 2 * n)
+    end = b0 + 3 * n
+    if paired:
+        pc = np.frombuffer(payload, dtype=np.uint8, count=n, offset=end)
+        end += n
     pix = None
     if flags & SMAF_PIXELS:
-        end = b0 + 3 * n
         pix = decode_pixel_block(payload, end + (-end) % 8)
     return {
         "version": version, "flags": flags, "n_hits": n, "frame_seq": frame_seq,
@@ -733,4 +815,5 @@ def decode_sma_frame(payload: bytes) -> dict:
         "suspect": bool(flags & SMAF_SUSPECT), "time_shift": time_shift,
         "meta": meta, "t_rel_ns": t, "ch": c, "tot": k, "hit_flags": f,
         "words": words, "raw_words": rw, "word_index": wi, "pixels": pix,
+        "pairing": paired, "pair": pr, "cls": pc,
     }

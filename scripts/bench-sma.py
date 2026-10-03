@@ -11,6 +11,22 @@ words, fine/coarse mismatch per channel, RF valid fraction).
 
 Gate (docs plan): >= 100 frames/s of 40000-word frames on one core.
 
+Channel roles (``--roles``): a file from before run 1015 (its name's run
+number) is timed with the old cabling (S1..S5 on ch 1-5, RF 6, current 7,
+delayed 8-10: ``tests/sma_layouts.OLD_LAYOUT``) and no NIM copies, so the gate
+stays comparable with the numbers from before the 1015 defaults; a run >= 1015
+and the synthetic frames with the 1015 defaults. ``--roles old`` / ``1015``
+forces one for every input.
+
+``--nim`` adds the TOT + NIM pairing and lag votes of the plugin
+(``sma.pair_frame``, the defaults' ``/DQM/SMA/NIM`` with ``merge`` on, every
+frame voted: the worst case) to the 1015-cabled inputs; the analysis then runs
+on the merged counters. ``--synthetic K`` times K dense run-1015-cabled
+synthetic frames (~39000 words, ``tests/sma_layouts``) instead of, or besides,
+files; with it the pairing is on::
+
+    PYTHONPATH=src python3 scripts/bench-sma.py --synthetic 40
+
 Run inside testbeam-midas (needs lz4 and the MIDAS python):
 
     docker exec -u 1000:1000 testbeam-midas bash -lc \\
@@ -34,10 +50,23 @@ from pathlib import Path  # noqa: E402
 
 import numpy as np  # noqa: E402
 
+from mdqm.plugins import sma as P  # noqa: E402
 from mdqm.plugins import sma_words as W  # noqa: E402
 
 GATE_FPS = 100.0
 GATE_WORDS = 40000
+#: The cabling before run 1015 (tests/sma_layouts.OLD_ROLES; that module is
+#: not importable from an installed checkout's scripts).
+OLD_ROLES = W.Roles(s1=1, counters=(1, 2, 3, 4, 5), rf=6, current=7, delayed=(8, 9, 10))
+FIRST_1015_RUN = 1015
+
+
+def run_of(path) -> int | None:
+    """The run number in a file name like run01008_00001.mid.lz4; None if absent."""
+    import re
+
+    m = re.search(r"run0*(\d+)", Path(path).name)
+    return int(m.group(1)) if m else None
 
 
 def read_frames(path, n_frames, skip=0):
@@ -61,18 +90,23 @@ def read_frames(path, n_frames, skip=0):
     return out
 
 
-def pipeline(bank, shift, roles, cuts):
-    """Everything WP3 computes per frame, bar the histogram fills."""
+def pipeline(bank, shift, roles, cuts, nim=None):
+    """Everything WP3 computes per frame, bar the histogram fills; with `nim`
+    (an sma.Config) the TOT + NIM pairing too, the analysis on merged counters."""
     fr = W.prepare_frame(bank, shift, cuts.stale_gap_ns, cuts.latch_margin_ns)
     occupancy = W.per_channel_bit_counts(fr.ch, fr.fine)
     bad = ~fr.consistent
     xor = W.fine_coarse_xor(fr.coarse[bad], fr.fine[bad], shift)
     mismatch_bits = W.per_channel_bit_counts(fr.ch[bad], xor, W.shared_bits(shift))
+    if nim is not None:
+        nf = P.pair_frame(fr, nim)
+        if nf is not None:
+            fr.counter_hits = nf.hits or None
     a = W.analyse_frame(fr, roles, cuts)
     return fr, a, occupancy, mismatch_bits
 
 
-def time_steps(banks, shift, roles, cuts):
+def time_steps(banks, shift, roles, cuts, nim=None):
     """Per-step mean time [ms], for the profile."""
     steps = {}
 
@@ -101,13 +135,20 @@ def time_steps(banks, shift, roles, cuts):
         fr = W.prepare_frame(b, shift, cuts.stale_gap_ns, cuts.latch_margin_ns)
         t6 = time.perf_counter()
         add("prepare_frame (all above but bits)", t6 - t5)
+        if nim is not None:
+            nf = P.pair_frame(fr, nim)
+            if nf is not None:
+                fr.counter_hits = nf.hits or None
+            t6b = time.perf_counter()
+            add("TOT+NIM pair_frame", t6b - t6)
+            t6 = t6b
         W.analyse_frame(fr, roles, cuts)
         t7 = time.perf_counter()
         add("analyse_frame", t7 - t6)
     return {k: 1e3 * v / len(banks) for k, v in steps.items()}
 
 
-def observe(banks, shift, roles, cuts, label):
+def observe(banks, shift, roles, cuts, label, nim=None):
     words = trig = stale = 0
     per_ch = np.zeros(W.N_CHANNELS, dtype=np.int64)
     bad_ch = np.zeros(W.N_CHANNELS, dtype=np.int64)
@@ -116,7 +157,7 @@ def observe(banks, shift, roles, cuts, label):
     spans = []
     tot_bad = np.zeros(W.N_CHANNELS, dtype=np.int64)
     for b in banks:
-        fr, a, _occ, _mb = pipeline(b, shift, roles, cuts)
+        fr, a, _occ, _mb = pipeline(b, shift, roles, cuts, nim)
         words += fr.n_words
         trig += fr.n_trigger
         stale += int(fr.stale_per_ch.sum())
@@ -143,14 +184,14 @@ def observe(banks, shift, roles, cuts, label):
                       zip(cuts.shift_scan, shift_counts, strict=True)))
 
 
-def bench(banks, shift, roles, cuts, repeat):
+def bench(banks, shift, roles, cuts, repeat, nim=None):
     for b in banks[:5]:
-        pipeline(b, shift, roles, cuts)              # warm up
+        pipeline(b, shift, roles, cuts, nim)         # warm up
     best = np.inf
     for _ in range(repeat):
         t0 = time.perf_counter()
         for b in banks:
-            pipeline(b, shift, roles, cuts)
+            pipeline(b, shift, roles, cuts, nim)
         best = min(best, time.perf_counter() - t0)
     n_words = sum(W.words_from_bank(b).size for b in banks)
     return len(banks) / best, n_words / best
@@ -159,29 +200,56 @@ def bench(banks, shift, roles, cuts, repeat):
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("files", nargs="+", type=Path)
+    ap.add_argument("files", nargs="*", type=Path)
+    ap.add_argument("--nim", action="store_true",
+                    help="add the TOT + NIM pairing (plugin defaults, merge on) to the "
+                         "1015-cabled inputs")
+    ap.add_argument("--roles", choices=("auto", "old", "1015"), default="auto",
+                    help="channel roles: auto = old before run 1015 (file name), else 1015")
+    ap.add_argument("--synthetic", type=int, default=0, metavar="K",
+                    help="also time K dense 1015-cabled synthetic frames (pairing on)")
     ap.add_argument("--frames", type=int, default=200)
     ap.add_argument("--skip", type=int, default=5,
                     help="frames skipped at the start of each file (subrun-0 stale replay)")
     ap.add_argument("--shift", type=int, default=W.DEFAULT_SHIFT)
     ap.add_argument("--repeat", type=int, default=3)
     a = ap.parse_args(argv)
-    roles, cuts = W.Roles(), W.Cuts()
+    cuts = W.Cuts()
     try:
         print(f"CPU affinity: {sorted(os.sched_getaffinity(0))}")
     except AttributeError:
         pass
+    nim_cfg = P.parse_settings({"NIM": {"merge": True}})
+
+    def roles_for(run):
+        old = a.roles == "old" or (a.roles == "auto" and run is not None
+                                   and run < FIRST_1015_RUN)
+        return (OLD_ROLES, None) if old else (W.Roles(), nim_cfg if a.nim else None)
+
+    sets = [(path.name, read_frames(path, a.frames, a.skip), *roles_for(run_of(path)))
+            for path in a.files]
+    if a.synthetic:
+        import sys
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tests"))
+        from sma_layouts import dense_1015
+
+        sets.append((f"synthetic 1015 x{a.synthetic}",
+                     [dense_1015(seed=k, shift=a.shift).view("<u4") for k in range(a.synthetic)],
+                     W.Roles(), nim_cfg))
+    if not sets:
+        ap.error("give files and/or --synthetic K")
     failed = False
-    for path in a.files:
-        banks = read_frames(path, a.frames, a.skip)
+    for name, banks, roles, nim in sets:
         if not banks:
-            print(f"{path}: no readout frames")
+            print(f"{name}: no readout frames")
             continue
         wpf = np.mean([W.words_from_bank(b).size for b in banks])
-        observe(banks, a.shift, roles, cuts, path.name)
-        steps = time_steps(banks, a.shift, roles, cuts)
+        cab = "old roles" if roles == OLD_ROLES else "1015 roles"
+        observe(banks, a.shift, roles, cuts,
+                f"{name} ({cab}{', TOT+NIM' if nim else ''})", nim)
+        steps = time_steps(banks, a.shift, roles, cuts, nim)
         print("    per step [ms/frame]: " + ", ".join(f"{k} {v:.2f}" for k, v in steps.items()))
-        fps, wps = bench(banks, a.shift, roles, cuts, a.repeat)
+        fps, wps = bench(banks, a.shift, roles, cuts, a.repeat, nim)
         verdict = ""
         if wpf >= 0.9 * GATE_WORDS:
             ok = fps >= GATE_FPS

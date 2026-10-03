@@ -46,7 +46,7 @@ table.dqm-sma-table th { white-space: nowrap; }
   border-color: #a8a8a8; border-top: 3px solid #06c; padding-top: 4px; }
 .dqm-sma-tablist > button.dqm-sma-tab:focus { outline: none; }
 .dqm-sma-tablist > button.dqm-sma-tab:focus-visible { outline: 2px solid #06c; outline-offset: -5px; }
-.dqm-sma-plotwrap { min-width: 0; }
+.dqm-sma-plotwrap { min-width: 0; max-width: 564px; }   /* a long title wraps, not the grid */
 .dqm-sma-plot-error .dqm-footnote { color: var(--mred, #c00); }
 
 /* Event display */
@@ -144,3 +144,16 @@ table.dqm-sma-table th { white-space: nowrap; }
 .dqm-smaev-pat select { margin-left: 4px; }
 .dqm-smaev-patwarn { white-space: normal; font-size: 85%; max-width: 100%; box-sizing: border-box; }
 .dqm-sma-pbox.ignored { border-style: dashed; opacity: 0.55; }
+
+/* SMAPlots NIM / TOT tab: the per-counter TOT + NIM table, its chips, and the
+   link a NIM flag carries to the tab. */
+.dqm-sma-nimchips { margin: 4px 0 8px 0; }
+.dqm-sma-nimwrap  { max-width: 100%; overflow-x: auto; }
+.dqm-sma-nimtable td, .dqm-sma-nimtable th { text-align: right; padding: 2px 8px; }
+.dqm-sma-nimtable td:first-child, .dqm-sma-nimtable th:first-child { text-align: left; }
+.dqm-sma-nimtable th { white-space: normal; vertical-align: bottom; }
+.dqm-sma-nimtable td { white-space: nowrap; cursor: help; }
+.dqm-sma-nimtools { margin: 6px 0 4px 0; }
+.dqm-sma-flaglink { -webkit-appearance: none; appearance: none; border: 0; background: none;
+                    padding: 0 2px; font: inherit; color: #06c; text-decoration: underline;
+                    cursor: pointer; white-space: nowrap; }

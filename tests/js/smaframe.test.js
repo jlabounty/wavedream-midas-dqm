@@ -57,6 +57,21 @@ function check(f, e, name) {
     assert.strictEqual(f.rawWord, null, `${name}: no raw words in v1`);
     assert.strictEqual(f.wordIndex, null, `${name}: no word index in v1`);
   }
+  if (e.pairing !== undefined) {
+    assert.strictEqual(f.pairing, e.pairing, `${name}: pairing`);
+    if (e.pairing) {
+      if (e.pair === null) {
+        assert.strictEqual(f.pair, null, `${name}: no partners without words`);
+      } else {
+        assert.ok(f.pair instanceof Int32Array, `${name}: pair is i32`);
+        assert.deepStrictEqual(Array.from(f.pair), e.pair, `${name}: pair`);
+      }
+      assert.deepStrictEqual(Array.from(f.cls), e.cls, `${name}: cls`);
+    } else {
+      assert.strictEqual(f.pair, null, `${name}: no pair before v3`);
+      assert.strictEqual(f.cls, null, `${name}: no cls before v3`);
+    }
+  }
   checkPixels(f, e, name);
 }
 
@@ -106,9 +121,59 @@ for (const c of cases) {
   }
 }
 
-test("v1 and v2 are both among the cases", () => {
+test("v1, v2 and v3 are all among the cases", () => {
   const versions = new Set(cases.map((c) => c.expect.version));
-  assert.deepStrictEqual([...versions].sort(), [1, 2]);
+  assert.deepStrictEqual([...versions].sort(), [1, 2, 3]);
+  const v3 = cases.filter((c) => c.expect.version === 3);
+  assert.deepStrictEqual([...new Set(v3.map((c) => c.expect.words))].sort(), [false, true],
+                         "v3 with and without words");
+});
+
+test("v3: the live raster carries classes only, 8 bytes a hit", () => {
+  const c = cases.find((x) => x.expect.version === 3 && x.expect.n_hits > 1000);
+  assert.ok(c, "a real v3 raster");
+  const f = SMAF.decode(bufferOf(c.payload_hex));
+  assert.ok(f.pairing && !f.words && f.pair === null && f.cls.length === f.nHits);
+  assert.strictEqual(f.offsets.cls - f.offsets.t, 4 * f.nHits + 3 * f.nHits);
+});
+
+test("v3: pair is a view when aligned, -1 survives, partners point back at each other", () => {
+  const c = cases.find((x) => x.expect.version === 3 && x.expect.words && x.expect.n_hits >= 300);
+  assert.ok(c, "a real v3 raster with words");
+  const ab = bufferOf(c.payload_hex);
+  const f = SMAF.decode(ab);
+  assert.strictEqual(f.pair.buffer, ab, "i32 pair: a view");
+  assert.ok(f.pairing && f.words);
+  let pairs = 0, none = 0;
+  for (let i = 0; i < f.nHits; i++) {
+    const j = f.pair[i];
+    if (j < 0) { none++; continue; }
+    pairs++;
+    assert.strictEqual(f.pair[j], i, `hit ${i}'s partner ${j} points back`);
+    assert.strictEqual(f.cls[i] & SMAF.PAIR.CLASS_MASK, SMAF.PAIR.PAIRED, "a partner means paired");
+    assert.notStrictEqual(f.cls[i] & SMAF.PAIR.NIM_SIDE, f.cls[j] & SMAF.PAIR.NIM_SIDE,
+                          "a pair is one TOT word and one NIM word");
+  }
+  assert.ok(pairs > 50 && none > 0, `${pairs} paired, ${none} without a partner`);
+  // At an odd offset the i32 array is copied, with the same values.
+  const raw = Buffer.from(c.payload_hex, "hex");
+  const big = new Uint8Array(raw.length + 3);
+  big.set(raw, 3);
+  const g = SMAF.decode(new Uint8Array(big.buffer, 3, raw.length));
+  assert.notStrictEqual(g.pair.buffer, big.buffer);
+  assert.deepStrictEqual(Array.from(g.pair), Array.from(f.pair));
+});
+
+test("v3: the cls byte packs the class and the sub-flags", () => {
+  const c = cases.find((x) => /NIM-only lag-held, echo/.test(x.name));
+  const f = SMAF.decode(bufferOf(c.payload_hex));
+  const P = SMAF.PAIR;
+  const cl = Array.from(f.cls, (b) => b & P.CLASS_MASK);
+  assert.deepStrictEqual(cl, [P.PAIRED, P.PAIRED, P.ECHO, P.NIM_ONLY, P.TOT_ONLY]);
+  assert.ok(f.cls[3] & P.LAG_HELD && f.cls[3] & P.NIM_SIDE);
+  assert.ok(f.cls[1] & P.NIM_SIDE && !(f.cls[0] & P.NIM_SIDE));
+  assert.deepStrictEqual(Array.from(f.pair), [1, 0, -1, -1, -1]);
+  assert.strictEqual(SMAF.hex64(f.rawWord[3]), "0xffffffffffffffff", "words travel with v3 too");
 });
 
 test("v2 arrays are views too when aligned, and copied only where they must be", () => {
@@ -161,8 +226,19 @@ test("a time shift scales the times without overflowing u32", () => {
 
 test("an unknown version is refused, not misread", () => {
   const ab = bufferOf(cases[0].payload_hex);
-  new DataView(ab).setUint8(0, 3);
-  assert.throws(() => SMAF.decode(ab), /unknown smaf version 3/);
+  new DataView(ab).setUint8(0, 4);
+  assert.throws(() => SMAF.decode(ab), /unknown smaf version 4/);
+});
+
+test("a version that disagrees with the PAIRING flag is refused", () => {
+  const v1 = cases.find((x) => x.expect.version === 1);
+  const ab = bufferOf(v1.payload_hex);
+  new DataView(ab).setUint8(0, 3);                       // v3 claimed, no PAIRING flag
+  assert.throws(() => SMAF.decode(ab), /smaf version 3 with flags/);
+  const v3 = cases.find((x) => x.expect.version === 3 && x.expect.words);
+  const ab3 = bufferOf(v3.payload_hex);
+  new DataView(ab3).setUint8(0, 2);                      // v2 claimed, PAIRING set
+  assert.throws(() => SMAF.decode(ab3), /smaf version 2 with flags/);
 });
 
 test("a version that disagrees with the WORDS flag is refused", () => {
@@ -188,7 +264,9 @@ test("the flag constants agree with framing.py", () => {
   const want = {
     SMAF_SEEDED: SMAF.FLAGS.SEEDED, SMAF_STALE: SMAF.FLAGS.STALE,
     SMAF_TRUNCATED: SMAF.FLAGS.TRUNCATED, SMAF_SUSPECT: SMAF.FLAGS.SUSPECT,
-    SMAF_WORDS: SMAF.FLAGS.WORDS, HIT_MISMATCH: SMAF.HIT.MISMATCH,
+    SMAF_WORDS: SMAF.FLAGS.WORDS, SMAF_PAIRING: SMAF.FLAGS.PAIRING, HIT_MISMATCH: SMAF.HIT.MISMATCH,
+    PAIR_MULTI: SMAF.PAIR.MULTI, PAIR_SHADOW: SMAF.PAIR.SHADOW, PAIR_EDGE: SMAF.PAIR.EDGE,
+    PAIR_LAG_HELD: SMAF.PAIR.LAG_HELD, PAIR_NIM_SIDE: SMAF.PAIR.NIM_SIDE,
     HIT_TOT_CORRUPT: SMAF.HIT.TOT_CORRUPT, HIT_FINE_LSB: SMAF.HIT.FINE_LSB,
     HIT_IN_SEED: SMAF.HIT.IN_SEED, HIT_STALE: SMAF.HIT.STALE,
   };
@@ -197,15 +275,24 @@ test("the flag constants agree with framing.py", () => {
     assert.ok(m, `${name} not found in framing.py`);
     assert.strictEqual(1 << Number(m[1]), value, name);
   }
+  assert.ok(/^PAIR_CLASS_MASK = 0x07/m.test(py) && SMAF.PAIR.CLASS_MASK === 7);
+  assert.ok(new RegExp(`^PAIR_NONE = ${SMAF.PAIR.NONE}\\b`, "m").test(py));
+  // The classes are sma_nim's.
+  const nim = fs.readFileSync(
+    path.join(__dirname, "..", "..", "src", "mdqm", "plugins", "sma_nim.py"), "utf8");
+  for (const [name, v] of [["PAIRED", SMAF.PAIR.PAIRED], ["TOT_ONLY", SMAF.PAIR.TOT_ONLY],
+                           ["ECHO_WORD", SMAF.PAIR.ECHO], ["NIM_ONLY", SMAF.PAIR.NIM_ONLY]]) {
+    assert.ok(new RegExp(`^${name} = ${v}$`, "m").test(nim), `sma_nim.${name} = ${v}`);
+  }
 });
 
 test("every case ran", () => {
   assert.ok(cases.length >= 20, `only ${cases.length} cases`);
 });
 
-test("pixel blocks come after v1 and v2, with and without words, and old fields are untouched", () => {
+test("pixel blocks come after v1, v2 and v3, with and without words, and old fields are untouched", () => {
   const px = cases.filter((c) => c.expect.pixels);
-  assert.deepStrictEqual([...new Set(px.map((c) => c.expect.version))].sort(), [1, 2]);
+  assert.deepStrictEqual([...new Set(px.map((c) => c.expect.version))].sort(), [1, 2, 3]);
   assert.deepStrictEqual([...new Set(px.map((c) => c.expect.pixels.words))].sort(), [false, true]);
   // The same real frame with and without the block: the trigger hits read the same.
   const a = cases.find((c) => c.name === "real 4k-word frame, seeded (v2, words)");

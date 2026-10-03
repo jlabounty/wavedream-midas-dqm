@@ -31,6 +31,19 @@
 // A pixel hit is hit number nHits + j of its frame (j in the pixel block), so
 // hovering, tagging, Copy all and the word ranges treat it like any other hit.
 //
+// TOT + NIM (since run 1015 every counter reaches the board twice, its TOT
+// word and a NIM discriminator copy "S*k*L"): each NIM copy gets its own lane
+// right under its counter, in the counter's colour but lighter. A thin dark
+// tick joins a TOT word to the NIM word it is paired with; a NIM-only word
+// (what the merge adds, or would add) is a hollow bar, one held back by a lag
+// fault is grey (only with the merge on: nothing is held back from a merge
+// that is off), and a TOT echo word has a dark back-slanted hatch. The pairing travels
+// with the frame (smaf v3, per hit), and so do the roles: nothing here is
+// guessed from labels when the analyzer says it. With the merge on, the
+// pattern boxes and the per-counter selector are of the merged counters; with
+// it off (the default) they are the TOT words alone, and the NIM-only hits are
+// shown but not merged -- every legend and tooltip says which.
+//
 // Drawn on our own <canvas>, not mplot: mplot has no shapes (see dqm-evd.js,
 // markEdge), and a 33k-hit raster as 16 scatter series would be both slow and
 // the wrong picture. Everything on screen comes from one sma::frame reply, so
@@ -71,7 +84,8 @@ const PROMPT_NS = 150;
 const MAX_HITS = 60000;          // raster reply cap, see fetchFor()
 const SUMMARY_EVERY_MS = 10000;  // roles and labels change only on an ODB edit
 const SINGLE_RETRY_MS = 300;     // Single asks once more after this if the frame is unchanged
-// A raster with words is 19 bytes a hit, ~1.2 MB at MAX_HITS: ask for that
+// A raster with words is 19 bytes a hit (24 with the TOT + NIM pairing),
+// ~1.2 MB (~1.45 MB) at MAX_HITS: ask for that
 // once rather than the 512 kB poll default and a retry.
 const WORDS_MAX_REPLY = 2 * 1024 * 1024;
 const HIT_SLOP_PX = 4;           // how far from a hit the mouse may be and still point at it
@@ -96,13 +110,32 @@ const MUPIX_MODES = [
 ];
 // The per-counter pattern selector (sma_words.PATTERN_STATES): AND-ed with everything else.
 const PATTERN_STATES = [["any", "any"], ["present", "present"], ["absent", "absent"]];
-const N_PATTERN = 5;             // S1..S5
+// One selector per counter (S1..Sn from the roles), at most 8: the pattern is one byte.
+const PATTERN_MAX = 8;
 const PLANE_LABEL = { 0: "no plane", 1: "MuPix L1", 2: "MuPix L2" };
 const IN_TIME_FILL = "rgba(44, 160, 44, 0.16)";   // the in-time window on the MuPix lanes
 
 const LANE_COLOURS = {
   s1: "#1f77b4", counter: ["#1f77b4", "#2ca02c", "#17becf", "#9467bd", "#8c564b", "#bcbd22"],
   rf: "#ff7f0e", current: "#7f7f7f", delayed: "#e377c2",
+};
+// TOT + NIM hit styles (see hitStyle). A NIM lane's bars are its counter's
+// colour, lighter (NIM_LIGHTEN of the way to white), with a 1 px outline in the
+// counter's colour darkened by NIM_EDGE_DARKEN: the light fill alone is under
+// 2:1 against the lane stripe, the outline is >= 3.6:1 for all six colours.
+const NIM_LIGHTEN = 0.35;
+const NIM_EDGE_DARKEN = 0.3;
+const NIM_MIN_PX = 3;              // a NIM bar's least width (a 10 ns word is ~2 px on the full window)
+const PAIR_TICK = "#3a3a3a";       // a TOT word joined to its NIM copy
+const HELD_FILL = "#d4d4d4";       // a NIM-only word held back from the merge (lag fault)
+const HELD_EDGE = "#6f6f6f";       // 4.6:1 on the lane stripe
+const ECHO_HATCH = "rgba(0, 0, 0, 0.55)";   // a TOT echo word: dark, the other way to the mismatch hatch
+const NIM_ONLY_FILL = "#ffffff";   // hollow: the outline is the lane edge (counter colour, darker)
+const HOLLOW_MIN_PX = 6;           // a hollow/grey bar's least width, so its outline shows
+const MISMATCH_ON_HOLLOW = "rgba(208, 0, 0, 0.7)";   // the mismatch hatch on a hollow bar
+const PAIR_CLASS_TEXT = {
+  0: "paired", 1: "TOT only (no NIM copy in the window)", 2: "echo word (not paired)",
+  3: "NIM only",
 };
 
 const state = {
@@ -115,7 +148,7 @@ const state = {
   intervals: { seeded: 250, raster: 500 },
   // Which hits seed the seeded view, and which oddities it is limited to (OR):
   // this viewer's choice, sent with every seeded request (see seedArgs()).
-  // pattern: {"<k>": "present"|"absent"} per counter k = 1..5 (S1..S5); "any" is left out.
+  // pattern: {"<k>": "present"|"absent"} per counter k = 1..n (S1..Sn); "any" is left out.
   seedSel: { seed: "s1", filters: [], mupix: "any", pattern: {} },
   frames: { seeded: null, raster: null },
   lastNewAt: { seeded: null, raster: null },
@@ -291,9 +324,16 @@ function singleNote(text) {
   n.style.display = text ? "" : "none";
 }
 
+/** The raster's drop list: the current channel when hidden; nothing when there is none. */
 function rasterDrop() {
   const cur = roles().current;
   return state.hideCurrent && cur !== null ? [cur] : [];
+}
+
+/** "hide the current channel" only where there is one (the roles may name none). */
+function updateCurrentToggle() {
+  const lab = document.getElementById("dqm-smaev-hidecurlab");
+  if (lab) lab.style.display = roles().current === null ? "none" : "";
 }
 
 /** The raster request: the drop list, the reply bound, and "pixels": false when MuPix is hidden. */
@@ -308,15 +348,27 @@ function rasterArgs() {
 // ---------------------------------------------------------------------------
 
 /**
- * Channel roles, from the summary (i.e. the ODB), else from the frame's labels.
+ * Channel roles: the analyzer's "roles" block (the ODB's channel map, in every
+ * frame and in the summary), else from the summary's channel rows, else from
+ * the frame's labels.
  *
- * The fallback reads the labels the analyzer put in the frame (S1..S5, RF,
- * current are its defaults), so a page whose summary call failed still draws
- * sensible lanes rather than none.
+ * The frame's block is preferred: it is the map the frame was analysed with.
+ * `nim[k]` is counter k's NIM copy (null: none). The label fallback reads the
+ * labels the analyzer put in the frame (S1..S5, RF, current are its
+ * defaults), so a page whose summary call failed and whose analyzer is older
+ * than the roles block still draws sensible lanes. With none of these there
+ * are no roles at all (no counters, no RF, no current): nothing is guessed.
  */
 function roles() {
-  const out = { counters: [], rf: null, current: null, delayed: [], labels: [] };
+  const out = { counters: [], nim: [], s1: null, rf: null, current: null, delayed: [], labels: [] };
   const s = state.summary;
+  const f = state.frames[state.tab] || state.frames.seeded || state.frames.raster;
+  const fm = (f && f.meta) || {};
+  const block = (fm.roles && typeof fm.roles === "object") ? fm.roles : s && s.roles;
+  if (block && Array.isArray(block.counters)) {
+    out.labels = s && s.channels ? s.channels.map((c) => (c ? c.label : "")) : (fm.labels || []);
+    return fromRolesBlock(block, out);
+  }
   if (s && s.channels) {
     out.labels = s.channels.map((c) => (c ? c.label : ""));
     // Counter order is S1 first, then the order the efficiency list gives
@@ -336,10 +388,17 @@ function roles() {
         out.counters.push(c.ch);
       }
     }
+    // A counter's NIM copy: its row's pair_of (an analyzer with NIM copies
+    // sends the roles block too, so this is only for a summary without one).
+    out.nim = out.counters.map(function (ch) {
+      const row = s.channels[ch];
+      const n = row && typeof row.pair_of === "number" ? row.pair_of : null;
+      const nr = n === null ? null : s.channels[n];
+      return nr && nr.role === "nim" ? n : null;
+    });
     return out;
   }
-  const f = state.frames[state.tab] || state.frames.seeded || state.frames.raster;
-  const labels = (f && f.meta && f.meta.labels) || [];
+  const labels = fm.labels || [];
   out.labels = labels;
   const byS = [];
   labels.forEach(function (l, ch) {
@@ -349,8 +408,71 @@ function roles() {
     else if (l === "current") out.current = ch;
   });
   out.counters = byS.sort((a, b) => a[0] - b[0]).map((x) => x[1]);
-  if (!labels.length) { out.counters = [1, 2, 3, 4, 5]; out.rf = 6; out.current = 7; }
+  out.nim = out.counters.map(() => null);
   return out;
+}
+
+/** The analyzer's roles block into roles(): -1 (none) becomes null, nim stays aligned. */
+function fromRolesBlock(b, out) {
+  const ch = (x) => (Number.isInteger(x) && x >= 0 && x < 16 ? x : null);
+  const nim = Array.isArray(b.nim) ? b.nim : [];
+  b.counters.forEach(function (c, k) {
+    if (ch(c) === null) return;
+    out.counters.push(c);
+    const n = ch(nim[k]);
+    out.nim.push(n !== null && n !== c ? n : null);
+  });
+  out.s1 = ch(b.s1);
+  out.rf = ch(b.rf);
+  out.current = ch(b.current);
+  const taken = new Set([...out.counters, ...out.nim.filter((n) => n !== null), out.rf, out.current]);
+  out.delayed = (b.delayed || []).map(ch).filter((c) => c !== null && !taken.has(c));
+  return out;
+}
+
+/** Whether the counters are the merged TOT + NIM hits: the frame's word, else the summary's. */
+function nimMerge() {
+  const f = state.frames[state.tab] || state.frames.seeded || state.frames.raster;
+  const m = f && f.meta;
+  if (m && typeof m.nim_merge === "boolean") return m.nim_merge;
+  return !!(state.summary && state.summary.nim_merge);
+}
+
+/** `hex` (#rrggbb) moved fraction `f` of the way to black. */
+function darken(hex, f) {
+  const m = /^#([0-9a-f]{6})$/i.exec(hex || "");
+  if (!m) return hex;
+  const v = parseInt(m[1], 16);
+  return `#${[16, 8, 0].map((sh) => Math.round(((v >> sh) & 255) * (1 - f))
+    .toString(16).padStart(2, "0")).join("")}`;
+}
+
+/** `hex` (#rrggbb) moved fraction `f` of the way to white. */
+function lighten(hex, f) {
+  const m = /^#([0-9a-f]{6})$/i.exec(hex || "");
+  if (!m) return hex;
+  const v = parseInt(m[1], 16);
+  const ch = (sh) => Math.round(((v >> sh) & 255) + (255 - ((v >> sh) & 255)) * f);
+  return `#${[16, 8, 0].map((sh) => ch(sh).toString(16).padStart(2, "0")).join("")}`;
+}
+
+/**
+ * How a hit is drawn, from its v3 cls byte (SMAF.PAIR; undefined before v3):
+ * "solid" (paired, TOT-only, no class), "hollow" (NIM-only: merged into the
+ * counter), "held" (NIM-only held back by a lag fault: grey) or "echo" (a TOT
+ * echo word: hatched).
+ */
+function hitStyle(b) {
+  if (b === undefined || b === null) return "solid";
+  const c = b & SMAF.PAIR.CLASS_MASK;
+  if (c === SMAF.PAIR.NIM_ONLY) return b & SMAF.PAIR.LAG_HELD ? "held" : "hollow";
+  if (c === SMAF.PAIR.ECHO) return "echo";
+  return "solid";
+}
+
+/** How many counters the pattern selector and the seed's pattern boxes show (0: roles unknown). */
+function nPattern(r) {
+  return Math.min(PATTERN_MAX, (r || roles()).counters.length);
 }
 
 function labelOf(ch, r) {
@@ -359,7 +481,8 @@ function labelOf(ch, r) {
 }
 
 /**
- * Seeded-view lanes: counters in order, RF, delayed channels, current, then
+ * Seeded-view lanes: counters in order (each with its NIM copy's lane right
+ * under it, `nim: true`, `edge` the counter's colour), RF, delayed channels, current, then
  * the MuPix planes when the frame has a pixel block (L1 and L2 always, "no
  * plane" only when a shipped pixel hit is on a chip the plane map lacks).
  * A MuPix lane has `pix` (the plane code) instead of `ch`.
@@ -368,7 +491,15 @@ function lanes(frame) {
   const r = roles();
   const out = [];
   r.counters.forEach(function (ch, k) {
-    out.push({ ch, label: labelOf(ch, r), colour: LANE_COLOURS.counter[k % 6] });
+    const colour = LANE_COLOURS.counter[k % 6];
+    out.push({ ch, label: labelOf(ch, r), colour });
+    // Its NIM copy right under it: the pair reads as one block of two lanes.
+    const n = r.nim[k];
+    if (n !== null && n !== undefined) {
+      out.push({ ch: n, label: labelOf(n, r), colour: lighten(colour, NIM_LIGHTEN),
+                 edge: darken(colour, NIM_EDGE_DARKEN),
+                 nim: true, counter: ch });
+    }
   });
   if (r.rf !== null) out.push({ ch: r.rf, label: labelOf(r.rf, r), colour: LANE_COLOURS.rf });
   for (const ch of r.delayed) out.push({ ch, label: labelOf(ch, r), colour: LANE_COLOURS.delayed });
@@ -601,6 +732,12 @@ function renderSeeded(frame) {
       : "This frame has no S1 hit whose whole window lies inside it.");
   }
   const ls = lanes(frame);
+  const nl = document.getElementById("dqm-smaev-nimlegend");
+  if (nl) {
+    nl.style.display = ls.some((l) => l.nim) ? "" : "none";
+    const text = nimLegend(nimMerge());
+    if (nl.textContent !== text) nl.textContent = text;
+  }
   const nums = tagNumbers("seeded", frame);
   seeds.forEach(function (seed, k) {
     const p = state.seedPanels[k];
@@ -699,13 +836,17 @@ function mupixBadge(frame, k) {
 
 function drawSeed(frame, seed, k, p, ls, nums) {
   const [a, b] = seedHits(frame, seed);
-  let nMis = 0, nTot = 0, nOther = 0;
+  let nMis = 0, nTot = 0, nOther = 0, nNimOnly = 0, nHeld = 0, nEcho = 0;
   const laneOf = {}, pixLane = {};
   ls.forEach((l, i) => { if (l.pix === undefined) laneOf[l.ch] = i; else pixLane[l.pix] = i; });
   for (let i = a; i < b; i++) {
     if (frame.hitFlags[i] & SMAF.HIT.MISMATCH) nMis++;
     if (frame.hitFlags[i] & SMAF.HIT.TOT_CORRUPT) nTot++;
     if (laneOf[frame.ch[i]] === undefined) nOther++;
+    const st = frame.cls ? hitStyle(frame.cls[i]) : "solid";
+    if (st === "hollow") nNimOnly++;
+    else if (st === "held") nHeld++;
+    else if (st === "echo") nEcho++;
   }
 
   // Header: DOM, not canvas, so it can be read, selected and copied.
@@ -716,8 +857,13 @@ function drawSeed(frame, seed, k, p, ls, nums) {
   const tot = seed.seed_ch === undefined ? seed.s1_tot : seed.seed_tot;
   head.appendChild(el("span", { class: "dqm-sma-seedtitle" },
     `seed ${k + 1}: ${who} at ${ms(frameOffsetNs(frame) + seed.t_rel)} ms in the frame, ToT ${tot}`));
-  const pat = el("span", { class: "dqm-sma-pattern", title: "coincidence pattern" });
-  const nCounters = Math.max(roles().counters.length, 5);
+  const hasNim = roles().nim.some((n) => n !== null);
+  const merged = nimMerge() && hasNim;
+  const pat = el("span", { class: "dqm-sma-pattern", title: merged
+    ? "coincidence pattern of the merged counters (TOT words + NIM-only hits)"
+    : hasNim ? "coincidence pattern of the TOT words only (NIM merge off)" : "coincidence pattern" });
+  // Unknown roles: as many boxes as the pattern has bits.
+  const nCounters = nPattern() || Math.min(PATTERN_MAX, 32 - Math.clz32(seed.pattern || 0));
   const inc = (frame.meta || {}).incomplete;
   const ignored = new Set(((inc && inc.ignored) || []).map((f) => f.counter));
   for (let c = 0; c < nCounters; c++) {
@@ -732,6 +878,9 @@ function drawSeed(frame, seed, k, p, ls, nums) {
   if (nMis) head.appendChild(badge(`${nMis} fine/coarse mismatch`, "red"));
   if (nTot) head.appendChild(badge(`${nTot} ToT ≥ ${frame.meta.tot_corrupt || 250}`, "yellow"));
   if (nOther) head.appendChild(badge(`${nOther} on channels without a role`));
+  if (nNimOnly) head.appendChild(badge(`${nNimOnly} NIM-only (${merged ? "merged" : "not merged: merge off"})`));
+  if (nHeld) head.appendChild(badge(`${nHeld} NIM-only held back (lag fault)`, "yellow"));
+  if (nEcho) head.appendChild(badge(`${nEcho} echo word${nEcho === 1 ? "" : "s"}`));
   const mb = mupixBadge(frame, k);
   if (mb) head.appendChild(mb);
   const wr = seed.word_range;
@@ -846,6 +995,7 @@ function paintSeed(canvas, frame, seed, a, b, ls, laneOf, range, nums, pix) {
   ctx.rect(x0, MARGIN.top, x1 - x0, ls.length * LANE_H);
   ctx.clip();
   const marks = [];
+  const cls = frame.cls;
   for (let i = a; i < b; i++) {
     const lane = laneOf[frame.ch[i]];
     if (lane === undefined) continue;
@@ -857,15 +1007,41 @@ function paintSeed(canvas, frame, seed, a, b, ls, laneOf, range, nums, pix) {
     const pw = Math.max(2, X(t + tot) - px0);
     const y = MARGIN.top + lane * LANE_H + 3;
     const h = LANE_H - 6;
-    ctx.fillStyle = ls[lane].colour;
-    ctx.fillRect(px0, y, pw, h);
+    const style = hitStyle(cls ? cls[i] : undefined);
+    const hollow = style === "hollow" || style === "held";
+    // The width every mark of this hit uses: a NIM bar at least NIM_MIN_PX, a
+    // hollow one HOLLOW_MIN_PX (a 10 ns NIM word is 2-3 px on the full window).
+    const ww = hollow ? Math.max(HOLLOW_MIN_PX, pw) : ls[lane].nim ? Math.max(NIM_MIN_PX, pw) : pw;
+    if (hollow) {
+      // A NIM-only word: an outline, so it reads as "only the copy saw it";
+      // grey when a lag fault kept it out of the merge. Filled only when its
+      // own width reaches the minimum, so a widened one cannot paint over a
+      // neighbour on the lane.
+      if (pw >= HOLLOW_MIN_PX || style === "held") {
+        ctx.fillStyle = style === "held" ? HELD_FILL : NIM_ONLY_FILL;
+        ctx.fillRect(px0, y, ww, h);
+      }
+      ctx.strokeStyle = style === "held" ? HELD_EDGE : (ls[lane].edge || ls[lane].colour);
+      ctx.lineWidth = 1.5;
+      ctx.strokeRect(px0 + 0.75, y + 0.75, ww - 1.5, h - 1.5);
+      ctx.lineWidth = 1;
+    } else {
+      ctx.fillStyle = ls[lane].colour;
+      ctx.fillRect(px0, y, ww, h);
+      if (ls[lane].nim) {
+        ctx.strokeStyle = ls[lane].edge;
+        ctx.strokeRect(px0 + 0.5, y + 0.5, ww - 1, h - 1);
+      }
+      if (style === "echo") hatch(ctx, px0, y, ww, h, ECHO_HATCH, true);
+    }
     if (flags & SMAF.HIT.MISMATCH) {
       // Hatched with a red outline: the time of this hit cannot be trusted,
-      // so it must not look like the solid bars around it.
-      hatch(ctx, px0, y, pw, h);
+      // so it must not look like the solid bars around it. (Red hatching on a
+      // hollow bar: white would vanish on its white fill.)
+      hatch(ctx, px0, y, ww, h, hollow ? MISMATCH_ON_HOLLOW : undefined);
       ctx.strokeStyle = "#d00";
       ctx.lineWidth = 2;
-      ctx.strokeRect(px0, y, pw, h);
+      ctx.strokeRect(px0, y, ww, h);
       ctx.lineWidth = 1;
     }
     if (flags & SMAF.HIT.TOT_CORRUPT) {
@@ -876,8 +1052,9 @@ function paintSeed(canvas, frame, seed, a, b, ls, laneOf, range, nums, pix) {
       ctx.closePath(); ctx.fill();
     }
     const n = nums.any ? nums.of(i) : undefined;
-    if (n !== undefined) marks.push([px0, y, pw, h, n]);
+    if (n !== undefined) marks.push([px0, y, ww, h, n]);
   }
+  paintPairTicks(ctx, frame, seed, a, b, ls, laneOf, X, range);
   paintSeedPixels(ctx, frame, seed, pix, X, range, marks, nums);
   for (const [mx, my, mw, mh] of marks) {
     // A tagged hit, boxed in black: its number is its row in "Tagged hits".
@@ -892,6 +1069,32 @@ function paintSeed(canvas, frame, seed, a, b, ls, laneOf, range, nums, pix) {
     tagMarker(ctx, mx + mw + 3, mx - 3, my + (mh - 13) / 2, n, x1);
   }
   return { x0, x1, laneOf };
+}
+
+/**
+ * The pair ticks: a thin dark line from each TOT word to the NIM word it is
+ * paired with, start to start, across the counter's lane and its NIM lane
+ * (adjacent, see lanes()). Only pairs with both words shipped and on screen.
+ */
+function paintPairTicks(ctx, frame, seed, a, b, ls, laneOf, X, range) {
+  const pair = frame.pair, cls = frame.cls;
+  if (!pair || !cls) return;
+  ctx.strokeStyle = PAIR_TICK;
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  let any = false;
+  for (let i = a; i < b; i++) {
+    const j = pair[i];
+    if (j < a || j >= b || (cls[i] & SMAF.PAIR.NIM_SIDE)) continue;   // drawn once, from the TOT word
+    const lt = laneOf[frame.ch[i]], ln = laneOf[frame.ch[j]];
+    if (lt === undefined || ln === undefined) continue;
+    const ti = frame.t[i] - seed.t_rel, tj = frame.t[j] - seed.t_rel;
+    if (ti < range[0] || ti > range[1] || tj < range[0] || tj > range[1]) continue;
+    ctx.moveTo(X(ti) + 0.5, MARGIN.top + lt * LANE_H + LANE_H / 2);
+    ctx.lineTo(X(tj) + 0.5, MARGIN.top + ln * LANE_H + LANE_H / 2);
+    any = true;
+  }
+  if (any) ctx.stroke();
 }
 
 const PIX_TICK_W = 2.5;          // a pixel hit's tick on a MuPix lane or row, px
@@ -958,14 +1161,22 @@ function seedHitAt(p, x, y) {
   return best;
 }
 
-function hatch(ctx, x, y, w, h) {
+/**
+ * Diagonal hatching over a bar: white "/" lines by default (the fine/coarse
+ * mismatch); `colour` and `back` (lines slanted the other way) for the echo words, so the two
+ * never look alike.
+ */
+function hatch(ctx, x, y, w, h, colour, back) {
   ctx.save();
   ctx.beginPath();
   ctx.rect(x, y, w, h);
   ctx.clip();
-  ctx.strokeStyle = "rgba(255,255,255,0.9)";
+  ctx.strokeStyle = colour || "rgba(255,255,255,0.9)";
   ctx.beginPath();
-  for (let d = -h; d < w; d += 5) { ctx.moveTo(x + d, y + h); ctx.lineTo(x + d + h, y); }
+  for (let d = -h; d < w; d += back ? 4 : 5) {
+    if (back) { ctx.moveTo(x + d, y); ctx.lineTo(x + d + h, y + h); }
+    else { ctx.moveTo(x + d, y + h); ctx.lineTo(x + d + h, y); }
+  }
   ctx.stroke();
   ctx.restore();
 }
@@ -976,6 +1187,8 @@ const ROW_H = 22;
 const RASTER_MARGIN = { left: 84, right: 110, top: 6, bottom: 34 };
 
 function renderRaster(frame) {
+  // Roles may have come from this frame's labels only (no summary yet).
+  try { updateCurrentToggle(); } catch (e) { /* the switch keeps its state */ }
   const head = document.getElementById("dqm-smaev-rasterhead");
   const holder = document.getElementById("dqm-smaev-rasterbox");
   if (!frame) {
@@ -984,6 +1197,13 @@ function renderRaster(frame) {
     return;
   }
   clearNote("raster");
+  const rn = document.getElementById("dqm-smaev-rasternim");
+  if (rn) {
+    rn.style.display = frame.cls ? "" : "none";
+    const text = "S*k*L rows: the NIM copies · dark mark above a hit: a NIM-only word" +
+      (nimMerge() ? " (merged; grey: held back, lag fault)" : " (not merged: NIM merge off)");
+    if (rn.textContent !== text) rn.textContent = text;
+  }
   guard(head, () => frameHeader(frame, head));
   guard(holder, () => paintRaster(frame));
   renderHints("raster");
@@ -1102,6 +1322,29 @@ function paintRaster(frame) {
     ctx.beginPath();
     for (let j = 0; j < pts.length; j += 2) ctx.rect(pts[j], pts[j + 1], 1.5, ROW_H - 8);
     ctx.fill();
+  }
+  // NIM-only words (smaf v3): a small dark mark above the bar, whose colour
+  // stays its ToT -- what the merge adds to each counter, and (grey) what a
+  // lag fault held back. Above rather than around the bar: on a whole frame
+  // the marks merge into a band whose density is the NIM-only share, without
+  // hiding the ToT colours below.
+  if (frame.cls) {
+    const outl = { hollow: [], held: [] };
+    for (let i = 0; i < frame.nHits; i++) {
+      const st = hitStyle(frame.cls[i]);
+      if (st !== "hollow" && st !== "held") continue;
+      const t = (off + frame.t[i]) / scale;
+      if (t < range[0] || t > range[1] || frame.ch[i] >= nCh) continue;
+      outl[st].push(X(t), M.top + frame.ch[i] * ROW_H + 1);
+    }
+    for (const [st, colour] of [["hollow", PAIR_TICK], ["held", HELD_EDGE]]) {
+      const pts = outl[st];
+      if (!pts.length) continue;
+      ctx.fillStyle = colour;
+      ctx.beginPath();
+      for (let j = 0; j < pts.length; j += 2) ctx.rect(pts[j] - 0.5, pts[j + 1], 2.5, 2.5);
+      ctx.fill();
+    }
   }
   // The MuPix rows: one path per pixel ToT code (32 colours).
   const px = pixOf(frame);
@@ -1550,9 +1793,46 @@ function hitText(frame, i, tab) {
   const tRel = frame.t[i];
   const parts = [`ch ${c}${named ? ` (${l})` : ""}`, `ToT ${frame.tot[i]}`,
     Number.isFinite(m.t0_ns) ? `t ${m.t0_ns + tRel} ns (t_rel ${tRel} ns)` : `t_rel ${tRel} ns`,
-    `fine/coarse ${frame.hitFlags[i] & SMAF.HIT.MISMATCH ? "MISMATCH" : "ok"}`,
-    wordText(frame, i, tab)];
+    `fine/coarse ${frame.hitFlags[i] & SMAF.HIT.MISMATCH ? "MISMATCH" : "ok"}`];
+  const pt = pairText(frame, i);
+  if (pt) parts.push(pt);
+  parts.push(wordText(frame, i, tab));
   return parts.join(" · ");
+}
+
+/**
+ * A hit's TOT + NIM pairing as words (smaf v3): its class, the partner and
+ * NIM - TOT, and the sub-flags. "" for a hit with no class (RF, ...) or a
+ * frame without pairing.
+ */
+function pairText(frame, i) {
+  if (!frame.cls) return "";
+  const b = frame.cls[i];
+  const c = b & SMAF.PAIR.CLASS_MASK;
+  if (c === SMAF.PAIR.NONE) return "";
+  const nimSide = !!(b & SMAF.PAIR.NIM_SIDE);
+  let text = PAIR_CLASS_TEXT[c] || `class ${c}`;
+  if (c === SMAF.PAIR.NIM_ONLY) {
+    text += b & SMAF.PAIR.LAG_HELD ? " (held back from the merge: lag fault)"
+      : nimMerge() ? " (merged into its counter)" : " (merge off)";
+  }
+  const j = frame.pair ? frame.pair[i] : -1;
+  if (c === SMAF.PAIR.PAIRED) {
+    if (!frame.pair) {
+      text += " (freeze for its partner)";
+    } else if (j >= 0) {
+      const dt = nimSide ? frame.t[i] - frame.t[j] : frame.t[j] - frame.t[i];
+      text += ` with ${labelOf(frame.ch[j])} (ch ${frame.ch[j]}), NIM − TOT ${dt > 0 ? "+" : ""}${dt} ns`;
+    } else {
+      text += " (partner outside what was shipped)";
+    }
+  }
+  const fl = [];
+  if (b & SMAF.PAIR.MULTI) fl.push("multi-candidate");
+  if (b & SMAF.PAIR.SHADOW) fl.push("in TOT shadow");
+  if (b & SMAF.PAIR.EDGE) fl.push("near frame edge");
+  if (b & SMAF.PAIR.LAG_HELD) fl.push("lag-held");
+  return `${nimSide ? "NIM word" : "TOT word"}: ${text}${fl.length ? ` [${fl.join(", ")}]` : ""}`;
 }
 
 /**
@@ -2038,11 +2318,15 @@ function seedArgs() {
            pattern: Object.assign({}, state.seedSel.pattern) };
 }
 
-/** A pattern selector object with only valid "present"/"absent" entries for S1..S5. */
-function cleanPattern(o) {
+/**
+ * A pattern selector object with only valid "present"/"absent" entries for
+ * counters 1..n (default PATTERN_MAX: a stored choice kept until the roles are known).
+ */
+function cleanPattern(o, n) {
   const out = {};
   if (!o || typeof o !== "object" || Array.isArray(o)) return out;
-  for (let k = 1; k <= N_PATTERN; k++) {
+  const max = n === undefined ? PATTERN_MAX : n;
+  for (let k = 1; k <= max; k++) {
     const v = o[String(k)];
     if (v === "present" || v === "absent") out[String(k)] = v;
   }
@@ -2068,12 +2352,14 @@ function pctText(f) {
 
 /** The inline warnings of the pattern row: one per counter with a timestamp fault. */
 function updatePatternWarnings() {
+  updatePatternHead();
   const bad = {};
   for (const f of faultedCounters()) bad[f.counter] = f;
   const r = roles();
-  for (let k = 1; k <= N_PATTERN; k++) {
+  syncPatternBoxes(r);
+  for (let k = 1; k <= nPattern(r); k++) {
     const lab = document.getElementById(`dqm-smaev-pattext-${k}`);
-    if (lab) lab.textContent = labelOf(r.counters.length >= k ? r.counters[k - 1] : k, r);
+    if (lab) lab.textContent = labelOf(r.counters[k - 1], r);
     const w = document.getElementById(`dqm-smaev-patwarn-${k}`);
     if (!w) continue;
     const f = bad[k];
@@ -2160,6 +2446,7 @@ function updateSeedOptions() {
     for (const [v, label] of opts) sel.appendChild(el("option", { value: v }, label));
   }
   sel.value = state.seedSel.seed;
+  updateCurrentToggle();
   const tab = document.getElementById("dqm-smaev-tab-seeded");
   if (tab) tab.textContent = seededTabLabel();
   const tl = document.getElementById("dqm-smaev-filtertext-tot");
@@ -2340,6 +2627,9 @@ function build() {
     "dashed red: the seed · black tick on RF: the pulse the phase is taken from · " +
     "MuPix lanes: one tick per pixel hit, coloured by pixel ToT; green band: the in-time window · " +
     "black box + number: a tagged hit"));
+  const nimNote = el("span", { class: "dqm-footnote", id: "dqm-smaev-nimlegend" }, nimLegend(false));
+  nimNote.style.display = "none";
+  sbar.appendChild(nimNote);
   seeded.appendChild(sbar);
   seeded.appendChild(patternRow());
   seeded.appendChild(el("div", { id: "dqm-smaev-note-seeded" }));
@@ -2364,9 +2654,11 @@ function build() {
     // poll: the point of the switch is to see the difference.
     if (!state.paused) startPolling();
   };
-  const lab = el("label", { for: "dqm-smaev-hidecur", class: "dqm-chip" }, "hide the current channel");
+  const lab = el("label", { for: "dqm-smaev-hidecur", class: "dqm-chip",
+                            id: "dqm-smaev-hidecurlab" }, "hide the current channel");
   lab.insertBefore(box, lab.firstChild);
   rbar.appendChild(lab);
+  updateCurrentToggle();
   const pbox = el("input", { type: "checkbox", id: "dqm-smaev-hidepix" });
   pbox.checked = state.hidePixels;
   pbox.onchange = function () {
@@ -2382,6 +2674,10 @@ function build() {
   rbar.appendChild(el("span", { class: "dqm-footnote" },
     "drag to zoom in time, double-click for the whole frame, click a hit to tag it " +
     "(a live frame is frozen first, for its word data)"));
+  const rnim = el("span", { class: "dqm-footnote", id: "dqm-smaev-rasternim" },
+    "S*k*L rows: the NIM copies · dark mark above a hit: a NIM-only word (grey: held back, lag fault)");
+  rnim.style.display = "none";
+  rbar.appendChild(rnim);
   raster.appendChild(rbar);
   raster.appendChild(el("div", { id: "dqm-smaev-note-raster" }));
   raster.appendChild(makeTagBar("raster"));
@@ -2398,30 +2694,75 @@ function build() {
 }
 
 /**
- * The per-counter pattern selector: S1..S5 each any / present / absent (a hit
- * within the coincidence window of the seed, or none), AND-ed with the seed
- * choice, the boxes and MuPix. Explicit, so nothing is ignored here; a counter
- * with a known timestamp fault gets a warning beside it instead.
+ * The per-counter pattern selector: S1..Sn (the counters of the roles) each
+ * any / present / absent (a hit within the coincidence window of the seed, or
+ * none), AND-ed with the seed choice, the boxes and MuPix. Explicit, so nothing
+ * is ignored here; a counter with a known timestamp fault gets a warning beside
+ * it instead. The selectors follow the roles (syncPatternBoxes).
  */
 function patternRow() {
   const row = el("div", { class: "dqm-strip dqm-smaev-patternrow", id: "dqm-smaev-patternrow" });
-  row.appendChild(el("span", {
-    class: "dqm-smaev-patternhead",
-    title: "Per counter: a hit within the coincidence window of the seed (present) or none " +
-           "(absent). AND-ed with the seed, the oddity boxes and MuPix.",
-  }, "and counters:"));
-  const r = roles();
-  for (let k = 1; k <= N_PATTERN; k++) {
+  row.appendChild(el("span", { class: "dqm-smaev-patternhead", id: "dqm-smaev-patternhead",
+                               title: patternTitle(false) }, "and counters:"));
+  syncPatternBoxes(roles(), row);
+  return row;
+}
+
+/** The NIM line of the seeded view's legend, for the merge on or off. */
+function nimLegend(merged) {
+  return "S*k*L lanes: the counter's NIM copy, lighter, outlined · dark tick: a TOT word and its " +
+    "NIM copy · " + (merged
+    ? "hollow: NIM-only (merged into its counter) · grey: NIM-only held back (lag fault) · "
+    : "hollow: NIM-only (shown, not merged: NIM merge off, the counters and the pattern are " +
+      "the TOT words only) · ") +
+    "dark\u00a0\\\u00a0hatch: TOT echo word (not paired)";
+}
+
+function patternTitle(merged, hasNim) {
+  return "Per counter: a hit within the coincidence window of the seed (present) or none " +
+         "(absent). AND-ed with the seed, the oddity boxes and MuPix." +
+         (merged ? " Merged: a counter's hits are its TOT words plus its NIM-only hits " +
+                   "(/DQM/SMA/NIM/merge), as nearline's."
+          : hasNim ? " TOT only: the NIM merge is off (/DQM/SMA/NIM/merge), so a counter's " +
+                     "hits are its TOT words; its NIM-only hits are shown but not counted." : "");
+}
+
+/** The pattern row's head says whether it selects on the merged counters. */
+function updatePatternHead() {
+  const h = document.getElementById("dqm-smaev-patternhead");
+  if (!h) return;
+  const hasNim = roles().nim.some((n) => n !== null);
+  const merged = nimMerge() && hasNim;
+  const text = merged ? "and counters (merged TOT + NIM):"
+    : hasNim ? "and counters (TOT only, merge off):" : "and counters:";
+  if (h.textContent !== text) h.textContent = text;
+  h.setAttribute("title", patternTitle(merged, hasNim));
+}
+
+/**
+ * One selector per counter of the roles, rebuilt when their number changes.
+ * Roles not known yet (no summary, no frame): none, and a stored choice is
+ * kept; once known, choices for counters that no longer exist are dropped.
+ */
+function syncPatternBoxes(r, rowEl) {
+  const row = rowEl || document.getElementById("dqm-smaev-patternrow");
+  if (!row) return;
+  const n = nPattern(r);
+  if (row._nBoxes === n) return;
+  row._nBoxes = n;
+  while (row.children.length > 1) row.children[row.children.length - 1].remove();
+  if (n) state.seedSel.pattern = cleanPattern(state.seedSel.pattern, n);
+  for (let k = 1; k <= n; k++) {
     const s = select(PATTERN_STATES, state.seedSel.pattern[String(k)] || "any", function (v) {
       const p = Object.assign({}, state.seedSel.pattern);
       if (v === "present" || v === "absent") p[String(k)] = v; else delete p[String(k)];
-      state.seedSel.pattern = cleanPattern(p);
+      state.seedSel.pattern = cleanPattern(p, nPattern());
       seedChoiceChanged();
     });
     s.id = `dqm-smaev-pat-${k}`;
     const lab = el("label", { class: "dqm-chip dqm-smaev-pat", for: s.id },
                    el("span", { id: `dqm-smaev-pattext-${k}` },
-                      labelOf(r.counters.length >= k ? r.counters[k - 1] : k, r)), s);
+                      labelOf(r.counters[k - 1], r)), s);
     row.appendChild(lab);
     const w = el("span", { class: "dqm-chip yellow dqm-smaev-patwarn", id: `dqm-smaev-patwarn-${k}`,
                            role: "note" });

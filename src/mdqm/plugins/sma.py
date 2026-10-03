@@ -55,7 +55,7 @@ ToT / corruption (good frames, kept hits):
 Timing (good frames; S1 = the "s1" role):
 
 ``dt_S{k}_S1``      counter k (S2..S5) minus S1, every pair in +-Cuts/dt window, 1 ns bins
-``pattern``         per S1: bit k = counter k within +-coinc window (32 bins)
+``pattern``         per S1: bit k = counter k within +-coinc window (2^n bins, n counters)
 ``s1_coinc``        counter index; per S1 with that counter in the window (entries = S1 hits)
 ``s1_partner_hits`` counter index x partners in the window per S1
 ``s1_spacing_us``   consecutive kept S1 hits
@@ -75,6 +75,26 @@ Shift (good frames):
                     configured one); entries = S1 words, so a bin over the entries
                     is the consistent fraction
 
+TOT + NIM (good frames; one set per counter k with a NIM copy, ``/DQM/SMA/NIM``):
+
+``nim_dt_Sk``          t'_NIM - t'_TOT of the nearest TOT word, every NIM word, +-200 ns
+``nim_dt_wide_Sk``     raw t_NIM - t_TOT, sampled pairs within +-2^19 ns (a lag fault)
+``nim_walk_Sk``        pairs: t'_NIM - t'_TOT x the TOT word's ToT
+``nim_classes_Sk``     0 paired (pairs), 1 TOT-only, 2 NIM-only, 3 echo, then sub-counts
+                       of those: 4 lag-held (NIM-only), 5 in TOT shadow, 6 multi-candidate
+``nim_width_Sk``       NIM word ToT field
+``nim_candidates_Sk``  NIM words in the pair window per (non-echo) TOT word
+``nim_lag_Sk``         (fine - fine of the reference S1 word) mod 2^20, the lag vote's input;
+                       filled in the voted frames only (``NIM/lag vote every``)
+``s1_coinc_tot``       ``s1_coinc`` on the TOT words alone (no merge), beside the merged one
+
+With ``NIM/merge`` on (off by default), the counters (S1 included) are the
+merged hits wherever counter times are used: ``dt_S*``, ``pattern``,
+``s1_coinc``, ``s1_partner_hits``, ``s1_spacing_us``, the RF and delayed
+histograms, the seeds, the efficiencies and the MuPix in-time matching (its
+S1 sample). ``rf_phase_vs_s1_tot`` leaves the NIM-only S1 hits out (no ToT of
+their own). The rest reads the words (see `pair_frame`).
+
 Commands: ``sma::summary``, ``sma::trend``, ``sma::frame``, ``sma::raw`` (see `commands`).
 """
 
@@ -86,11 +106,13 @@ import math
 import time
 from collections import OrderedDict, deque
 from dataclasses import dataclass, field
+from typing import NamedTuple
 
 import numpy as np
 
 from mdqm.dqm import framing
 from mdqm.dqm.hist import Axis, Hist1D, Hist2D
+from mdqm.plugins import sma_nim as N
 from mdqm.plugins import sma_words as W
 
 NCH = W.N_CHANNELS
@@ -101,14 +123,20 @@ SETTINGS_DEFAULTS: dict[str, object] = {
     #: The board's coarse = time >> shift. A per-run board setting; the self
     #: check says when another shift fits the data better.
     "Coarse shift": W.DEFAULT_SHIFT,
+    #: The defaults are the cabling since run 1015: 0 clock, 1 S1, 2 S2,
+    #: 3 S1L, 4 S4, 5 S5, 6 RF, 7 S3 (TOT), 8 WD trigger copy, 9-12 S2L-S5L.
+    #: The proton current is no longer on the SMA.
     "Channel roles": {
         "s1": 1,
-        #: S1..S5 in order; the first must be the s1 channel for the pattern
-        #: bit 0 to mean "S1".
-        "counters": [1, 2, 3, 4, 5],
+        #: S1..S5 in order, at most 8 (the pattern is one byte); the first
+        #: must be the s1 channel for the pattern bit 0 to mean "S1".
+        "counters": [1, 2, 7, 4, 5],
         "rf": 6,
-        "current": 7,
-        "delayed": [8, 9, 10],
+        #: -1 = no current channel.
+        "current": -1,
+        #: Channels histogrammed against S1 over microseconds; -1 entries
+        #: are ignored, so [-1] means none (an ODB array cannot be empty).
+        "delayed": [-1],
         #: Per-channel display names, 16 entries. Empty means the role name
         #: (S1..S5, RF, current) or "chNN". Changing them never resets a plot.
         "labels": [""] * NCH,
@@ -216,6 +244,49 @@ SETTINGS_DEFAULTS: dict[str, object] = {
         #: analyses use. 0 = all of them.
         "max S1 per frame": W.MUPIX_MAX_S1,
     },
+    #: The NIM copies of the counters (since run 1015) and how they are paired
+    #: with the TOT words (sma_nim.pair_counter, reco's rule). The per-counter
+    #: lists follow Channel roles/counters, one entry each. Editing any of
+    #: these rebuilds the histograms, except the CPU knobs (NIM_CPU_KEYS).
+    "NIM": {
+        #: The NIM channel of each counter, -1 = none ([-1] alone: no NIM at all).
+        "channels": [3, 9, 10, 11, 12],
+        #: Per counter: t'_NIM = t - offset, in whole ns. The DQM has no fine
+        #: offset or lag corrections, so these are its own constants: set them
+        #: from the nim_dt peak.
+        "offset ns": [0, 0, 0, 0, 0],
+        #: Per counter: the NIM copy's expected (fine - fine of S1) [ns], the
+        #: cable delay and flight time; the lag vote judges "faulted" from it.
+        "lag nominal ns": [0, 0, 0, 0, 0],
+        #: NIM-only hits join the counters (pattern, efficiencies, seeds). Off
+        #: until the offsets above are measured on a clean run >= 1015: with an
+        #: unmeasured offset a NIM copy more than "pair window ns" off its TOT
+        #: word pairs with nothing, and merging would count every particle
+        #: twice. The pairing plots, summary and flags run either way.
+        "merge": False,
+        #: Also merge a NIM channel's NIM-only hits in a frame whose lag vote
+        #: says "faulted" (off: those hits are held back and counted).
+        "merge when lagged": False,
+        "pair window ns": N.NimConfig.pair_window_ns,
+        #: "tot" or "nim": which time a paired hit takes.
+        "time source": N.NimConfig.time_source,
+        #: The ToT code a NIM-only hit is given.
+        "nim only tot": N.NimConfig.nim_only_tot,
+        #: Counter numbers (1 = S1) whose TOT words get the echo rule; -1 = none.
+        "echo counters": [3],
+        "echo late tot": N.NimConfig.echo_late_tot,
+        "echo edge tol ns": N.NimConfig.echo_edge_tol_ns,
+        "lag tolerance ns": N.NimConfig.lag_tol_ns,
+        "lag min pairs": N.NimConfig.lag_min_pairs,
+        "lag dominance": N.NimConfig.lag_dominance,
+        #: Vote a NIM channel's lag in every this many of its frames (1 = every
+        #: frame; always while no vote of this epoch has decided). The frames
+        #: between take the last decisive vote. A CPU knob: no plot resets.
+        "lag vote every": 4,
+        #: nim_dt_wide pairs per counter and frame, at most (about; 0 = none).
+        #: A CPU knob: no plot resets.
+        "wide pairs per frame": 1024,
+    },
     "Self check": {
         #: Shift verdict over this many seconds of good frames.
         "shift window s": 30.0,
@@ -252,10 +323,21 @@ SETTINGS_DEFAULTS: dict[str, object] = {
         "mupix sync window s": 10.0,
         "mupix sync min S1": 200,
         "mupix sync clear margin": 0.05,
+        #: TOT + NIM (flags nim_pairing, nim_offset, nim_lag): pair efficiency
+        #: paired / (paired + TOT-only) below these; the median nim_dt further
+        #: than this from 0; the lag state "faulted" in more than this share of
+        #: the frames with a lag state, after at least "nim lag min votes"
+        #: frames voted "faulted" since the last rebuild or run start. Each
+        #: needs "min hits" in the window.
+        "nim pairing warn fraction": 0.8,
+        "nim pairing error fraction": 0.5,
+        "nim offset max ns": 5.0,
+        "nim lag max fraction": 0.5,
+        "nim lag min votes": 3,
         #: Only these channels raise mismatch / ToT flags (S1, the counters
         #: and the RF by default); the others are still in the summary table.
         #: Here and not under Cuts, so editing it never resets a plot.
-        "mismatch flag channels": [1, 2, 3, 4, 5, 6],
+        "mismatch flag channels": [1, 2, 4, 5, 6, 7],
     },
     "Sampling": {
         #: The analyzer's CPU, in % of one core, everything included (reading
@@ -320,6 +402,34 @@ def _ratio(a, b, digits=6):
 # ---------------------------------------------------------------------------
 
 @dataclass
+class NimSettings:
+    """The parsed ``/DQM/SMA/NIM``: per counter (``Roles.counters`` order) and shared."""
+
+    #: NIM channel per counter, -1 = none.
+    channels: tuple = ()
+    #: Per counter, whole ns.
+    offsets: tuple = ()
+    nominal: tuple = ()
+    #: Per counter: the echo rule runs on its TOT words.
+    echo: tuple = ()
+    merge: bool = False
+    merge_when_lagged: bool = False
+    #: Vote each NIM channel's lag every this many of its frames.
+    lag_every: int = 4
+    wide_budget: int = 1024
+    cfg: N.NimConfig = field(default_factory=N.NimConfig)
+
+    def pairs(self, counters) -> list[tuple[int, int, int]]:
+        """``(k, TOT channel, NIM channel)`` of every counter with a NIM copy."""
+        return [(k, c, n) for k, (c, n) in enumerate(zip(counters, self.channels, strict=False))
+                if n >= 0]
+
+    @property
+    def active(self) -> bool:
+        return any(n >= 0 for n in self.channels)
+
+
+@dataclass
 class Config:
     """The parsed ``/DQM/SMA`` tree; every field has a safe value."""
 
@@ -332,7 +442,7 @@ class Config:
     stale_junk_words: int = 100
     stale_junk_frac: float = 0.9
     suspect_kept_frac: float = 0.5
-    flag_channels: tuple = (1, 2, 3, 4, 5, 6)
+    flag_channels: tuple = (1, 2, 4, 5, 6, 7)
     max_words: int | None = 1 << 20
     max_gap_ns: int = 10 * 10**9
     max_overlap_ns: int = 10 * 10**6
@@ -340,6 +450,7 @@ class Config:
     seed_ring_frames: int = 8
     seed_ring_bytes: int = 24 << 20
     mupix: W.MuPixCuts = field(default_factory=W.MuPixCuts)
+    nim: NimSettings = field(default_factory=NimSettings)
     binning: dict = field(default_factory=dict)
     check: dict = field(default_factory=dict)
     errors: list = field(default_factory=list)
@@ -349,8 +460,16 @@ class Config:
         return tuple(self.cuts.shift_scan)
 
     def role_channels(self) -> set:
+        """Every channel with a role, the NIM copies included; an unset
+        optional role (-1) is none."""
         r = self.roles
-        return {r.s1, r.rf, r.current, *r.counters, *r.delayed}
+        return {c for c in (r.s1, r.rf, r.current, *r.counters, *r.delayed, *self.nim.channels)
+                if c >= 0}
+
+    @property
+    def merging(self) -> bool:
+        """Counters are the merged TOT + NIM hits (NIM/merge on and a NIM copy cabled)."""
+        return self.nim.merge and self.nim.active
 
 
 def _merge(defaults: dict, given: dict | None) -> dict:
@@ -396,11 +515,22 @@ def parse_settings(settings: dict | None) -> Config:
         v = [chan(x) for x in (v if isinstance(v, list | tuple) else [v])]
         return tuple(v)
 
+    def opt_chan(v):
+        """A channel, or -1 for "none" (an optional role)."""
+        v = int(v)
+        return -1 if v == -1 else chan(v)
+
+    def opt_chans(v):
+        """Channels; -1 entries are dropped, so [] and [-1] are both "none"."""
+        return tuple(c for c in (opt_chan(x) for x in (v if isinstance(v, list | tuple)
+                                                         else [v])) if c >= 0)
+
     shift = get(None, "Coarse shift", int, lambda v: 0 <= v <= W.MAX_COARSE_SHIFT)
     R = "Channel roles"
-    roles = W.Roles(s1=get(R, "s1", chan), counters=get(R, "counters", chans, len),
-                    rf=get(R, "rf", chan), current=get(R, "current", chan),
-                    delayed=get(R, "delayed", chans))
+    roles = W.Roles(s1=get(R, "s1", chan),
+                    counters=get(R, "counters", chans, lambda v: 1 <= len(v) <= W.MAX_COUNTERS),
+                    rf=get(R, "rf", chan), current=get(R, "current", opt_chan),
+                    delayed=get(R, "delayed", opt_chans))
     raw_labels = s[R]["labels"]
     raw_labels = raw_labels if isinstance(raw_labels, list | tuple) else [raw_labels]
     labels = [str(x) for x in raw_labels][:NCH]
@@ -500,6 +630,8 @@ def parse_settings(settings: dict | None) -> Config:
         max_pixels=get(M, "max pixel hits per frame", int, lambda v: v >= 0),
         max_s1=get(M, "max S1 per frame", int, lambda v: v >= 0) or None)
 
+    nim = _parse_nim(s, roles, get, opt_chan, errors)
+
     S = "Self check"
     check = {k: get(S, k, float) for k in d[S] if k != "mismatch flag channels"}
     flag_channels = get(S, "mismatch flag channels", chans)
@@ -520,19 +652,171 @@ def parse_settings(settings: dict | None) -> Config:
                                 lambda v: 0 <= v <= 1024) * (1 << 20)),
         max_gap_ns=int(get(C, "max gap s", float, pos) * 1e9),
         max_overlap_ns=int(get(C, "max overlap ms", float, lambda v: v >= 0) * 1e6),
-        mupix=mupix, binning=binning, check=check, errors=errors)
+        mupix=mupix, nim=nim, binning=binning, check=check, errors=errors)
+
+
+def _as_bool(v) -> bool:
+    """An ODB BOOL, or y/n/true/false/1/0 typed as text or a number."""
+    if isinstance(v, bool | np.bool_):
+        return bool(v)
+    if isinstance(v, int | np.integer) and int(v) in (0, 1):
+        return bool(v)
+    t = str(v).strip().lower()
+    if t in ("y", "yes", "true", "1"):
+        return True
+    if t in ("n", "no", "false", "0"):
+        return False
+    raise ValueError("not a yes/no")
+
+
+def _whole_ns(v) -> int:
+    """A time in ns rounded to a whole ns (the pairing keeps int64 times exact)."""
+    x = float(v)
+    if not math.isfinite(x):
+        raise ValueError("not finite")
+    return int(round(x))
+
+
+def _parse_nim(s: dict, roles: W.Roles, get, opt_chan, errors: list) -> NimSettings:
+    """``/DQM/SMA/NIM`` -> NimSettings, falling back per key (see parse_settings).
+
+    The per-counter lists must have one entry per counter (``[-1]`` alone is
+    accepted for "no NIM copies", and without any NIM channel the offsets and
+    nominals are not judged). A NIM channel that is also S1, a counter, the
+    RF, ``current`` or a ``delayed`` channel means the channel roles and the
+    NIM map disagree -- typically a pre-1015 ODB that got the seeded NIM
+    defaults -- so NIM is switched off altogether (no pairing, no merge) with
+    one settings error naming the collisions. A NIM channel repeating another
+    counter's is dropped (-1) alone. Offsets and nominals are whole ns; a
+    fractional one is rounded with a settings note.
+    """
+    K = "NIM"
+    d = SETTINGS_DEFAULTS[K]
+    nc = len(roles.counters)
+
+    def as_list(v):
+        return list(v) if isinstance(v, list | tuple) else [v]
+
+    def per_counter(key, conv, fill, allow_none=False):
+        raw = s[K][key]
+        dflt = [conv(x) for x in d[key]]
+        fallback = tuple(dflt) if len(dflt) == nc else (fill,) * nc
+        try:
+            vals = [conv(x) for x in as_list(raw)]
+        except (TypeError, ValueError) as exc:
+            errors.append(f"NIM/{key}={raw!r}: {exc}; using {list(fallback)!r}")
+            return fallback
+        if allow_none and vals == [-1]:
+            return (-1,) * nc
+        if len(vals) != nc:
+            errors.append(f"NIM/{key}={raw!r}: {len(vals)} entries for {nc} counters; "
+                          f"using {list(fallback)!r}")
+            return fallback
+        return tuple(vals)
+
+    chans = list(per_counter("channels", opt_chan, -1, allow_none=True))
+    # What each role channel is, for the message (S1 first: it is a counter too).
+    role_of: dict[int, str] = {}
+    for c, what in ((roles.s1, "S1"),
+                    *((c, f"counter S{k + 1}") for k, c in enumerate(roles.counters)),
+                    (roles.rf, "the RF"), (roles.current, "current"),
+                    *((c, "delayed") for c in roles.delayed)):
+        if c >= 0:
+            role_of.setdefault(c, what)
+    clash = [(k, n) for k, n in enumerate(chans) if n >= 0 and n in role_of]
+    if clash:
+        errors.append(
+            "Channel roles look pre-1015: NIM/channels "
+            + ", ".join(f"{n} (S{k + 1}'s NIM copy) is {role_of[n]}" for k, n in clash)
+            + "; NIM is off (no pairing, no merge). Set the run-1015 roles with the odbedit "
+            "lines in docs/SMA-DQM.md ('Settings'), or NIM/channels = -1 for the old cabling")
+        chans = [-1] * nc
+    seen = set()
+    for k, n in enumerate(chans):
+        if n < 0:
+            continue
+        if n in seen:
+            errors.append(f"NIM/channels: S{k + 1}'s NIM channel {n} is also another counter's "
+                          f"NIM channel; S{k + 1} gets no NIM copy")
+            chans[k] = -1
+            continue
+        seen.add(n)
+
+    def nominal(v):
+        v = _whole_ns(v)
+        if not -N.HALF_FINE_WRAP_NS < v < N.HALF_FINE_WRAP_NS:
+            raise ValueError("not in (-2^19, 2^19) ns")
+        return v
+
+    def note_rounding(key, vals):
+        raw = as_list(s[K][key])
+        try:
+            frac = [float(x) for x in raw]
+        except (TypeError, ValueError):
+            return
+        if len(frac) == len(vals) and any(f != v for f, v in zip(frac, vals, strict=True)):
+            errors.append(f"NIM/{key}={raw!r}: whole ns only; using {list(vals)!r}")
+
+    if any(n >= 0 for n in chans):
+        offsets = per_counter("offset ns", _whole_ns, 0)
+        nominals = per_counter("lag nominal ns", nominal, 0)
+        note_rounding("offset ns", offsets)
+        note_rounding("lag nominal ns", nominals)
+    else:                                   # nothing to align: not judged
+        offsets = nominals = (0,) * nc
+
+    def counter_numbers(v):
+        out = {int(x) for x in as_list(v)} - {-1}
+        if any(not 1 <= x <= nc for x in out):
+            raise ValueError(f"not a counter number 1-{nc} (or -1)")
+        return frozenset(out)
+
+    raw = s[K]["echo counters"]
+    try:
+        echo = counter_numbers(raw)
+    except (TypeError, ValueError) as exc:
+        echo = frozenset(x for x in d["echo counters"] if 1 <= x <= nc)
+        errors.append(f"NIM/echo counters={raw!r}: {exc}; using {sorted(echo) or [-1]!r}")
+    echo = tuple(k + 1 in echo for k in range(nc))
+    try:
+        cfg = N.NimConfig(
+            pair_window_ns=get(K, "pair window ns", float, lambda v: v > 0),
+            time_source=get(K, "time source", lambda v: str(v).strip().lower(),
+                            lambda v: v in N.TIME_SOURCES),
+            nim_only_tot=get(K, "nim only tot", int, lambda v: 0 <= v <= 255),
+            echo_late_tot=get(K, "echo late tot", int),
+            echo_edge_tol_ns=get(K, "echo edge tol ns", float),
+            lag_tol_ns=get(K, "lag tolerance ns", float, lambda v: 0 < v < 1024),
+            lag_min_pairs=get(K, "lag min pairs", int, lambda v: v >= 1),
+            lag_dominance=get(K, "lag dominance", float, lambda v: v >= 1))
+    except ValueError as exc:                     # a combination NimConfig refuses
+        errors.append(f"NIM: {exc}; using the pairing defaults")
+        cfg = N.NimConfig()
+    return NimSettings(
+        channels=tuple(chans), offsets=offsets, nominal=nominals, echo=echo,
+        merge=get(K, "merge", _as_bool), merge_when_lagged=get(K, "merge when lagged", _as_bool),
+        lag_every=get(K, "lag vote every", int, lambda v: v >= 1),
+        wide_budget=get(K, "wide pairs per frame", int, lambda v: v >= 0), cfg=cfg)
+
+
+#: ``/DQM/SMA/NIM`` keys that only bound the CPU: editing them rebuilds nothing.
+NIM_CPU_KEYS = ("wide pairs per frame", "lag vote every")
 
 
 def shape_fingerprint(settings: dict) -> str:
-    """What changes the histograms: shift, roles (but not labels), cuts, binning, MuPix.
+    """What changes the histograms: shift, roles (but not labels), cuts, binning, MuPix, NIM.
 
     Labels are left out on purpose -- renaming a channel must never reset an
-    afternoon of plots. The self-check and sampling settings change no plot.
+    afternoon of plots. The self-check and sampling settings change no plot,
+    nor do NIM's CPU knobs (`NIM_CPU_KEYS`).
     """
     s = _merge(SETTINGS_DEFAULTS, settings)
     roles = {k: v for k, v in s["Channel roles"].items() if k != "labels"}
+    # NIM's CPU knobs change how much is filled, not what a plot means.
+    nim = {k: v for k, v in s["NIM"].items() if k not in NIM_CPU_KEYS}
     return json.dumps({"shift": s["Coarse shift"], "roles": roles, "Cuts": s["Cuts"],
-                       "Binning": s["Binning"], "MuPix": s["MuPix"]}, sort_keys=True,
+                       "Binning": s["Binning"], "MuPix": s["MuPix"], "NIM": nim},
+                      sort_keys=True,
                       default=str)
 
 
@@ -617,6 +901,172 @@ def classify_frame(fr: W.Frame, cfg: Config, n_s1: int, scan_counts, n_s1_all: i
 
 
 # ---------------------------------------------------------------------------
+# TOT + NIM pairing of a good frame
+# ---------------------------------------------------------------------------
+
+#: `NimWords.cls` of a kept hit that is neither a paired counter's TOT word
+#: nor its NIM word (the RF, S1 without a NIM copy, ...).
+NIM_NO_CLASS = 255
+#: `NimWords.flags` bit (above sma_nim's flag bits): a NIM-only word held back
+#: from the merge because its channel's lag vote said "faulted" in this frame.
+NIM_LAG_HELD = 1 << 15
+#: Columns of `_Second.nim` (one row per counter). The first nine are counts
+#: of words / hits; "frames" counts the frames paired; then the frames by
+#: lag-vote state (sma_nim.LAG_STATES), the frames not voted (NIM/lag vote
+#: every), and the frames by lag state (`NimFrame.state`: the frame's own
+#: decisive vote, else the epoch's last).
+NIM_COLS = ("tot_words", "nim_words", "paired", "tot_only", "nim_only", "echo", "lag_held",
+            "shadow", "multi", "frames", *(f"lag_{x}" for x in N.LAG_STATES), "lag_skipped",
+            "state_ok", "state_faulted")
+_NC = {name: k for k, name in enumerate(NIM_COLS)}
+
+
+class NimWords(NamedTuple):
+    """A frame's pairing per kept hit (``Frame.s_*`` index), for the event display.
+
+    ``cls``: sma_nim.PAIRED / TOT_ONLY / ECHO_WORD for a paired counter's TOT
+    word, PAIRED / NIM_ONLY for its NIM word, NIM_NO_CLASS otherwise.
+    ``partner``: the ``s_*`` index of the word it is paired with, -1 if none.
+    ``flags``: sma_nim's flag bits (a paired NIM word carries its pair's), plus
+    NIM_LAG_HELD.
+    """
+
+    cls: np.ndarray        # uint8
+    partner: np.ndarray    # int32
+    flags: np.ndarray      # uint16
+
+
+@dataclass
+class LagMemory:
+    """One NIM channel's lag state over an epoch (`pair_frame`'s ``memory``).
+
+    ``state`` is the last decisive vote ("ok" or "faulted") since the last
+    rebuild or run start, None before the first. A frame whose own vote does
+    not decide ("none": too few NIM words with an S1 reference; "ambiguous"),
+    or that is not voted at all (``NIM/lag vote every``), takes it: the lag
+    fault is a whole-file state, so a quiet frame after a faulted one is
+    still faulted. A later "ok" vote clears it.
+    """
+
+    state: str | None = None
+    #: Frames to pass before the next vote.
+    skip: int = 0
+    #: Decisive votes this epoch, and how many of them said "faulted".
+    votes: int = 0
+    faulted_votes: int = 0
+
+
+@dataclass
+class NimFrame:
+    """`pair_frame` on one frame; the dicts are keyed by counter index k (0 = S1)."""
+
+    results: dict          # k -> sma_nim.PairResult
+    votes: dict            # k -> sma_nim.LagVote, or None: not voted in this frame
+    #: k -> the channel's lag state in this frame: its own decisive vote,
+    #: else the epoch's last (`LagMemory`); None: none known.
+    state: dict
+    held: dict             # k -> bool: its NIM-only hits were held back from the merge
+    #: TOT channel -> W.CounterHits, the merged hits (empty when not merging).
+    hits: dict
+    words: NimWords
+
+
+def pair_frame(fr: W.Frame, cfg: Config, memory: dict | None = None,
+               update: bool = True) -> NimFrame | None:
+    """Pair every counter that has a NIM copy, on all its kept words, and vote the lags.
+
+    Per counter k with TOT channel c and NIM channel n (``NIM/channels``):
+
+    * `sma_nim.pair_counter` on c's and n's kept words: n aligned by its
+      ``NIM/offset ns``, the echo rule if k is in ``NIM/echo counters``, the
+      frame's first/last kept hit and the ``Frame.chan`` positions for the edge
+      flag and the ties, as nearline does.
+    * `sma_nim.lag_vote` of n against the S1 role channel on the raw fine and
+      coarse fields of every trigger word, with k's ``NIM/lag nominal ns``.
+      Measured only: nothing is corrected. With ``memory`` (k -> `LagMemory`,
+      the plugin's, per epoch) the vote runs in every ``NIM/lag vote every``-th
+      frame of the channel once a vote has decided, and a frame without a
+      decisive vote of its own takes the memory's state; ``update`` False
+      reads the memory without changing it (a frame rebuilt for a page).
+      Without ``memory`` every frame votes and stands alone.
+    * With merging on (`Config.merging`), c's counter hits become the merged
+      hits (`W.CounterHits`, set on the frame by the caller). In a frame whose
+      lag state is "faulted", n's NIM-only hits are held back unless
+      ``NIM/merge when lagged``: a lagged NIM word sits ~150 us or ~0.9 us off
+      and would only add accidentals. Nothing is held with merging off.
+
+    None when no counter has a NIM copy. With merging off the counters stay
+    the TOT words (``hits`` is empty), and ``NIM/time source`` changes nothing.
+    """
+    nim = cfg.nim
+    if not nim.active:
+        return None
+    n_kept = int(fr.s_t.size)
+    cls = np.full(n_kept, NIM_NO_CLASS, dtype=np.uint8)
+    partner = np.full(n_kept, -1, dtype=np.int32)
+    flags = np.zeros(n_kept, dtype=np.uint16)
+    out = NimFrame(results={}, votes={}, state={}, held={}, hits={},
+                   words=NimWords(cls, partner, flags))
+    s1 = cfg.roles.s1
+    pairs = nim.pairs(cfg.roles.counters)
+    mems = {k: (memory.setdefault(k, LagMemory()) if memory is not None else None)
+            for k, _c, _n in pairs}
+    # Which channels vote in this frame, then the stream positions of their
+    # words and of S1's in one pass over the bank (the vote of one NIM channel
+    # reads only its words and S1's).
+    voting = {k for k, _c, _n in pairs
+              if mems[k] is None or not update or mems[k].state is None or mems[k].skip <= 0}
+    pos = {}
+    if voting:
+        want = [s1] + [n for k, _c, n in pairs if k in voting]
+        sel = np.flatnonzero(np.isin(fr.ch, want))
+        chs = fr.ch[sel]
+        pos = {c: sel[chs == c] for c in want}
+    for k, c, n in pairs:
+        it = np.asarray(fr.chan[c], dtype=np.intp)
+        inn = np.asarray(fr.chan[n], dtype=np.intp)
+        pr = N.pair_counter(fr.s_t[it], fr.s_tot[it], fr.s_t[inn], fr.s_tot[inn], nim.cfg,
+                            frame_lo=fr.first, frame_hi=fr.last, idx_tot=it, idx_nim=inn,
+                            nim_offset_ns=nim.offsets[k], echo=nim.echo[k])
+        mem = mems[k]
+        vote = None
+        if k in voting:
+            vote = N.lag_vote(fr.ch, fr.coarse, fr.fine, n, s1, nim.cfg,
+                              nominal_ns=nim.nominal[k], ref_idx=pos[s1], nim_idx=pos[n])
+        decided = vote is not None and vote.state in ("ok", "faulted")
+        state = vote.state if decided else (mem.state if mem is not None else None)
+        if mem is not None and update:
+            if decided:
+                mem.state = vote.state
+                mem.votes += 1
+                mem.faulted_votes += vote.faulted
+            # The next vote: in lag_every frames once a state is known, else next frame.
+            mem.skip = (nim.lag_every - 1 if vote is not None else mem.skip - 1) \
+                if mem.state is not None else 0
+        held = state == "faulted" and nim.merge and not nim.merge_when_lagged
+        out.results[k], out.votes[k], out.state[k], out.held[k] = pr, vote, state, held
+        if nim.merge:
+            m = pr.merged_hits(nim_only=not held)
+            from_nim = m.cls == N.NIM_ONLY
+            carrier = np.empty(m.n, dtype=np.intp)
+            carrier[from_nim] = inn[m.src[from_nim]]
+            carrier[~from_nim] = it[m.src[~from_nim]]
+            out.hits[c] = W.CounterHits(np.asarray(m.t, dtype=np.int64), m.tot, carrier)
+        cls[it] = pr.cls_tot
+        cls[inn] = pr.cls_nim
+        flags[it] = pr.flags_tot
+        f_nim = pr.flags_nim
+        if held:
+            f_nim = f_nim | np.where(pr.cls_nim == N.NIM_ONLY, NIM_LAG_HELD, 0).astype(np.uint16)
+        flags[inn] = f_nim
+        pa = pr.partner_tot >= 0
+        partner[it[pa]] = inn[pr.partner_tot[pa]]
+        pb = pr.partner_nim >= 0
+        partner[inn[pb]] = it[pr.partner_nim[pb]]
+    return out
+
+
+# ---------------------------------------------------------------------------
 # per-second accumulators (trend, summary, shift ring)
 # ---------------------------------------------------------------------------
 
@@ -628,7 +1078,7 @@ class _Second:
                  "mismatch", "tot_bad",
                  "stale_words", "n_s1", "n_s1_kept", "eff", "rf_valid", "rf_vetoed", "scan",
                  "shift_counts", "shift_n", "mp_frames", "mp_pix", "mp_examined", "mp_skipped",
-                 "mp_n", "mp_in", "mp_side", "mp_chip", "mp_rows", "mp_unsorted")
+                 "mp_n", "mp_in", "mp_side", "mp_chip", "mp_rows", "mp_unsorted", "nim")
 
     def __init__(self, t: int, epoch: int, n_counters: int, scan: tuple):
         self.t = t
@@ -662,6 +1112,17 @@ class _Second:
         self.mp_in = np.zeros(3, dtype=np.int64)
         self.mp_side = np.zeros(3, dtype=np.int64)
         self.mp_chip = np.zeros(W.N_CHIP_IDS, dtype=np.int64)
+        #: TOT + NIM, per counter (rows) and NIM_COLS (columns); all zero for
+        #: a counter without a NIM copy.
+        self.nim = np.zeros((n_counters, len(NIM_COLS)), dtype=np.int64)
+
+    def nim_eff(self) -> list | None:
+        """Pair efficiency paired / (paired + TOT-only) per counter (S1 first),
+        None for a counter without such hits; None when no counter has any."""
+        p, t = self.nim[:, _NC["paired"]], self.nim[:, _NC["tot_only"]]
+        if not (p + t).any():
+            return None
+        return [_ratio(a, a + b, 4) for a, b in zip(p, t, strict=True)]
 
     def mupix_row(self, widths=(1.0, 1.0)) -> dict | None:
         """The trend's MuPix entry: in-time, sideband and accidental-corrected
@@ -703,6 +1164,8 @@ class _Second:
             "eff": eff,
             "rf_valid": _ratio(self.rf_valid, self.n_s1, 4),
             "mupix": self.mupix_row(widths),
+            # TOT + NIM pair efficiency per counter, S1 first (trend's nim_counters).
+            "nim_eff": self.nim_eff(),
         }
 
 
@@ -799,6 +1262,11 @@ class _Snapshot:
     #: been analysed by then (itself included): the seeded view's staleness.
     at: float = 0.0
     good_n: int = 0
+    #: The NIM view of the settings the frame was analysed (paired) under:
+    #: ``{"roles": ..., "nim_merge": bool}``, None without NIM copies. The
+    #: event display encodes from it, never from the settings of now: a frame
+    #: held across a settings edit keeps the map and merge state of its pairing.
+    nim: dict | None = None
 
 
 def snapshot_bytes(snap: _Snapshot) -> int:
@@ -906,6 +1374,12 @@ class SmaPlugin:
         self._mp_flagged = False
         self._mp_last: dict = {"state": "insufficient"}
         self._mp_eval_t: int | None = None
+        #: Per counter index k: the last frame's lag vote with a lag,
+        #: ``(when, lag ns, state)``; cleared with each epoch.
+        self._nim_last: dict[int, tuple] = {}
+        #: Per counter index k: its NIM channel's lag state this epoch
+        #: (`LagMemory`: the sticky state, the vote cadence); cleared with each epoch.
+        self._nim_mem: dict[int, LagMemory] = {}
         self._build()
 
     # -- settings --------------------------------------------------------------
@@ -934,6 +1408,8 @@ class SmaPlugin:
         self.epoch += 1
         self._mp_low_since = None
         self._mp_flagged = False
+        self._nim_last = {}
+        self._nim_mem = {}
         self._roll(force=True)
 
     # -- histograms ------------------------------------------------------------
@@ -1046,6 +1522,51 @@ class SmaPlugin:
                                          "coarse shift"),
                                     "Consistent S1 words per trial shift (entries = S1 words)")
         self._build_mupix()
+        self._build_nim()
+
+    def _build_nim(self) -> None:
+        """The TOT + NIM histograms, per counter with a NIM copy (see _fill_nim)."""
+        cfg, h = self.cfg, self.h
+        nim = cfg.nim
+        h["nim"] = {}
+        if not nim.active:
+            return
+        labels = self.labels()
+        w = int(math.ceil(nim.cfg.pair_window_ns))
+        H = N.HALF_FINE_WRAP_NS
+        for k, c, n in nim.pairs(cfg.roles.counters):
+            name = f"S{k + 1}"
+            what = f"{name} (TOT ch {c}, NIM ch {n})"
+            h["nim"][k] = {
+                "dt": self._h1(f"nim_dt_{name}", Axis(401, -200.5, 200.5, "t'_NIM - t'_TOT (ns)"),
+                               f"{what}: NIM minus the nearest TOT word, every NIM word "
+                               f"(offset {nim.offsets[k]} ns)"),
+                "wide": self._h1(f"nim_dt_wide_{name}", Axis(4096, -H, H, "t_NIM - t_TOT (ns)"),
+                                 f"{what}: NIM minus TOT within +-2^19 ns, raw times, sampled"),
+                "walk": self._h2(f"nim_walk_{name}", Axis(2 * w + 1, -w - 0.5, w + 0.5,
+                                                          "t'_NIM - t'_TOT (ns)"),
+                                 Axis(256, 0, 256, "TOT ToT code"),
+                                 f"{what}: pairs, NIM minus TOT vs the TOT word's ToT"),
+                "classes": self._h1(f"nim_classes_{name}",
+                                    Axis(7, -0.5, 6.5,
+                                         "0 pair 1 TOT 2 NIM 3 echo 4 held 5 shadow 6 multi"),
+                                    f"{what}: hits by class (entries = hits; 4-6 are "
+                                    "sub-counts: lag-held, in TOT shadow, multi-candidate)"),
+                "width": self._h1(f"nim_width_{name}", Axis(256, 0, 256, "NIM ToT code"),
+                                  f"{labels[n]} (ch {n}): NIM word width"),
+                "candidates": self._h1(f"nim_candidates_{name}",
+                                       Axis(11, -0.5, 10.5, "NIM words in the pair window"),
+                                       f"{what}: NIM candidates per TOT word "
+                                       f"(+-{nim.cfg.pair_window_ns} ns)"),
+                "lag": self._h1(f"nim_lag_{name}",
+                                Axis(1024, 0, W.FINE_WRAP_NS, "(fine - fine(S1)) mod 2^20 (ns)"),
+                                f"{labels[n]} (ch {n}) fine minus the reference S1 word's "
+                                f"(lag vote; nominal {nim.nominal[k]} ns)"),
+            }
+        cax = self.h["s1_coinc"].x
+        h["s1_coinc_tot"] = self._h1("s1_coinc_tot", Axis(cax.n, cax.lo, cax.hi, cax.title),
+                                     "S1 hits with the counter in the window, TOT words only "
+                                     "(entries = S1 hits)")
 
     def _build_mupix(self) -> None:
         """The MuPix histograms (good frames; see _fill_mupix)."""
@@ -1210,6 +1731,11 @@ class SmaPlugin:
             sec.suspect += 1
         else:
             gap = self._fill_good(fr, sec, now)
+            # TOT + NIM: pair every word, then (merging) the counters are the
+            # merged hits from here on -- before the S1 sample is drawn.
+            nf = self._pair(fr, update=True)
+            if nf is not None:
+                self._fill_nim(fr, nf, sec, now)
             # The all-S1 shift scan was done above to classify the frame.
             an = W.analyse_frame(fr, cfg.roles, cfg.cuts, shift_counts=scan_all)
             sampled = self._fill_analysis(fr, an, sec)
@@ -1222,7 +1748,8 @@ class SmaPlugin:
                          post_ns=cfg.cuts.seed_post_ns,
                          event_id=int(getattr(hdr, "event_id", W.EVID_READOUT)),
                          timestamp=int(getattr(hdr, "timestamp", 0) or 0),
-                         trigger_mask=int(getattr(hdr, "trigger_mask", 0) or 0))
+                         trigger_mask=int(getattr(hdr, "trigger_mask", 0) or 0),
+                         nim=self._nim_view())
         snap.at = now
         self._keep_raw(snap, event, data)
         self._last = snap
@@ -1335,12 +1862,25 @@ class SmaPlugin:
         scan_all = W.shift_scan(fr.coarse[s1_all], fr.fine[s1_all], cfg.scan, c.latch_margin_ns)
         cls, reason, _best = classify_frame(fr, cfg, n_s1, scan_counts,
                                             int(np.count_nonzero(s1_all)), scan_all)
-        an = (W.analyse_frame(fr, cfg.roles, cfg.cuts, shift_counts=scan_all)
-              if cls == "good" else None)
+        an = None
+        if cls == "good":
+            self._pair(fr)
+            an = W.analyse_frame(fr, cfg.roles, cfg.cuts, shift_counts=scan_all)
         return _Snapshot(seq=entry.seq, run=entry.run, serial=entry.serial, fr=fr, an=an,
                          cls=cls, reason=reason, gap_ns=None, shift=cfg.shift,
                          tot_min=c.tot_corrupt_min, pre_ns=c.seed_pre_ns, post_ns=c.seed_post_ns,
-                         event_id=eid, timestamp=ts, trigger_mask=tmask)
+                         event_id=eid, timestamp=ts, trigger_mask=tmask, nim=self._nim_view())
+
+    def _nim_view(self) -> dict | None:
+        """`_Snapshot.nim` under the current settings (a frame is paired with them now)."""
+        cfg = self.cfg
+        if not cfg.nim.active:
+            return None
+        r = cfg.roles
+        return {"roles": {"s1": r.s1, "counters": list(r.counters), "rf": r.rf,
+                          "current": r.current, "delayed": list(r.delayed),
+                          "nim": list(cfg.nim.channels)},
+                "nim_merge": bool(cfg.merging)}
 
     def _seeded_snap(self):
         """The last frame that had seeds, else the last good one.
@@ -1472,6 +2012,72 @@ class SmaPlugin:
         h["fine_bit_occupancy"].add_counts(occ, entries=int(hits.sum()))
         return gap
 
+    def _pair(self, fr: W.Frame, update: bool = False) -> NimFrame | None:
+        """`pair_frame` with the epoch's lag memory (advanced only with
+        ``update``: a frame analysed as it arrives, not one rebuilt for a page),
+        and its result put on the frame: the merged counter hits
+        (``Frame.counter_hits``) and the per-hit pairing (``Frame.pairing``)."""
+        nf = pair_frame(fr, self.cfg, self._nim_mem, update=update)
+        if nf is not None:
+            fr.counter_hits = nf.hits or None
+            fr.pairing = nf.words
+        return nf
+
+    def _fill_nim(self, fr: W.Frame, nf: NimFrame, sec: _Second, now: float) -> None:
+        """The TOT + NIM histograms and counts of a good frame (every word)."""
+        hs = self.h["nim"]
+        budget = self.cfg.nim.wide_budget
+        H = N.HALF_FINE_WRAP_NS
+        for k, pr in nf.results.items():
+            hh = hs.get(k)
+            if hh is None:
+                continue
+            vote, held, state = nf.votes[k], nf.held[k], nf.state[k]
+            cnt = pr.counts()
+            n_held = cnt["nim_only"] if held else 0
+            row = sec.nim[k]
+            for name in ("tot_words", "nim_words", "paired", "tot_only", "nim_only", "echo",
+                         "shadow", "multi"):
+                row[_NC[name]] += cnt[name]
+            row[_NC["lag_held"]] += n_held
+            row[_NC["frames"]] += 1
+            if vote is None:
+                row[_NC["lag_skipped"]] += 1
+            else:
+                row[_NC[f"lag_{vote.state}"]] += 1
+                if vote.lag_ns is not None:
+                    self._nim_last[k] = (now, vote.lag_ns, vote.state)
+            if state is not None:
+                row[_NC[f"state_{state}"]] += 1
+
+            classes = np.array([0, cnt["paired"], cnt["tot_only"], cnt["nim_only"], cnt["echo"],
+                                n_held, cnt["shadow"], cnt["multi"], 0], dtype=np.int64)
+            hh["classes"].add_counts(classes, entries=int(classes[1:5].sum()))
+            # Whole-ns times (the offsets are rounded): integer bins, the
+            # values' own (bin centres on the integers).
+            if pr.nim_dt.size and pr.t_tot.size:
+                _fill_1d_index(hh["dt"], pr.nim_dt.astype(np.intp) + (hh["dt"].x.n // 2 + 1))
+            if pr.tot_nim.size:
+                wc = np.bincount(pr.tot_nim.astype(np.intp), minlength=256)[:256]
+                hh["width"].add_counts(_with_flow(wc), entries=int(pr.tot_nim.size))
+            live = pr.n_cand_tot[~pr.echo]
+            if live.size:
+                _fill_1d_index(hh["candidates"], live.astype(np.intp) + 1)
+            dtp = pr.pair_dt
+            if dtp.size:
+                hw = hh["walk"]
+                _fill_2d_index(hw, dtp.astype(np.intp) + (hw.x.n // 2 + 1),
+                               pr.pair_tot.astype(np.intp) + 1)
+            # The lag vote's input, from the voted frames only (NIM/lag vote
+            # every): the shape is the same, the entries fewer.
+            if vote is not None and vote.d.size:
+                _fill_1d_index(hh["lag"], (vote.d >> 10).astype(np.intp) + 1)
+            if budget > 0:
+                c, n = self.cfg.roles.counters[k], self.cfg.nim.channels[k]
+                wd = N.wide_dt(fr.times(c), fr.times(n), fr.first, fr.last, budget)
+                if wd.size:
+                    _fill_1d_index(hh["wide"], ((wd + H) >> 8) + 1)
+
     def _fill_analysis(self, fr: W.Frame, an: W.FrameAnalysis,
                        sec: _Second) -> W.FrameAnalysis:
         """The S1-seeded fills; returns the rows filled (the S1 sample)."""
@@ -1498,6 +2104,8 @@ class SmaPlugin:
         cc = np.zeros(h["s1_coinc"].counts.shape, dtype=np.int64)
         cc[1:nc + 1] = coinc
         h["s1_coinc"].add_counts(cc, entries=n1)
+        if "s1_coinc_tot" in h:
+            self._fill_coinc_tot(fr, cc, n1)
         # Integer bins on both axes (counter index, partner count).
         k = np.broadcast_to(np.arange(1, nc + 1, dtype=np.intp), an.partner_counts.shape)
         _fill_2d_index(h["s1_partner_hits"], k.ravel(),
@@ -1514,12 +2122,42 @@ class SmaPlugin:
             ph = an.rf_phase[v]
             _fill_values(h["rf_phase_s1"], ph)
             _fill_values(h["rf_period"], an.rf_period[v])
-            _fill_2d(h["rf_phase_vs_s1_tot"], ph, an.s1_tot[v].astype(np.float64))
+            # A NIM-only S1 hit (merged from S1L) has no ToT of its own: it is
+            # left out of the ToT-binned plot rather than drawing a stripe at
+            # NIM/nim only tot.
+            tv = v
+            s1c = self.cfg.roles.s1
+            if fr.counter_hits and s1c in fr.counter_hits:
+                rows = (np.arange(n1) if an.s1_rows is None else an.s1_rows)
+                carrier = fr.counter_idx(s1c)[rows]
+                tv = v & (fr.s_ch[carrier] == s1c)
+            _fill_2d(h["rf_phase_vs_s1_tot"], an.rf_phase[tv], an.s1_tot[tv].astype(np.float64))
         for ch, (_i, dt) in an.delayed_dt.items():
             hh = h["delayed"].get(ch)
             if hh is not None and dt.size:
                 _fill_values(hh, dt * 1e-3)
         return an
+
+    def _fill_coinc_tot(self, fr: W.Frame, merged_cc, n_merged: int) -> None:
+        """``s1_coinc_tot``: ``s1_coinc`` on the TOT words alone, S1 sampled the
+        same way (the merged counts as they are when nothing is merged)."""
+        h = self.h["s1_coinc_tot"]
+        if not fr.counter_hits:
+            h.add_counts(merged_cc, entries=n_merged)
+            return
+        cfg = self.cfg
+        t1 = fr.times(cfg.roles.s1)
+        m = cfg.cuts.max_s1
+        if m is not None and t1.size > m:
+            t1 = t1[W.even_sample(t1.size, int(m))]
+        if not t1.size:
+            return
+        _pat, counts = W.coincidence(t1, [fr.times(c) for c in cfg.roles.counters],
+                                     cfg.cuts.coinc_ns)
+        nc = counts.shape[1]
+        cc = np.zeros(h.counts.shape, dtype=np.int64)
+        cc[1:nc + 1] = np.count_nonzero(counts > 0, axis=0)
+        h.add_counts(cc, entries=int(t1.size))
 
     def _fill_mupix(self, fr: W.Frame, t_s1, sec: _Second) -> None:
         """MuPix of a good frame: occupancy, ToT, and the S1 matching.
@@ -1712,11 +2350,23 @@ class SmaPlugin:
         names = {}
         for c in r.delayed:
             names[c] = f"ch{c:02d}"
-        names[r.current] = "current"
+        if r.current >= 0:
+            names[r.current] = "current"
         names[r.rf] = "RF"
+        for k, _c, n in self.cfg.nim.pairs(r.counters):
+            names[n] = f"S{k + 1}L"
         for k, c in enumerate(r.counters):
             names[c] = f"S{k + 1}"
         return [self.cfg.labels[c] or names.get(c, f"ch{c:02d}") for c in range(NCH)]
+
+    def _pair_of(self, c: int) -> int | None:
+        """A NIM channel's counter channel, a counter's NIM channel; None otherwise."""
+        for _k, ct, n in self.cfg.nim.pairs(self.cfg.roles.counters):
+            if c == n:
+                return ct
+            if c == ct:
+                return n
+        return None
 
     def _role_of(self, c: int) -> str:
         r = self.cfg.roles
@@ -1724,7 +2374,9 @@ class SmaPlugin:
             return "s1" if c == r.s1 else "counter"
         if c == r.rf:
             return "rf"
-        if c == r.current:
+        if c >= 0 and c in self.cfg.nim.channels:
+            return "nim"
+        if c == r.current and c >= 0:
             return "current"
         if c in r.delayed:
             return "delayed"
@@ -1770,6 +2422,8 @@ class SmaPlugin:
             "mismatch_frac": _ratio(mism[c], hits[c], 4),
             "stale": int(stw[c]),
             "flagged": c in cfg.flag_channels,
+            #: A NIM row's counter channel, a counter's NIM channel, else None.
+            "pair_of": self._pair_of(c),
         } for c in range(NCH)]
         efficiency = []
         for k, c in enumerate(cfg.roles.counters):
@@ -1841,10 +2495,84 @@ class SmaPlugin:
             #: rule); SMAEvents' "incomplete pattern" leaves them out.
             "timestamp_faults": self._timestamp_faults(hits, mism, shift["verdict"]),
             "mupix": self._mupix_summary(secs, now),
+            #: The channel map, so the pages need not guess roles from labels;
+            #: "nim" follows "counters" (-1 = no NIM copy).
+            "roles": {"s1": cfg.roles.s1, "counters": list(cfg.roles.counters),
+                      "rf": cfg.roles.rf, "current": cfg.roles.current,
+                      "delayed": list(cfg.roles.delayed),
+                      "nim": list(cfg.nim.channels) or [-1] * nc},
             "settings_errors": list(cfg.errors),
         }
+        nim = self._nim_summary(secs, now, hits)
+        out["nim"] = nim
+        #: Whether the counters are the merged TOT + NIM hits (pattern,
+        #: efficiencies, seeds), and the NIM channels whose NIM-only hits a
+        #: lag fault held back from the merge in the window.
+        out["nim_merge"] = cfg.merging
+        out["nim_lag_held"] = [r["nim_ch"] for r in nim["counters"] if r["lag_held"]]
         out["flags"] = self._flags(out, now, run_active)
         return out
+
+    def _nim_summary(self, secs: list, now: float, hits) -> dict:
+        """The TOT + NIM part of sma::summary, per counter with a NIM copy, over
+        the summary window -- except the median dt and its entries, which are
+        read from ``nim_dt_Sk`` and so run since the last rebuild or run start.
+
+        Per counter: word and hit counts (`NIM_COLS`; ``nim_only`` counts every
+        unpaired NIM word, ``lag_held`` those of them held back from the
+        merge), ``pair_eff`` = paired / (paired + TOT-only; echo words are
+        left out of the denominator, as reco's pair fraction does and smanim's
+        ``tot_with_nim`` = pairs / all TOT words does not), ``purity`` =
+        paired / NIM words, ``nim_only_frac`` = NIM-only / merged hits (paired
+        + TOT-only + echo + NIM-only: what the merge adds), ``median_dt_ns``
+        and ``dt_entries``, ``lag``: frames per vote state (``skipped``: not
+        voted, NIM/lag vote every), the faulted share of the frames with a
+        decisive vote, frames per lag state (``state_*``: the frame's own
+        decisive vote, else the epoch's last) and its faulted share, the
+        epoch's lag state now and its decisive votes, and the last voted lag.
+        """
+        cfg = self.cfg
+        nim = cfg.nim
+        nc = len(cfg.roles.counters)
+        tab = sum((x.nim for x in secs if x.nim.shape == (nc, len(NIM_COLS))),
+                  np.zeros((nc, len(NIM_COLS)), dtype=np.int64))
+        labels = self.labels()
+        rows = []
+        for k, c, n in nim.pairs(cfg.roles.counters):
+            a = {name: int(tab[k, j]) for j, name in enumerate(NIM_COLS)}
+            merged = a["paired"] + a["tot_only"] + a["echo"] + a["nim_only"]
+            hd = self.h["nim"].get(k, {}).get("dt")
+            med, n_dt = _hist_median(hd) if hd is not None else (None, 0)
+            voted = a["lag_ok"] + a["lag_faulted"]
+            stated = a["state_ok"] + a["state_faulted"]
+            last = self._nim_last.get(k)
+            mem = self._nim_mem.get(k) or LagMemory()
+            rows.append({
+                "counter": f"S{k + 1}", "k": k + 1, "ch": c, "nim_ch": n,
+                "label": labels[c], "nim_label": labels[n],
+                "tot_hits": int(hits[c]), "nim_hits": int(hits[n]),
+                **{name: a[name] for name in NIM_COLS[:10]},
+                "pair_eff": _ratio(a["paired"], a["paired"] + a["tot_only"], 4),
+                "purity": _ratio(a["paired"], a["nim_words"], 4),
+                "nim_only_frac": _ratio(a["nim_only"], merged, 4),
+                "median_dt_ns": _num(med, 4), "dt_entries": n_dt,
+                "offset_ns": nim.offsets[k], "echo_rule": bool(nim.echo[k]),
+                "lag": {**{st: a[f"lag_{st}"] for st in N.LAG_STATES},
+                        "skipped": a["lag_skipped"],
+                        "voted": voted, "faulted_frac": _ratio(a["lag_faulted"], voted, 4),
+                        "state_ok": a["state_ok"], "state_faulted": a["state_faulted"],
+                        "state_faulted_frac": _ratio(a["state_faulted"], stated, 4),
+                        "state": mem.state, "epoch_votes": mem.votes,
+                        "epoch_faulted_votes": mem.faulted_votes,
+                        "nominal_ns": nim.nominal[k],
+                        "last_ns": None if last is None else int(last[1]),
+                        "last_state": None if last is None else last[2],
+                        "last_age_s": None if last is None else _num(now - last[0], 4)},
+            })
+        return {"active": nim.active, "merge": nim.merge, "merging": cfg.merging,
+                "merge_when_lagged": nim.merge_when_lagged, "lag_vote_every": nim.lag_every,
+                "pair_window_ns": nim.cfg.pair_window_ns, "time_source": nim.cfg.time_source,
+                "counters": rows}
 
     def _timestamp_faults(self, hits, mism, verdict: str) -> dict:
         """The counters (S1..S5) with a known timestamp fault, by the rule the
@@ -1952,8 +2680,8 @@ class SmaPlugin:
         chk = self.cfg.check
         flags = []
 
-        def add(sev, code, text):
-            flags.append({"severity": sev, "code": code, "text": text})
+        def add(sev, code, text, **fields):
+            flags.append({"severity": sev, "code": code, "text": text, **fields})
 
         f = s["frames"]
         w = f["window"]
@@ -2041,6 +2769,7 @@ class SmaPlugin:
                     f"{c['label']} (ch {c['ch']}): {t:.1%} of hits with ToT >= "
                     f"{self.cfg.cuts.tot_corrupt_min}")
 
+        self._nim_flags(s, add, time_base_ok)
         if time_base_ok:
             faulty = {e["ch"] for e in s["efficiency"] if e["eff"] is None}
             flags.extend(self._efficiency_flags(now, faulty))
@@ -2058,6 +2787,72 @@ class SmaPlugin:
         if s["settings_errors"]:
             add("warn", "settings", "; ".join(s["settings_errors"]))
         return flags
+
+    def _nim_flags(self, s: dict, add, time_base_ok: bool = True) -> None:
+        """nim_missing, nim_pairing, nim_offset, nim_lag, per counter with a NIM
+        copy; each needs ``min hits`` (TOT hits; TOT words paired or not; dt
+        entries; NIM words) in the summary window.
+
+        Only ``nim_missing`` (it counts hits) is judged whatever the time base.
+        The others compare times: like the efficiency flags they wait for the
+        shift check to say ok (``time_base_ok``), and ``nim_pairing`` /
+        ``nim_offset`` skip a counter whose TOT channel has a known timestamp
+        fault (``timestamp_faults``). The NIM channel's own fine/coarse
+        mismatch does not gate them: the lag fault is such a mismatch.
+        ``nim_lag`` also needs ``nim lag min votes`` frames voted "faulted"
+        since the last rebuild or run start, and judges the lag state of the
+        window's frames (a quiet or unvoted frame takes the last decisive
+        vote)."""
+        chk = self.cfg.check
+        min_hits = chk["min hits"]
+        win = f"{s['window_s']:.0f} s"
+        bad_tot = {f["ch"] for f in (s.get("timestamp_faults") or {}).get("counters", [])}
+        flag = add
+        for r in s["nim"]["counters"]:
+            tot, nim = f"{r['label']} (ch {r['ch']})", f"{r['nim_label']} (ch {r['nim_ch']})"
+
+            # The channels as fields too, so the pages need not parse the text.
+            def add(sev, code, text, _chans={"ch": r["ch"], "nim_ch": r["nim_ch"]}):  # noqa: B006
+                flag(sev, code, text, **_chans)
+
+            if r["tot_hits"] >= min_hits and r["nim_hits"] == 0:
+                add("warn", "nim_missing",
+                    f"{nim}: no hits in the last {win} while {tot} has {r['tot_hits']}: the NIM "
+                    "copy is not cabled, its discriminator is off, or /DQM/SMA/NIM/channels "
+                    "is wrong")
+                continue
+            if not time_base_ok:
+                continue
+            e = r["pair_eff"]
+            if r["ch"] in bad_tot:
+                e = None
+            if e is not None and r["paired"] + r["tot_only"] >= min_hits:
+                sev = ("error" if e < chk["nim pairing error fraction"] else
+                       "warn" if e < chk["nim pairing warn fraction"] else None)
+                if sev:
+                    add(sev, "nim_pairing",
+                        f"{tot}: only {_pct(e)} of its TOT words have a NIM word ({nim}) within "
+                        f"±{s['nim']['pair_window_ns']} ns (median NIM - TOT "
+                        f"{r['median_dt_ns']} ns): NIM threshold, timing (NIM/offset ns) "
+                        "or a lag fault")
+            m = r["median_dt_ns"]
+            if (m is not None and r["ch"] not in bad_tot and r["dt_entries"] >= min_hits
+                    and abs(m) > chk["nim offset max ns"]):
+                add("warn", "nim_offset",
+                    f"{nim}: median NIM - TOT (since the run start or the last settings change) "
+                    f"is {m:g} ns after the {r['offset_ns']} ns offset: "
+                    f"set /DQM/SMA/NIM/offset ns[{r['k'] - 1}] = {r['offset_ns'] + round(m)}")
+            lg = r["lag"]
+            ff = lg["state_faulted_frac"]
+            if (ff is not None and r["nim_words"] >= min_hits and ff > chk["nim lag max fraction"]
+                    and lg["epoch_faulted_votes"] >= chk["nim lag min votes"]):
+                held = (f"; its NIM-only hits ({r['lag_held']}) were held back from the merge"
+                        if r["lag_held"] else "")
+                add("warn", "nim_lag",
+                    f"{nim}: fine-time lag fault in {lg['state_faulted']} of "
+                    f"{lg['state_ok'] + lg['state_faulted']} frames ({lg['faulted']} of "
+                    f"{lg['voted']} voted; last lag {lg['last_ns']} ns, nominal "
+                    f"{lg['nominal_ns']} ns){held}. Measured only; the DQM corrects nothing")
 
     def _mupix_flags(self, s: dict, add) -> None:
         mp = s.get("mupix") or {}
@@ -2144,6 +2939,9 @@ class SmaPlugin:
         return {"t": now, "labels": self.labels(),
                 # The columns of each row's "eff": the counters after S1.
                 "counters": [f"S{k + 1}" for k in range(1, len(self.cfg.roles.counters))],
+                # The columns of each row's "nim_eff" (TOT + NIM pair efficiency):
+                # every counter, S1 first; a column is null without a NIM copy.
+                "nim_counters": [f"S{k + 1}" for k in range(len(self.cfg.roles.counters))],
                 "rows": rows}
 
     # -- event display -------------------------------------------------------------
@@ -2186,7 +2984,8 @@ class SmaPlugin:
         req = W.parse_pattern(pattern, len(self.cfg.roles.counters))
         words = (view == "seeded") if words is None else bool(words)
         pixels = True if pixels is None else bool(pixels)
-        drop = tuple(sorted({int(c) for c in drop}))
+        # Channels to leave out; anything not a channel (-1: "no current") is ignored.
+        drop = tuple(sorted({int(c) for c in drop} & set(range(NCH))))
         max_hits = None if max_hits is None else max(0, int(max_hits))
         if view == "seeded" and (mode != W.SEED_S1 or filt or mp != "any" or req):
             return self._chosen(mode, filt, mp, drop, max_hits, words, seq, pixels, req)
@@ -2419,7 +3218,8 @@ class SmaPlugin:
                 # not): the range, to find the seed's words in the file.
                 "word_range": ([int(fr.word_index[o[a:b]].min()), int(fr.word_index[o[a:b]].max())]
                                if fr.word_index is not None and b > a else None),
-                "s1_word": (int(fr.word_index[o[fr.chan[self.cfg.roles.s1][
+                # The S1 hit's carrier word (a NIM-only S1 hit: its S1L word).
+                "s1_word": (int(fr.word_index[o[fr.counter_idx(self.cfg.roles.s1)[
                     int(i if an.s1_rows is None else an.s1_rows[i])]]])
                             if fr.word_index is not None else None),
             })
@@ -2446,18 +3246,65 @@ class SmaPlugin:
             "raw_held": snap.seq in self._raw,
             "words": bool(words and widx is not None),
         }
+        if snap.nim is not None:
+            # With NIM copies configured when the frame was analysed: its
+            # channel map (as sma::summary's "roles"; -1 = none, "nim" follows
+            # "counters"), so the event page never guesses which lane is whose
+            # copy, and whether its counters are the merged TOT + NIM hits.
+            # Without NIM copies the payload stays byte for byte what it was
+            # (the page then reads the summary's roles block).
+            meta["roles"] = snap.nim["roles"]
+            meta["nim_merge"] = snap.nim["nim_merge"]
         if extra:
             meta.update(extra)
         block = None
         if pixels and fr.px is not None:
             seed_times = [int(seed_t[i]) for i in seeds]
             meta["mupix"], block = self._pixel_block(snap, view, seed_times, max_hits, words)
+        # The TOT + NIM pairing per shipped hit (smaf v3), when the frame was
+        # paired; the partner indices only with the words (framing, "Version 3").
+        pair = pcls = None
+        if getattr(fr, "pairing", None) is not None and snap.nim is not None:
+            pair, pcls = self._smaf_pairing(fr, idx, snap.nim["roles"]["nim"])
+            if not (words and fr.raw is not None):
+                pair = None
         return framing.encode_sma_frame(
             meta, t_rel, ch, tot, flags, frame_seq=snap.seq, run_number=snap.run,
             seeded=view == "seeded", stale=snap.cls == "stale", truncated=truncated,
             suspect=snap.cls == "suspect", time_shift=k,
             raw_words=fr.raw[o[idx]] if words and fr.raw is not None else None,
-            word_index=widx if words and fr.raw is not None else None, pixels=block)
+            word_index=widx if words and fr.raw is not None else None, pixels=block,
+            pair=pair, cls=pcls)
+
+    @staticmethod
+    def _smaf_pairing(fr: W.Frame, idx: np.ndarray, nim_map) -> tuple[np.ndarray, np.ndarray]:
+        """``(pair, cls)`` of the shipped hits `idx` (``Frame.s_*`` indices), smaf v3.
+
+        ``pair``: the partner's position among the shipped hits, -1 when there
+        is none or it was not shipped. ``cls``: `NimWords.cls` in bits 2:0
+        (``framing.PAIR_NONE`` for NIM_NO_CLASS), the sub-flags the page shows
+        and whether the word is a NIM copy (framing, "Version 3").
+        """
+        pw = fr.pairing
+        pos = np.full(pw.cls.size, -1, dtype=np.int32)
+        pos[idx] = np.arange(idx.size, dtype=np.int32)
+        partner = pw.partner[idx]
+        pair = np.where(partner >= 0, pos[np.maximum(partner, 0)], -1).astype("<i4")
+        c = pw.cls[idx]
+        f = pw.flags[idx]
+        nim_chans = [n for n in nim_map if n >= 0]
+
+        def b(m, bit):
+            return (m != 0).astype(np.uint8) * np.uint8(bit)
+
+        code = (np.where(c == NIM_NO_CLASS, framing.PAIR_NONE,
+                         c & framing.PAIR_CLASS_MASK).astype(np.uint8)
+                | b(f & N.MULTI_CANDIDATE, framing.PAIR_MULTI)
+                | b(f & N.IN_TOT_SHADOW, framing.PAIR_SHADOW)
+                | b(f & N.NEAR_FRAME_EDGE, framing.PAIR_EDGE)
+                | b(f & NIM_LAG_HELD, framing.PAIR_LAG_HELD)
+                | b(np.isin(fr.s_ch[idx], nim_chans), framing.PAIR_NIM_SIDE))
+        return pair, code.astype(np.uint8)
 
     def _pixel_block(self, snap: _Snapshot, view: str, seed_times: list, max_hits, words):
         """``(meta, block)``: the ``mupix`` meta of a frame and its smaf pixel block.
@@ -2531,7 +3378,8 @@ class SmaPlugin:
             s1 = int(sel.s1_idx[j])
             out.append({
                 "t_rel": int(sel.t[j]) - t0,
-                "s1_tot": int(fr.s_tot[s1]) if has else None,
+                "s1_tot": (int(fr.s_tot[s1] if sel.s1_tot is None else sel.s1_tot[j])
+                           if has else None),
                 "rf_phase": _num(sel.rf_phase[j]), "rf_period": _num(sel.rf_period[j]),
                 "rf_n": int(sel.rf_n[j]) if has else None, "rf_valid": bool(sel.rf_valid[j]),
                 "rf_vetoed": bool(sel.rf_vetoed[j]), "pattern": int(sel.pattern[j]),
@@ -2687,7 +3535,20 @@ def _merge_seconds(secs: list[_Second]) -> _Second:
         out.mp_chip += s.mp_chip
         if s.eff.size == out.eff.size:
             out.eff += s.eff
+        if s.nim.shape == out.nim.shape:
+            out.nim += s.nim
     return out
+
+
+def _hist_median(h: Hist1D) -> tuple[float | None, int]:
+    """``(median bin centre, in-range entries)`` of a 1D histogram; None when empty."""
+    c = np.asarray(h.counts[1:-1], dtype=np.int64)
+    n = int(c.sum())
+    if n == 0:
+        return None, 0
+    i = int(np.searchsorted(np.cumsum(c), (n + 1) / 2))
+    w = (h.x.hi - h.x.lo) / h.x.n
+    return h.x.lo + (i + 0.5) * w, n
 
 
 def _with_flow(counts) -> np.ndarray:

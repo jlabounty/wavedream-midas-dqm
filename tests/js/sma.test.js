@@ -211,7 +211,7 @@ test("only the visible tab is polled", async () => {
 
 test("the tab strip is a tablist: aria-selected follows the tab, arrows move it", async () => {
   const page = await boot();
-  const ids = ["health", "tot", "timing", "rf", "mupix", "trends"];
+  const ids = ["health", "tot", "timing", "rf", "mupix", "nim", "trends"];
   const tab = (id) => byId(page, `dqm-sma-tab-${id}`);
   const strip = tab("health").parent;
   assert.strictEqual(strip.getAttribute("role"), "tablist");
@@ -241,6 +241,8 @@ test("the tab strip is a tablist: aria-selected follows the tab, arrows move it"
   assert.ok(key("ArrowRight"));
   assert.deepStrictEqual(selected(), ["mupix"]);
   assert.strictEqual(El.focused, tab("mupix"), "the new tab has the focus");
+  key("ArrowRight");
+  assert.deepStrictEqual(selected(), ["nim"], "NIM / TOT sits between MuPix and Trends");
   key("ArrowRight"); key("ArrowRight");
   assert.deepStrictEqual(selected(), ["health"], "Right wraps past the last tab");
   key("ArrowLeft");
@@ -785,4 +787,247 @@ test("a reply that grows between the truncated call and its retry still arrives"
   } finally {
     globalThis.mjsonrpc_call = saved;
   }
+});
+
+// --- TOT + NIM (run-1015 cabling, summary_nim: S4L lagged and held back) -------------------
+
+/** An analyzer with the NIM fixtures: summary, trend, the plugin's histogram list. */
+function nimAnalyzer(summary) {
+  return {
+    "sma::summary": () => json(summary || FX.summary_nim),
+    "sma::trend": () => json(FX.trend_nim),
+    "dqm::list": () => envelope("list", new TextEncoder().encode(FX.hist_names_nim.join("\n"))),
+    "dqm::histogram": (name) => {
+      const dims = FX.hist_dims_nim[name];
+      const hex = FX.hists_nim[name] ||
+        (dims === 2 ? FX.hists["sma/tot_vs_ch_lsb0"] : FX.hists["sma/words_per_ch"]);
+      return envelope("hist", Buffer.from(hex, "hex"));
+    },
+  };
+}
+
+const nimRowCells = (page, counter) => byId(page, "dqm-sma-nim")
+  .find((e) => e.tagName === "TR" && e.attrs["data-counter"] === counter).byTag("td");
+
+test("the NIM fixtures carry what the page is tested on", () => {
+  assert.ok(FX.summary_nim.nim.active && FX.summary_nim.nim_merge);
+  assert.deepStrictEqual(FX.summary_nim.nim_lag_held, [11]);
+  assert.ok(FX.hist_names_nim.includes("sma/nim_dt_S4") && FX.hist_names_nim.includes("sma/s1_coinc_tot"));
+  assert.deepStrictEqual(FX.trend_nim.nim_counters, ["S1", "S2", "S3", "S4", "S5"]);
+});
+
+test("the NIM tab polls only its plots, merged-vs-TOT first, then counter by counter", async () => {
+  const page = await boot(nimAnalyzer());
+  const mark = page.an.calls.length;
+  byId(page, "dqm-sma-tab-nim").onclick();
+  await settle(page);
+  const polled = histCalls(page, mark);
+  assert.ok(polled.length > 0);
+  for (const n of polled) {
+    assert.ok(/^sma\/(nim_\w+_S\d|s1_coinc|s1_coinc_tot)$/.test(n), `${n} polled on the NIM tab`);
+  }
+  const grid = byId(page, "dqm-sma-grid-nim");
+  const plots = grid.byClass("dqm-plot").map((d) => d.parent._plot);
+  assert.deepStrictEqual(plots[0].names, ["sma/s1_coinc", "sma/s1_coinc_tot"], "the overlay first");
+  const order = plots.slice(1).map((p) => /^sma\/nim_(.+)_S(\d)$/.exec(p.key)).map((m) => [Number(m[2]), m[1]]);
+  const want = ["dt", "dt_wide", "classes", "walk", "lag", "width", "candidates"];
+  assert.deepStrictEqual(order.slice(0, 7), want.map((k) => [1, k]), "S1's block, in kind order");
+  for (let i = 1; i < order.length; i++) {
+    assert.ok(order[i][0] >= order[i - 1][0], "counter by counter");
+  }
+  assert.deepStrictEqual([...new Set(order.map((o) => o[0]))], [1, 2, 3, 4, 5]);
+  // The overlay: merged and TOT only, told apart.
+  const g = grid.byClass("dqm-plot")[0].mpg;
+  assert.deepStrictEqual(g.param.plot.map((x) => x.label), ["merged", "TOT only"]);
+  assert.notStrictEqual(g.param.plot[0].line.color, g.param.plot[1].line.color);
+  assert.ok(/merged: [\d,]+ · TOT only: [\d,]+ entries/.test(plots[0].foot.textContent),
+            plots[0].foot.textContent);
+});
+
+test("the Timing tab overlays s1_coinc with s1_coinc_tot too", async () => {
+  const page = await boot(nimAnalyzer());
+  byId(page, "dqm-sma-tab-timing").onclick();
+  await settle(page);
+  const plot = byId(page, "dqm-sma-grid-timing").byClass("dqm-plot").map((d) => d.parent._plot)
+    .find((p) => p.key === "sma/s1_coinc");
+  assert.deepStrictEqual(plot.names, ["sma/s1_coinc", "sma/s1_coinc_tot"]);
+  assert.ok(byId(page, "dqm-sma-grid-nim").byClass("dqm-plot").length === 0 ||
+            !byId(page, "dqm-sma-grid-timing").find((e) => e === byId(page, "dqm-sma-grid-nim")),
+            "each tab has its own graph");
+});
+
+test("the NIM dt plots are log y by default; the NIM tab switch turns that off", async () => {
+  const page = await boot(nimAnalyzer());
+  byId(page, "dqm-sma-tab-nim").onclick();
+  await settle(page);
+  const plotOf = (key) => byId(page, "dqm-sma-grid-nim").byClass("dqm-plot")
+    .find((d) => d.parent._plot.key === key);
+  assert.strictEqual(plotOf("sma/nim_dt_S1").mpg.param.yAxis.log, true);
+  assert.strictEqual(plotOf("sma/nim_dt_S1").mpg.param.yAxis.min, 0.5);
+  assert.strictEqual(plotOf("sma/nim_dt_wide_S4").mpg.param.yAxis.log, true);
+  assert.strictEqual(plotOf("sma/nim_classes_S4").mpg.param.yAxis.log, false, "only the dt plots");
+  assert.strictEqual(plotOf("sma/s1_coinc_tot").mpg.param.yAxis.log, false);
+  const box = byId(page, "dqm-sma-nimlogy");
+  assert.strictEqual(box.checked, true);
+  box.checked = false;
+  box.onchange.call(box);
+  await settle(page);
+  assert.strictEqual(plotOf("sma/nim_dt_S1").mpg.param.yAxis.log, false);
+  assert.strictEqual(JSON.parse(globalThis.localStorage._d["dqm-sma-settings"]).nimLogY, false,
+                     "remembered");
+});
+
+test("the NIM table: one row per counter, the lagged S4L flagged where it hurts", async () => {
+  const page = await boot(nimAnalyzer());
+  byId(page, "dqm-sma-tab-nim").onclick();
+  await settle(page);
+  const rows = byId(page, "dqm-sma-nim").findAll((e) => e.tagName === "TR" && e.attrs["data-counter"]);
+  assert.deepStrictEqual(rows.map((r) => r.attrs["data-counter"]), ["S1", "S2", "S3", "S4", "S5"]);
+  const s1 = nimRowCells(page, "S1").map((td) => td.textContent);
+  assert.strictEqual(s1[0], "S1 (ch 1) / S1L (ch 3)");
+  assert.strictEqual(s1[1], "97.0 %");
+  assert.strictEqual(s1[4], "+2 ns");
+  assert.ok(/^ok · 0 % of 3 · 2 ns$/.test(s1[5]), s1[5]);
+  assert.strictEqual(s1[6], "0");
+  const s4 = nimRowCells(page, "S4");
+  assert.strictEqual(s4[1].textContent, "32.5 %");
+  assert.ok(s4[1].classList.contains("alarm"), "nim_pairing error colours the pair efficiency");
+  assert.ok(/^FAULTED · 67 % of 3 · 155\.0 µs$/.test(s4[5].textContent), s4[5].textContent);
+  assert.ok(s4[5].classList.contains("warn"), "nim_lag colours the lag vote");
+  assert.strictEqual(s4[6].textContent, "5,817");
+  assert.ok(s4[6].classList.contains("warn"));
+  assert.ok(!nimRowCells(page, "S2")[1].classList.contains("alarm"));
+  assert.ok(/pair window ±20 ns/.test(byId(page, "dqm-sma-nimchips").textContent));
+  assert.ok(/held back now: S4L/.test(byId(page, "dqm-sma-nimchips").textContent));
+});
+
+test("a NIM merge chip in the status line; off says so", async () => {
+  const page = await boot(nimAnalyzer());
+  const c = byId(page, "dqm-sma-status").byClass("dqm-chip").find((x) => /NIM merge/.test(x.textContent));
+  assert.strictEqual(c.textContent, "NIM merge on");
+  assert.ok(c.classList.contains("blue"));
+  assert.ok(/merged TOT \+ NIM/.test(c.getAttribute("title")));
+  const p2 = await boot(nimAnalyzer(FX.summary_nim_off));
+  const c2 = byId(p2, "dqm-sma-status").byClass("dqm-chip").find((x) => /NIM merge/.test(x.textContent));
+  assert.strictEqual(c2.textContent, "NIM merge off");
+  assert.ok(/TOT words only/.test(c2.getAttribute("title")));
+  // An old-layout analyzer has no NIM copies: no chip, and the tab says why it is empty.
+  const old = await boot();
+  assert.ok(!byId(old, "dqm-sma-status").byClass("dqm-chip").some((x) => /NIM merge/.test(x.textContent)));
+  assert.ok(/No NIM copies are configured/.test(byId(old, "dqm-sma-nim").textContent));
+});
+
+test("merge off (the default): the lag is still flagged, nothing is held back, no duplicate overlay", async () => {
+  const off = FX.summary_nim_off;
+  assert.strictEqual(off.nim_merge, false);
+  assert.deepStrictEqual(off.nim_lag_held, []);
+  const page = await boot(nimAnalyzer(off));
+  byId(page, "dqm-sma-tab-nim").onclick();
+  await settle(page);
+  const s4 = nimRowCells(page, "S4");
+  assert.ok(/^FAULTED · /.test(s4[5].textContent), s4[5].textContent);
+  assert.ok(s4[5].classList.contains("warn"), "nim_lag still colours the lag vote");
+  assert.strictEqual(s4[6].textContent, "— (merge off)");
+  assert.ok(!s4[6].classList.contains("warn"));
+  assert.ok(/would add \(merge off/.test(s4[3].getAttribute("title")), s4[3].getAttribute("title"));
+  const chips = byId(page, "dqm-sma-nimchips").textContent;
+  assert.ok(!/held back/.test(chips), chips);
+  assert.ok(/counted, not merged: counters and pattern are TOT only/.test(chips), chips);
+  const flags = byId(page, "dqm-sma-flags").byClass("dqm-sma-flag");
+  const lag = flags.find((f) => f.attrs["data-code"] === "nim_lag");
+  assert.ok(lag && !/held back/.test(lag.textContent), "the lag flag, without a merge guard");
+  // The merged and TOT-only coincidences are the same curve: one graph, one line.
+  const plots = byId(page, "dqm-sma-grid-nim").byClass("dqm-plot").map((d) => d.parent._plot);
+  assert.deepStrictEqual(plots[0].names, ["sma/s1_coinc_tot"]);
+  assert.strictEqual(plots[0].mpg.param.plot.length, 1);
+});
+
+test("a merge edit lays the overlay out again", async () => {
+  let summary = FX.summary_nim_off;
+  const page = await boot(nimAnalyzer(), undefined, undefined);
+  page.an.handlers["sma::summary"] = () => json(summary);
+  byId(page, "dqm-sma-tab-timing").onclick();
+  await settle(page);
+  const coinc = () => byId(page, "dqm-sma-grid-timing").byClass("dqm-plot").map((d) => d.parent._plot)
+    .find((p) => p.key === "sma/s1_coinc");
+  assert.deepStrictEqual(coinc().names, ["sma/s1_coinc"], "merge off: no overlay");
+  summary = FX.summary_nim;
+  await settle(page);
+  assert.deepStrictEqual(coinc().names, ["sma/s1_coinc", "sma/s1_coinc_tot"], "merge on: the overlay");
+});
+
+test("the NIM table: flags matched by their channel fields, null numbers as dashes", async () => {
+  const s = clone(FX.summary_nim);
+  // A label that looks like another channel must not move the colouring.
+  for (const f of s.flags) if (f.code === "nim_lag") f.text = f.text.replace("(ch 11)", "(ch 2)");
+  s.nim.counters[0].pair_eff = null;
+  s.nim.counters[0].median_dt_ns = null;
+  const page = await boot(nimAnalyzer(s));
+  byId(page, "dqm-sma-tab-nim").onclick();
+  await settle(page);
+  assert.ok(nimRowCells(page, "S4")[5].classList.contains("warn"), "nim_lag found by nim_ch");
+  assert.ok(!nimRowCells(page, "S2")[5].classList.contains("warn"));
+  const s1 = nimRowCells(page, "S1").map((td) => td.textContent);
+  assert.strictEqual(s1[1], "—");
+  assert.strictEqual(s1[4], "—");
+});
+
+test("trend rows are dropped when the counter columns change", async () => {
+  const tr2 = clone(FX.trend_nim);
+  tr2.nim_counters = ["S1", "S2", "S3"];
+  let trend = FX.trend_nim;
+  const page = await boot(nimAnalyzer());
+  page.an.handlers["sma::trend"] = () => json(trend);
+  byId(page, "dqm-sma-tab-trends").onclick();
+  await settle(page);
+  trend = tr2;
+  const mark = page.an.calls.length;
+  await settle(page);
+  const asks = page.an.calls.slice(mark).filter((c) => c.cmd === "sma::trend").map((c) => c.args);
+  assert.ok(asks.includes(""), "asked for the whole 10 minutes again");
+});
+
+test("NIM rows of the per-channel table name their counter and show the pair efficiency", async () => {
+  const page = await boot(nimAnalyzer());
+  const row = (ch) => byId(page, "dqm-sma-table").find((e) => e.attrs && e.attrs["data-ch"] === String(ch))
+    .byTag("td");
+  assert.strictEqual(row(3)[2].textContent, "NIM copy of S1");
+  assert.strictEqual(row(3)[8].textContent, "pair 97.0 %");
+  assert.strictEqual(row(11)[2].textContent, "NIM copy of S4 · lag FAULTED");
+  assert.ok(row(11)[2].classList.contains("warn"), "nim_lag on the S4L row");
+  assert.strictEqual(row(11)[8].textContent, "pair 32.5 %");
+  assert.ok(row(11)[8].classList.contains("alarm"), "nim_pairing error on the S4L row");
+  assert.ok(!row(4)[8].classList.contains("alarm"), "the S4 TOT row's efficiency is another number");
+});
+
+test("the NIM flags are listed with the others, each with a way to the NIM tab", async () => {
+  const page = await boot(nimAnalyzer());
+  const flags = byId(page, "dqm-sma-flags").byClass("dqm-sma-flag");
+  const nim = flags.filter((f) => /^nim_/.test(f.attrs["data-code"]));
+  assert.deepStrictEqual(nim.map((f) => f.attrs["data-code"]), ["nim_pairing", "nim_lag"], "worst first");
+  assert.ok(nim[0].classList.contains("red") && nim[1].classList.contains("yellow"));
+  assert.ok(/S4L \(ch 11\): fine-time lag fault/.test(nim[1].textContent));
+  const go = nim[1].byTag("button")[0];
+  assert.strictEqual(go.textContent, "NIM / TOT tab ›");
+  go.onclick();
+  await settle(page);
+  assert.strictEqual(byId(page, "dqm-sma-tab-nim").getAttribute("aria-selected"), "true");
+});
+
+test("the trends tab has the TOT + NIM pair efficiency per counter", async () => {
+  const page = await boot(nimAnalyzer());
+  byId(page, "dqm-sma-tab-trends").onclick();
+  await settle(page);
+  const titles = byId(page, "dqm-sma-grid-trends").byClass("dqm-histtitle").map((t) => t.textContent);
+  const k = titles.findIndex((t) => /pair efficiency/.test(t));
+  assert.ok(k >= 0, titles.join(" | "));
+  const g = byId(page, "dqm-sma-grid-trends").byClass("dqm-plot")[k].mpg;
+  assert.deepStrictEqual(g.param.plot.map((x) => x.label),
+                         ["S1 + S1L", "S2 + S2L", "S3 + S3L", "S4 + S4L", "S5 + S5L"]);
+  // Without NIM copies there is no such chart.
+  const old = await boot();
+  byId(old, "dqm-sma-tab-trends").onclick();
+  await settle(old);
+  assert.ok(!byId(old, "dqm-sma-grid-trends").byClass("dqm-histtitle")
+    .some((t) => /pair efficiency/.test(t.textContent)));
 });

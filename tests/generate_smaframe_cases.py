@@ -10,7 +10,10 @@ Most cases come from the real plugin on the stored real frames, so the page is
 tested against what the analyzer actually sends; the synthetic ones pin the
 edges (no hits, a JSON block that is already a multiple of 8, the flags). The
 real frames carry the MuPix pixel block (``SMAF_PIXELS``) as the plugin sends
-it by default; ``pixels=False`` cases are the same frames without it.
+it by default; ``pixels=False`` cases are the same frames without it. The v3
+cases (per-hit TOT + NIM pairing, ``SMAF_PAIRING``) come from the plugin on
+dense synthetic run-1015 frames (``sma_layouts.dense_1015``: the stored real
+frames are all from before the NIM copies) and from synthetic edges.
 """
 
 from __future__ import annotations
@@ -41,15 +44,18 @@ class _Event:
 
 def _plugin_frames():
     """(name, payload) from the plugin on real frames."""
+    from sma_layouts import old_layout
+
     from mdqm.plugins.sma import SmaPlugin
 
+    # These runs' cabling (ch 7 = the current channel the rasters drop).
     out = []
     with np.load(DATA / "sma_run00682_frames.npz") as z:
         words = [z[f"f{i}_words"] for i in range(len(z["labels"]))]
     with np.load(DATA / "sma_run01008_frame.npz") as z:
         big = z["f0_words"]
 
-    p = SmaPlugin(HistStore(), clock=lambda: 1000.0)
+    p = SmaPlugin(HistStore(), clock=lambda: 1000.0, settings=old_layout())
     p.process(_Event(words[4], serial=3553), run_number=682)
     out.append(("real 4k-word frame, seeded (v2, words)", p.frame_blob("seeded")))
     out.append(("real 4k-word frame, seeded (v2, words), no pixel block",
@@ -69,7 +75,7 @@ def _plugin_frames():
     out.append(("real stale frame (channel 0/15 garbage), raster",
                 p.frame_blob("raster", pixels=False)))
 
-    p = SmaPlugin(HistStore(), clock=lambda: 1000.0)
+    p = SmaPlugin(HistStore(), clock=lambda: 1000.0, settings=old_layout())
     p.process(_Event(big, serial=206), run_number=1008)
     out.append(("real 40k-word-firmware frame, seeded (v2)", p.frame_blob("seeded")))
     out.append(("real 40k-word-firmware frame, raster with pixels, latest 600 hits of each kind",
@@ -81,16 +87,32 @@ def _plugin_frames():
     # hundreds of seconds, so time_shift is large.
     with np.load(DATA / "sma_run00342_frames.npz") as z:
         w342 = z["f0_words"]
-    p = SmaPlugin(HistStore(), clock=lambda: 1000.0)
+    p = SmaPlugin(HistStore(), clock=lambda: 1000.0, settings=old_layout())
     p.process(_Event(w342, serial=1), run_number=342)
     out.append(("real frame with a wrong shift (suspect), raster, time_shift > 0",
                 p.frame_blob("raster", drop=[6])))
 
     # A genuine frame longer than 4.29 s (a far consistent cluster): time_shift 1.
     from test_sma_plugin import synth_frame
-    p = SmaPlugin(HistStore(), clock=lambda: 1000.0)
+    p = SmaPlugin(HistStore(), clock=lambda: 1000.0, settings=old_layout())
     p.process(_Event(synth_frame(10**12, n=40, far=5_500_000_000)), run_number=1)
     out.append(("5.5 s frame, raster, time_shift 1", p.frame_blob("raster")))
+
+    # Run-1015 cabling, the plugin's defaults with NIM/merge on (off by default
+    # until the offsets are measured): every counter paired with its NIM copy
+    # (smaf v3), S4L with a fine-time lag (its NIM-only words held back).
+    from sma_layouts import dense_1015
+    p = SmaPlugin(HistStore(), clock=lambda: 1000.0, settings={"NIM": {"merge": True}})
+    p.process(_Event(dense_1015(seed=1, fine_lag={11: 155_000})), run_number=1015)
+    out.append(("1015 dense frame, seeded (v3, words, pairing)", p.frame_blob("seeded")))
+    out.append(("1015 dense frame, raster, latest 1200 hits (v3, pairing, no words)",
+                p.frame_blob("raster", max_hits=1200)))
+    out.append(("1015 dense frame, raster without RF, latest 300 hits, words (v3)",
+                p.frame_blob("raster", drop=[6], max_hits=300, words=True)))
+    p = SmaPlugin(HistStore(), clock=lambda: 1000.0, settings={"NIM": {"merge": False}})
+    p.process(_Event(dense_1015(seed=1, fine_lag={11: 155_000})), run_number=1015)
+    out.append(("1015 dense frame, NIM/merge off, seeded (v3, words, nothing held)",
+                p.frame_blob("seeded")))
     return out
 
 
@@ -157,6 +179,37 @@ def _synthetic_frames():
     out.append(("an empty pixel block after no hits",
                 framing.encode_sma_frame({"view": "raster"}, [], [], [], [], frame_seq=11,
                                          pixels=dict(empty_px, time_shift=0))))
+
+    # v3: every cls bit; without words (8 bytes a hit, no partners) the pixel
+    # block follows at once; with words, pair -1 and a JSON block ending off 8;
+    # with words and a pixel block; no hits at all.
+    cls = [framing.PAIR_NONE, 0 | framing.PAIR_MULTI | framing.PAIR_SHADOW,
+           framing.PAIR_NIM_SIDE | 0 | framing.PAIR_EDGE]
+    out.append(("v3 without words (no partners), every cls bit, a pixel block",
+                framing.encode_sma_frame({"view": "raster", "mupix": {"t0_ns": 5}},
+                                         [0, 3, 9], [6, 1, 3], [5, 20, 10], [0, 0, 0],
+                                         frame_seq=12, run_number=1015, pixels=pix, cls=cls)))
+    out.append(("v3 with words and a pixel block with words",
+                framing.encode_sma_frame({"view": "seeded"}, [0, 2], [1, 3], [5, 6], [0, 0],
+                                         frame_seq=15, run_number=1015, seeded=True,
+                                         raw_words=[0x8100000000000001, 0x8300000000000002],
+                                         word_index=[1, 2], pixels=pw, pair=[1, 0],
+                                         cls=[0, framing.PAIR_NIM_SIDE])))
+    meta = {"view": "seeded", "pad": "x"}
+    while len(json.dumps(meta, separators=(",", ":"))) % 8 != 5:
+        meta["pad"] += "x"
+    out.append(("v3 with words: NIM-only lag-held, echo, TOT-only, a pair",
+                framing.encode_sma_frame(
+                    meta, [0, 2, 400, 900, 902], [7, 10, 7, 11, 4], [30, 10, 200, 10, 40],
+                    [framing.HIT_IN_SEED] * 5, frame_seq=13, run_number=1015, seeded=True,
+                    raw_words=[0x8700000000000001, 0x8A00000000000002, 0x8700000000000003,
+                               0xFFFF_FFFF_FFFF_FFFF, 0x8400000000000005],
+                    word_index=[10, 11, 12, 4294967295, 14],
+                    pair=[1, 0, -1, -1, -1],
+                    cls=[0, 0 | framing.PAIR_NIM_SIDE, 2,
+                         3 | framing.PAIR_LAG_HELD | framing.PAIR_NIM_SIDE, 1])))
+    out.append(("v3, no hits", framing.encode_sma_frame({"view": "raster"}, [], [], [], [],
+                                                        frame_seq=14, cls=[])))
     return out
 
 
@@ -185,6 +238,9 @@ def build_cases() -> list[dict]:
                 "word_index": (None if d["word_index"] is None
                                else [int(x) for x in d["word_index"]]),
                 "pixels": _pixels_expect(d["pixels"]),
+                "pairing": d["pairing"],
+                "pair": None if d["pair"] is None else [int(x) for x in d["pair"]],
+                "cls": None if d["cls"] is None else [int(x) for x in d["cls"]],
             },
         })
     return cases
@@ -206,19 +262,25 @@ def test_generate_smaframe_cases():
     cases = build_cases()
     OUT.parent.mkdir(parents=True, exist_ok=True)
     OUT.write_text(json.dumps({
-        "_doc": "Generated by tests/generate_smaframe_cases.py (smaf v1 and v2 payloads, "
+        "_doc": "Generated by tests/generate_smaframe_cases.py (smaf v1, v2 and v3 payloads, "
                 "envelope removed, hex). Layout: src/mdqm/dqm/framing.py, 'SMA frames'. A "
                 "hit's time is meta.t0_ns + t_rel_ns * 2**time_shift (header u16 at offset "
                 "2). frame_seq is 2^40+5 in the synthetic case. raw_words are 16-digit hex "
                 "strings (u64). pixels: the MuPix pixel block (header flag SMAF_PIXELS, "
                 "'pixel block' in framing.py), null when there is none; a pixel's time is "
-                "meta.mupix.t0_ns + t_rel * 2**time_shift.",
+                "meta.mupix.t0_ns + t_rel * 2**time_shift. pair/cls: the v3 TOT + NIM "
+                "pairing (header flag SMAF_PAIRING), null before v3.",
         "cases": cases,
     }, indent=1))
     assert len(cases) >= 20
-    assert {c["expect"]["version"] for c in cases} == {1, 2}
+    assert {c["expect"]["version"] for c in cases} == {1, 2, 3}
+    v3 = [c["expect"] for c in cases if c["expect"]["version"] == 3]
+    assert {e["words"] for e in v3} == {False, True}, "v3 with and without words"
+    assert any(e["pixels"] is not None for e in v3), "a pixel block after v3"
+    assert any(e["n_hits"] > 1000 and e["pair"] is None for e in v3), "a live v3 raster"
+    assert any(e["words"] and e["n_hits"] >= 300 and -1 in e["pair"] for e in v3), "with words"
     px = [c for c in cases if c["expect"]["pixels"] is not None]
-    assert {c["expect"]["version"] for c in px} == {1, 2}, "a pixel block after v1 and after v2"
+    assert {c["expect"]["version"] for c in px} == {1, 2, 3}, "a pixel block after v1, v2 and v3"
     assert {c["expect"]["pixels"]["words"] for c in px} == {False, True}
     assert any(c["expect"]["pixels"]["n"] >= 600 for c in px), "a real raster's pixels"
     assert {c["expect"]["time_shift"] for c in cases} >= {0, 1, 32}
@@ -231,7 +293,9 @@ def test_python_decodes_its_own_cases():
         e = case["expect"]
         assert d["n_hits"] == len(e["t_rel_ns"]) == len(e["ch"]), case["name"]
         assert d["arrays_offset"] % 8 == 0, case["name"]
-        per_hit = 19 if d["words"] else 7
+        per_hit = framing.smaf_bytes_per_hit(d["flags"])
+        assert per_hit == {1: 7, 2: 19}.get(d["version"], 24 if d["words"] else 8), case["name"]
+        assert (d["pair"] is not None) == (d["pairing"] and d["words"]), case["name"]
         end = d["arrays_offset"] + per_hit * d["n_hits"]
         size = len(bytes.fromhex(case["payload_hex"]))
         if d["pixels"] is None:

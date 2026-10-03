@@ -75,7 +75,8 @@ def test_frames_carry_the_tag_and_the_word_of_every_hit():
     p.process(_Ev(words, serial=4757), run_number=1008)
     d = framing.decode_sma_frame(p.frame_blob("seeded"))
     m = d["meta"]
-    assert d["version"] == 2, "the seeded view always ships words"
+    # Default (run-1015) roles: ch 3 is S1L, so the frame is paired (v3); words either way.
+    assert d["words"] and d["version"] == 3, "the seeded view always ships words"
     assert m["tag"] == ("SMA run 1008 · event 301 serial 4757 · 2026-09-21 14:13:20 UTC"
                         " · frame seq 1")
     assert m["event"] == {"id": 301, "serial": 4757, "timestamp": 1790000000, "trigger_mask": 0}
@@ -89,9 +90,9 @@ def test_frames_carry_the_tag_and_the_word_of_every_hit():
     assert ((words[s0["s1_word"]] >> np.uint64(56)) & np.uint64(0xF)) == 1, "an S1 word"
 
     r = framing.decode_sma_frame(p.frame_blob("raster"))
-    assert r["version"] == 1, "the live raster stays lean"
+    assert not r["words"], "the live raster stays lean"
     r2 = framing.decode_sma_frame(p.frame_blob("raster", words=True))
-    assert r2["version"] == 2 and r2["n_hits"] == r["n_hits"]
+    assert r2["words"] and r2["n_hits"] == r["n_hits"]
     assert np.array_equal(words[r2["word_index"].astype(np.intp)], r2["raw_words"])
 
 

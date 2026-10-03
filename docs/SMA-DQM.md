@@ -316,13 +316,17 @@ Worst first. Codes as in `sma.py:1152-1232`:
 | `efficiency_drop` | warning | a counter's efficiency given S1 fell by more than 10 points in the last 30 s compared with the last 10 min | check HV and cabling of that counter |
 | `oversize` | warning | a frame had more than `Cuts/max words per frame` words and was not decoded | tell the SMA expert (the readout sent a huge frame) |
 | `sampling` | info | not every frame was analysed (CPU budget): histogram counts are from the sample, rates and fractions are not affected | nothing |
-| `settings` | warning | a value under `/DQM/SMA` was invalid and its default is used; the text names it | fix the ODB value |
+| `settings` | warning | a value under `/DQM/SMA` was invalid and its default is used; the text names it. "Channel roles look pre-1015" means a NIM channel is also S1, a counter, the RF, `current` or a `delayed` channel: NIM is then off altogether | fix the ODB value; for "pre-1015", run the odbedit lines under [Settings](#settings-dqmsma) |
 | `mupix_sync` | warning | fewer than 30 % of S1 hits have an L1 **and** an L2 pixel hit in time (accidentals taken out) for more than 30 s while S1 fires; or no pixel words at all | see [MuPix time sync](#mupix-time-sync-what-the-flag-means) |
 | `mupix_unmapped` | warning | pixel hits on a chip id that is in neither `MuPix/L1 chips` nor `L2 chips` | the plane map does not match the FEB Mapping: tell the MuPix expert, then fix the ODB lists |
 | `mupix_skipped` | info | a frame had more pixel hits than `MuPix/max pixel hits per frame`; only the latest were examined | nothing |
+| `nim_missing` | warning | a counter's NIM copy (S*k*L) has no hits while its TOT channel has at least `min hits` | check the NIM cable, the discriminator power and `NIM/channels`; see [the four NIM flags](#the-four-nim-flags) |
+| `nim_pairing` | error below 50 %, warning below 80 % | pair efficiency (paired / (paired + TOT-only)) is low. Only once the shift check is `ok`, and not for a counter whose TOT channel has a known timestamp fault | if the median NIM - TOT is large, measure the offset; if it is near 0, elog it and tell the SMA expert. See [the four NIM flags](#the-four-nim-flags) |
+| `nim_offset` | warning | the median NIM - TOT (since the run start or the last settings change) is more than 5 ns from 0 after `NIM/offset ns`; the text gives the value to set. Same conditions as `nim_pairing` | set `NIM/offset ns`, see [measuring the offsets](#measuring-the-nim-offsets-on-the-first-clean-run) |
+| `nim_lag` | warning | the NIM channel's lag state was "faulted" in more than half of the window's frames, after at least 3 frames voted "faulted" (`Self check/nim lag min votes`); only once the shift check is `ok`. The text says whether NIM-only hits were held back from the merge | elog it with the counter; tell the SMA expert (nothing here corrects it) |
 
 **Known timestamp faults (as of 2026-09-28), measured with this DQM on replayed
-runs:**
+runs** (channels as cabled before run 1015: S3 on ch 3, the proton current on ch 7):
 
 | Channel | Run 682 | Run 1008 | Status |
 |---|---|---|---|
@@ -355,7 +359,8 @@ vetoed fraction.
 * **Timing**: S2..S5 minus S1 time differences, coincidence pattern, partners per
   S1, S1 spacing.
 * **RF / delayed**: RF pulses per S1 gate, RF phase, RF period, phase vs S1 ToT,
-  delayed channels (8-10) minus S1.
+  delayed channels minus S1 (one plot per entry of `Channel roles/delayed`; none
+  by default).
 * **MuPix**: above the plots, the share of S1 hits with an L1, an L2 and an
   L1+L2 pixel hit in time, in the sideband, and with the accidentals taken out
   (over the last 60 s), and the time-sync chip. Plots: t(pixel) - t(S1) per
@@ -400,8 +405,10 @@ and catches up within a second of scrolling back.
   to a few hundred ns later (time walk).
 * **Whole-frame raster** (2 Hz): time vs channel for the whole frame, ToT as
   colour, hit count per channel on the right. Drag to zoom in time, double-click
-  for the whole frame. *hide the current channel* removes ch 7, which otherwise
-  dominates. Under the 16 channels, **MuPix L1** and **MuPix L2** rows: every
+  for the whole frame. *hide the current channel* removes the proton-current
+  channel (`Channel roles/current`), which otherwise dominates. Since run 1015 the
+  current is not on the SMA (`current` = -1) and the switch is not shown.
+  Under the 16 channels, **MuPix L1** and **MuPix L2** rows: every
   pixel hit of the frame (noise included), coloured by pixel ToT on its own
   scale (legend: MuPix ToT 0-31, x 256 ns), the plane's hit count on the
   right; a third row, **no plane**, appears only when a hit is on a chip the
@@ -440,7 +447,7 @@ byte.
 | Choice | Seeds are | Use it to |
 |---|---|---|
 | S1 (default) | S1 hits, as above | the normal view |
-| S2 .. S5, ch08, ch09, ch10 | hits of that channel (the counters and the delayed channels, names from the ODB labels; RF and the current channel are not offered) | see events a counter fired in, with or without S1 |
+| S2 .. S5 (and any delayed channel) | hits of that channel (the counters and the delayed channels, names from the ODB labels; RF and the current channel are not offered) | see events a counter fired in, with or without S1 |
 | any counter (S1..S5 clusters) | the first hit of each time cluster of the S1..S5 hits, a cluster being hits each within `Cuts/coinc window ns` (50 ns) of the one before | see events **without S1** at all |
 
 For a seed other than S1 the window, the completeness rule and the lanes are the
@@ -504,8 +511,9 @@ A seed whose window lies outside the MuPix part of the frame says nothing
 about MuPix and passes only *any*. The choice is kept per browser tab like
 the seed choice, and goes with Freeze and Single.
 
-**The *and counters:* row** asks for a coincidence pattern directly: for each of
-S1..S5, *any* (default), *present* (a hit on that counter within +-50 ns,
+**The *and counters:* row** asks for a coincidence pattern directly: for each
+counter (one selector per entry of `Channel roles/counters`, S1..S5 by default),
+*any* (default), *present* (a hit on that counter within +-50 ns,
 `Cuts/coinc window ns`, of the seed, i.e. its box lit) or *absent* (no such
 hit). It is another AND, on top of the seed choice, the boxes and *MuPix:*
 (`sma_words.py:1400`). Examples:
@@ -653,22 +661,234 @@ When `mupix_sync` is up:
 4. "No MuPix pixel words in the SMA frames": the MuPix readout, its link or
    its chips are off.
 
+## NIM copies of the counters (TOT + NIM)
+
+Since run 1015 each scintillator counter reaches the SMA twice: its TOT
+channel and a NIM discriminator copy (S1L ch 3, S2L-S5L ch 9-12). The analyzer
+pairs the two in every analysed good frame, on every word, with the same rule
+as reco (`sma_nim.pair_counter`, a port of `PIPSMSMANimPairing.hh`). A NIM word
+pairs with the nearest free TOT word within +-`NIM/pair window ns` (20 ns)
+after `NIM/offset ns`. S3's late and edge echo words (`NIM/echo counters`) do
+not pair. The analyzer also votes the NIM copy's fine-time lag against S1
+(`sma_nim.lag_vote`). It measures the lag and corrects nothing.
+
+Where to look: the **NIM / TOT** tab on SMAPlots (a table per counter above its
+plots, and the S1 coincidences with and without the merge), and the NIM lanes
+on SMAEvents (S*k*L under each counter, a dark tick joining a TOT word to its
+NIM copy, hollow bars for NIM-only words, grey for held-back ones, a hatch for
+TOT echo words).
+
+### The merge is off until the offsets are measured
+
+`NIM/merge` is **n** by default. The NIM offsets are not measured yet, and a
+NIM copy more than 20 ns off its TOT word pairs with nothing: merging then
+counts every particle twice. With the merge off, the pairing plots, the NIM
+table, the summary and the four NIM flags all work, and the counters, the
+pattern, the efficiencies and the seeds are the TOT words alone. The page says
+so in a chip ("NIM merge off", "NIM merge on" when it is on). Turn the merge on only after
+[measuring the offsets](#measuring-the-nim-offsets-on-the-first-clean-run).
+
+With `NIM/merge` on, the counters are the merged hits: TOT words (paired,
+TOT-only, echo) and NIM-only hits (the aligned NIM time, ToT `NIM/nim only
+tot`). Pattern, efficiencies, S2..S5 - S1, RF, delayed, the seeds of SMAEvents
+and the MuPix in-time matching (its S1 hits) use them; rates, ToT, fine/coarse,
+the stale rule, the shift check and the raster stay on the words.
+`rf_phase_vs_s1_tot` leaves the NIM-only S1 hits out (they have no ToT of their
+own).
+
+The NIM offsets are the DQM's own constants. The DQM applies no fine-time lag
+correction and no per-counter TOT offset, so its offsets differ from reco's
+`sma_time_alignment`. Do not copy numbers from one to the other.
+
+### The lag state
+
+The fine-time lag fault is a whole-file state: a NIM channel's fine time is off
+by about 150 us or about 0.9 us for the whole file. Each NIM channel keeps its
+last decisive vote ("ok" or "faulted") until the next rebuild or run start. A
+frame with too few NIM words for a vote (fewer than `NIM/lag min pairs` with an
+S1 reference, or no clear winner) takes that state, and so does a frame that is
+not voted at all: once a state is known the vote runs in every
+`NIM/lag vote every`-th frame (4) of the channel, to save CPU; before that, in
+every frame. A later "ok" vote clears a "faulted" state.
+
+The lag is **measured, never corrected**. The only action on it is with the
+merge on: the NIM-only hits of a frame whose lag state is "faulted" are held
+back from the counters (counted as "lag-held"), unless `NIM/merge when lagged`
+is y. With the merge off nothing is held back. `nim_lag_Sk` is filled from the
+voted frames only, so its shape is the same as an all-frames plot with about a
+quarter of the entries.
+
+### Pair efficiency
+
+Pair efficiency is paired / (paired + TOT-only). Echo words (S3's late and
+edge words) are left out of the denominator, as in reco's pair fraction.
+smanim leaves the late and echo TOT words out of its TOT sample too, so its
+`tot_with_nim` is the same quantity, and its `nim_with_tot` is the purity
+(paired / NIM words). The two can differ slightly: smanim pairs mutual
+nearest neighbours after its own offset fit and lag removal, the DQM pairs
+greedily one to one with the DQM's own offsets.
+
+### What the NIM plots should look like
+
+Plots are per counter with a NIM copy, named `sma/nim_<kind>_S<k>` (k = counter
+number, S1 = 1). The two `nim_dt` plots are drawn with log y by default (the
+"log y for the Δt plots" switch on the tab). Adapted from the nearline version in
+`beamtime2026_pie5` (`docs/SMA_NIM_RECABLING.md`, section 6).
+
+| Plot | Good | Bad, and what it usually means |
+|---|---|---|
+| `nim_dt_Sk` (NIM minus the nearest TOT word, every NIM word, +-200 ns, 1 ns bins, after `NIM/offset ns`) | one narrow peak at 0, a few bins wide, little flat background. Before the offsets are set the peak sits wherever the cable delay puts it; that is the number to measure | peak away from 0 after the offset is set: the offset is wrong or was not applied. Two peaks: two particles per window, or a swapped cable. A wide peak (several ns): a trigger-level or jitter problem on that channel. No peak: NIM and TOT are not the same counter, or the offset is larger than 200 ns; look at `nim_dt_wide_Sk` |
+| `nim_dt_wide_Sk` (raw NIM minus TOT, pairs within +-2^19 ns, 256 ns bins, sampled) | one peak in the central bin: no fine-time offset on the NIM channel. A cable delay of tens of ns does not leave that bin | a peak away from the centre is the lag fault; its position is the lag. Several peaks or a flat spread: a fault that changes within a file (`nim_lag` will usually fire; elog it) |
+| `nim_walk_Sk` (NIM minus TOT against the TOT word's ToT, pairs only, +-`pair window`) | a flat band: no walk | a slope or a curve is TOT leading-edge walk. It is measured only, nothing corrects it; elog its size |
+| `nim_classes_Sk` (paired, TOT-only, NIM-only, echo, then the sub-counts lag-held, in TOT shadow, multi-candidate) | "paired" is nearly all the hits (pair efficiency above about 95 %); "TOT-only" and "NIM-only" small; "echo" only on S3 | large "NIM-only": the NIM threshold is too low (noise), or the offset is wrong so that real pairs fall outside the window (then "TOT-only" is large too). Large "TOT-only": a dead or high-threshold NIM channel. "echo" on a counter other than S3: the echo rule is only on for `NIM/echo counters` |
+| `nim_width_Sk` (ToT field of the NIM word) | one narrow peak: the width is fixed by the discriminator | a wide spread: the channel is not a clean logic pulse |
+| `nim_candidates_Sk` (NIM words within the window of each TOT word) | bin 1 holds nearly all TOT words; bin 0 is the TOT-only share | many in bins 2 and up: the window is too wide for the rate, or the NIM channel doubles pulses |
+| `nim_lag_Sk` (the lag vote's input, fine minus the S1 word's fine, mod 2^20 ns) | one narrow peak, at the left edge (it wraps, so it can also sit at the right edge) | a peak elsewhere is the lag fault; several peaks or flat, no vote is possible. Filled only in voted frames, so an empty plot means too few S1 coincidences, not a fault |
+| `s1_coinc` and `s1_coinc_tot` (S1 hits with each counter in the window; `s1_coinc` is the merged one, `s1_coinc_tot` the TOT words alone) | with the merge off the two are the same and no overlay is drawn. With it on, `s1_coinc` is at or above `s1_coinc_tot` by a small gap, the hits only the NIM copy saw | a large gap: a large NIM-only share (check the table and `nim_classes_Sk`), usually a low NIM threshold or a wrong offset. `s1_coinc` below `s1_coinc_tot` should not happen; tell the SMA expert |
+
+The NIM table above the plots shows, per counter: pair efficiency, purity,
+NIM-only share, median NIM - TOT, the lag vote (last state, share of faulted
+frames, last lag) and the NIM-only hits held back. All are over the last 60 s.
+A healthy counter shows pair efficiency of about 95 % or more and a median near 0.
+The median is read from `nim_dt_Sk`, so it runs since the run start or the last
+settings change, not over 60 s.
+
+### The four NIM flags
+
+The flags are in the table under [Flags](#flags-below-the-banner). Each one
+needs at least `Self check/min hits` words (200) in the 60 s window for the
+counter. All but `nim_missing` compare times, so they wait for the shift check
+to say `ok`.
+
+* `nim_missing` (warning): the counter's TOT channel has hits and its NIM copy
+  has none. Check that the NIM cable is on the right SMA input and the
+  discriminator is powered, then `NIM/channels` in the ODB. Nothing is paired
+  for that counter meanwhile.
+* `nim_pairing` (warning below 80 %, error below 50 %): too few TOT words have
+  a NIM word in the window. The text gives the median NIM - TOT. If it is large,
+  the offset is not set: do the
+  [measurement](#measuring-the-nim-offsets-on-the-first-clean-run). If the
+  median is near 0, the NIM threshold or the NIM channel is the problem: elog
+  it with the counter, and tell the SMA expert. A counter whose TOT channel has
+  a known timestamp fault (the red `mismatch` flag, S5 for now) is not judged.
+* `nim_offset` (warning): the median NIM - TOT is more than 5 ns from 0 after
+  the offset. The text names the key and the value to set
+  (`NIM/offset ns[k-1]` = old offset + the median, rounded). Set it as
+  [below](#measuring-the-nim-offsets-on-the-first-clean-run). It is expected
+  until the offsets have been measured.
+* `nim_lag` (warning): the lag state was "faulted" in more than half of the
+  window's frames, after at least 3 faulted votes (`Self check/nim lag min
+  votes`). A hardware fault that nothing here fixes. Elog it with the counter
+  and tell the SMA expert. With the merge on, the text says how many NIM-only
+  hits were held back meanwhile.
+
+### Summary, trends and the manual path
+
+`sma::summary` carries `nim.counters[]` per counter (pair efficiency, purity,
+NIM-only share, median dt, lag votes and lag state), `nim_merge`,
+`nim_lag_held` and `roles`. Trend: `nim_eff` (pair efficiency) per counter.
+Offline, `mdqm-sma-file` runs the same plugin on one file, writes `nim.png`
+beside `summary.png`, and takes `--merge` / `--no-merge` (default: no merge).
+
+### Measuring the NIM offsets on the first clean run
+
+Do this once, on the first clean beam run at or after 1015 (S1 and the counters
+firing, the shift check `ok`), with `NIM/merge` still **n**.
+
+1. Open SMAPlots, **NIM / TOT** tab. Wait until `nim_dt_Sk` has a few thousand
+   entries per counter.
+2. For each counter read the position of the `nim_dt_Sk` peak in ns. That is
+   its offset. The `nim_offset` flag text gives the same number as the key to
+   set, from the median; the median is pulled toward 0 by the flat background,
+   so if the peak and the flag disagree by more than a ns or two, use the peak
+   and repeat step 4 once.
+3. Set the offsets, one line per counter. The list is S1L, S2L, S3L, S4L, S5L
+   (index 0-4), whole ns; the values below are placeholders:
+
+   ```bash
+   odbedit -e bt2026 -c 'set "/DQM/SMA/NIM/offset ns[0]" <S1L offset>'
+   odbedit -e bt2026 -c 'set "/DQM/SMA/NIM/offset ns[1]" <S2L offset>'
+   odbedit -e bt2026 -c 'set "/DQM/SMA/NIM/offset ns[2]" <S3L offset>'
+   odbedit -e bt2026 -c 'set "/DQM/SMA/NIM/offset ns[3]" <S4L offset>'
+   odbedit -e bt2026 -c 'set "/DQM/SMA/NIM/offset ns[4]" <S5L offset>'
+   ```
+
+   Every change rebuilds the histograms and zeroes them, so set all five before
+   looking again.
+4. Wait for the plots to fill again. Check, for every counter:
+   * the `nim_dt_Sk` peak is at 0 and the median NIM - TOT in the table is
+     within 5 ns of 0 (no `nim_offset` flag);
+   * the pair efficiency is **at least about 95 %** (S3: echo words do not count
+     against it); the `nim_pairing` flag only fires at 80 %, so look at the
+     number, not the flag;
+   * no `nim_missing` or `nim_lag` flag.
+5. Only then turn the merge on:
+
+   ```bash
+   odbedit -e bt2026 -c 'set "/DQM/SMA/NIM/merge" y'
+   ```
+
+   The tab's chip changes to "NIM merge on", and `s1_coinc` and `s1_coinc_tot` now
+   differ by a small gap. A large gap, or a NIM-only share that is not small,
+   means an offset or a threshold is still wrong: turn the merge off again (`n`)
+   and repeat from step 2.
+
+Write the measured offsets and the run number in the elog. Redo the measurement
+after any change to the NIM cables, thresholds or delays.
+
 ## Settings: `/DQM/SMA`
 
 The analyzer re-reads the tree every 2 s (`analyzer.py:231-233`); edits take
 effect without a restart. Changing the coarse shift, channel roles (except
-labels), anything under Cuts or Binning **rebuilds the histograms and zeroes
+labels), anything under Cuts, Binning, MuPix or NIM (except its two CPU knobs) **rebuilds the histograms and zeroes
 them** (`SmaPlugin.apply_settings`) and posts a MIDAS message. Labels, Self check
 and Sampling never reset a plot. Defaults: `SETTINGS_DEFAULTS` in `sma.py`.
+
+The default channel roles are the cabling since run 1015: 0 clock, 1 S1, 2 S2,
+3 S1L, 4 S4, 5 S5, 6 RF, 7 S3 (TOT), 8 WD trigger copy, 9-12 S2L-S5L. The proton
+current is no longer on the SMA. The NIM copies (S*k*L) are under `NIM/channels`;
+the WD copy has no role. (The roles before run 1015 were S3 on ch 3, the proton
+current on ch 7 and delayed channels 8-10.)
+
+**An existing ODB keeps its old roles.** The analyzer only creates missing keys,
+so an ODB that already has the keys keeps its values. An ODB upgraded by this
+version therefore has the pre-1015 roles next to the new NIM keys: NIM channels
+3, 9 and 10 are then a counter and delayed channels. The analyzer turns NIM off
+altogether (no pairing, no merge) and raises one `settings` flag, "Channel
+roles look pre-1015". To move an existing ODB to the 1015 layout (on pinky;
+drop `-e bt2026` if `MIDAS_EXPT_NAME` is set):
+
+```bash
+odbedit -e bt2026 -c 'set "/DQM/SMA/Channel roles/counters[2]" 7'
+odbedit -e bt2026 -c 'set "/DQM/SMA/Channel roles/current" -1'
+odbedit -e bt2026 -c 'set "/DQM/SMA/Channel roles/delayed[*]" -1'
+odbedit -e bt2026 -c 'set "/DQM/SMA/Self check/mismatch flag channels[2]" 7'
+odbedit -e bt2026 -c 'ls "/DQM/SMA/Channel roles/labels"'
+```
+
+The first three lines rebuild the histograms (a role change), and the flag goes
+once the third is in. For a channel role, -1 means "none". Check the labels
+last: a label set by hand ("current" or "S3" on ch 7, "S3" on ch 3) survives
+the edit; clear it (`set ".../labels[7]" ""`) so the role name shows.
+
+To keep analysing a pre-1015 run live instead, switch the NIM copies off with
+`odbedit -e bt2026 -c 'set "/DQM/SMA/NIM/channels[*]" -1'` and leave the old
+roles.
+
+**The NIM offsets and the merge** are set after the first clean run, not
+here: see [Measuring the NIM offsets on the first clean
+run](#measuring-the-nim-offsets-on-the-first-clean-run) for the odbedit lines
+and the checks before `NIM/merge` goes to y. Both kinds of edit rebuild the
+histograms.
 
 | Key | Default | Effect | Resets plots |
 |---|---|---|---|
 | `Coarse shift` | 14 | board coarse = time >> shift | yes |
 | `Channel roles/s1` | 1 | the seed channel | yes |
-| `Channel roles/counters` | [1, 2, 3, 4, 5] | S1..S5 in order (first must be the S1 channel) | yes |
+| `Channel roles/counters` | [1, 2, 7, 4, 5] | S1..S5 in order (first must be the S1 channel); at most 8, the pattern is one byte | yes |
 | `Channel roles/rf` | 6 | RF channel | yes |
-| `Channel roles/current` | 7 | proton-current channel | yes |
-| `Channel roles/delayed` | [8, 9, 10] | channels paired with S1 in [-1, +10] us | yes |
+| `Channel roles/current` | -1 | proton-current channel; -1 = none | yes |
+| `Channel roles/delayed` | [-1] | channels paired with S1 in [-1, +10] us; -1 entries are ignored, so [-1] = none (an ODB array cannot be empty) | yes |
 | `Channel roles/labels` | 16 x "" | display names; empty = role name or chNN | **no** |
 | `Cuts/coinc window ns` | 50 | S1 coincidence window (pattern, efficiency) | yes |
 | `Cuts/dt window ns` | 200 | range of the S2..S5 - S1 plots | yes |
@@ -692,6 +912,19 @@ and Sampling never reset a plot. Defaults: `SETTINGS_DEFAULTS` in `sma.py`.
 | `MuPix/sideband lo ns`, `sideband hi ns` | -2400, -1800 | the accidentals' window; must end at or before `window lo ns` | yes |
 | `MuPix/max pixel hits per frame` | 20000 | pixel hits examined per frame (the latest); 0 = MuPix analysis off (pixel words still counted) | yes |
 | `MuPix/max S1 per frame` | 500 | S1 hits per frame matched against the pixels (evenly spread); 0 = all | yes |
+| `NIM/channels` | [3, 9, 10, 11, 12] | NIM copy of each counter (per `Channel roles/counters` entry); -1 = none, [-1] alone = no NIM at all. A NIM channel that is also S1, a counter, the RF, `current` or `delayed` turns NIM off (a `settings` flag); a repeated one drops that entry | yes |
+| `NIM/offset ns` | [0, 0, 0, 0, 0] | per counter, t'_NIM = t - offset in whole ns (a fraction is rounded, with a `settings` note); set from the `nim_dt` peak | yes |
+| `NIM/lag nominal ns` | [0, 0, 0, 0, 0] | per counter, the NIM copy's expected fine - fine(S1) (cable delay, flight); the lag vote is "faulted" beyond `lag tolerance ns` of it | yes |
+| `NIM/merge` | n | NIM-only hits join the counters (pattern, efficiencies, seeds, MuPix matching). Turn on once the offsets are measured | yes |
+| `NIM/merge when lagged` | n | also merge a channel's NIM-only hits in a frame whose lag state is "faulted" | yes |
+| `NIM/pair window ns` | 20 | pair when \|t'_NIM - t'_TOT\| <= this | yes |
+| `NIM/time source` | tot | `tot` or `nim`: the time a paired merged hit takes | yes |
+| `NIM/nim only tot` | 1 | the ToT code a NIM-only hit gets | yes |
+| `NIM/echo counters` | [3] | counter numbers (1 = S1) whose TOT words get the echo rule; -1 = none | yes |
+| `NIM/echo late tot`, `echo edge tol ns` | 128, 3 | echo rule: ToT >= late, or a start within +-tol of the previous word's trailing edge | yes |
+| `NIM/lag tolerance ns`, `lag min pairs`, `lag dominance` | 50, 50, 2.0 | the lag vote (`sma_nim.decide_lag`) | yes |
+| `NIM/lag vote every` | 4 | vote a NIM channel's lag in every this many of its frames once a state is known (1 = every frame); the frames between take the last decisive vote. A CPU knob | **no** |
+| `NIM/wide pairs per frame` | 1024 | `nim_dt_wide` pairs per counter and frame, about; 0 = none. A CPU knob | **no** |
 | `Self check/shift window s`, `shift margin`, `shift min fraction`, `shift min words` | 30, 0.2, 0.9, 1000 | the shift check | no |
 | `Self check/summary window s` | 60 | averaging of chips, table and flags | no |
 | `Self check/mismatch warn fraction`, `mismatch error fraction` | 0.05, 0.5 | mismatch flag levels | no |
@@ -699,14 +932,22 @@ and Sampling never reset a plot. Defaults: `SETTINGS_DEFAULTS` in `sma.py`.
 | `Self check/min hits` | 200 | channels with fewer hits are not judged | no |
 | `Self check/no frames s` | 5 | `no_frames` delay | no |
 | `Self check/efficiency window s`, `efficiency drop` | 30, 0.1 | `efficiency_drop` | no |
-| `Self check/mismatch flag channels` | [1..6] | channels that can raise mismatch/ToT flags | no |
+| `Self check/mismatch flag channels` | [1, 2, 4, 5, 6, 7] | channels that can raise mismatch/ToT flags (S1..S5 and RF) | no |
 | `Self check/no seeds s` | 10 | `no_seeds` delay: good frames without an S1 seed for this long | no |
+| `Self check/nim pairing warn fraction`, `nim pairing error fraction` | 0.8, 0.5 | `nim_pairing` levels (pair efficiency) | no |
+| `Self check/nim offset max ns` | 5 | `nim_offset`: \|median NIM - TOT\| above this | no |
+| `Self check/nim lag max fraction` | 0.5 | `nim_lag`: share of the window's frames whose lag state is "faulted" above this | no |
+| `Self check/nim lag min votes` | 3 | `nim_lag` also needs this many frames voted "faulted" since the run start or the last rebuild | no |
 | `Self check/mupix sync min fraction`, `mupix sync hold s`, `mupix sync window s`, `mupix sync min S1`, `mupix sync clear margin` | 0.3, 30, 10, 200, 0.05 | the `mupix_sync` flag (see [MuPix time sync](#mupix-time-sync-what-the-flag-means)) | no |
 | `Sampling/CPU budget %` | 20 | the analyzer's CPU, % of one core, everything included; it analyses as many frames as fit and skips the rest unread. At most 50 (a larger value is used as 50, `cpu_budget_clamped` in `dqm::status`). 0: analyse nothing. No budget at all only with the development flag `mdqm-analyzer --no-cpu-budget` | no |
 | `Sampling/max events per s` | 1000 | hard cap on analysed frames per second, on top of the budget; 0 means "decode nothing" | no |
 | `Sampling/raw ring MB` | 16 | the raw bytes of the last analysed frames, for **Download raw event** (`sma::raw`); about 50 frames of run 1008. Oversize frames are never kept. 0 = none | no |
 | `Sampling/seed ring frames` | 8 | good frames kept for the seeded view's other seeds, filters, MuPix selector and counter pattern, searched back when the newest has no match; at most 64 | no |
 | `Sampling/seed ring MB` | 24 | the same, at most this many MB (estimated array bytes; the newest good frame is always kept) | no |
+
+The `NIM/` per-counter lists must have one entry per counter; a wrong length is a
+settings error and falls back (to the default if it fits, else no NIM copies).
+Without any NIM channel the offsets and nominals are not judged.
 
 An ODB seeded by an older version has a `Sampling/process all` key: it is
 ignored now (the budget replaced it) and can be deleted.
@@ -830,7 +1071,17 @@ identical. At PSI the download is the event exactly as the frontend wrote it.
 ## Manual path: `mdqm-sma-file` (analyzer or DAQ down)
 
 The same plugin over one file, no MIDAS needed (`src/mdqm/tools/sma_file.py`).
-It uses the default settings, not the ODB. **It is not CPU-budgeted: it analyses
+It uses the default settings, not the ODB. The default channel roles are the
+run-1015 cabling; for an older run pass its roles, its mismatch flag channels and
+no NIM copies (`tests/sma_layouts.OLD_LAYOUT`):
+
+```bash
+mdqm-sma-file run01008_00001.mid.lz4 --settings '{"Channel roles": {"s1": 1, "counters": [1, 2, 3, 4, 5], "rf": 6, "current": 7, "delayed": [8, 9, 10]}, "Self check": {"mismatch flag channels": [1, 2, 3, 4, 5, 6]}, "NIM": {"channels": [-1]}}'
+```
+
+Without the `NIM` part the old roles collide with the NIM defaults: NIM is
+then off anyway, but the `settings` warning stays.
+**It is not CPU-budgeted: it analyses
 every frame of the file** (it is a batch job, not a guest on the DAQ PC). The
 S1 cap (`Cuts/max S1 per frame`) is a cut and applies in both, so the CLI and an
 analyzer started with `--no-cpu-budget` on the same frames give identical histograms; an analyzer
@@ -846,7 +1097,7 @@ mdqm-sma-file FILE --settings my-sma-settings.json --skip 10 --frames 50
 Options (`sma_file.py:489-511`): `--shift N` (default 14), `--frames N`,
 `--skip N`, `--out DIR` (default `./sma-file-<run>_<subrun>/`), `--settings`
 (inline JSON or a JSON file in the `/DQM/SMA` layout; unknown keys are an error),
-`--no-png`, `--quiet`.
+`--no-png`, `--quiet`, `--merge` / `--no-merge` (`NIM/merge`, default n).
 
 Outputs in the output directory:
 
@@ -1094,8 +1345,15 @@ mhttpd idles at 0.6-1 % with the replay running):
 | SMAPlots, RF / delayed | 0.5 % | 120 kB/s |
 | SMAPlots, Trends | 0.2 % | 10 kB/s |
 | SMAEvents, seeded (4 Hz) | 0.2-0.25 % | 7 kB/s |
-| SMAEvents, raster (2 Hz), ch 7 hidden | 0.2 % | 390 kB/s |
-| SMAEvents, raster (2 Hz), ch 7 shown | 0.2-0.25 % | 430 kB/s |
+| SMAEvents, raster (2 Hz), current (ch 7, run 1008) hidden | 0.2 % | 390 kB/s |
+| SMAEvents, raster (2 Hz), current (ch 7, run 1008) shown | 0.2-0.25 % | 430 kB/s |
+
+These were measured before the NIM copies. With NIM copies configured
+(run 1015 on) every frame carries the per-hit TOT + NIM class (smaf v3): the
+live raster is 8 instead of 7 bytes a hit, so about 445 instead of 390 kB/s
+(+14 %); the partner indices travel only with the word data (the seeded view,
+a frozen raster: 24 instead of 19 bytes a hit). The table is to be re-measured
+on NIM data.
 
 So three shifters with pages open cost mhttpd 1-2.5 % of a core. The raster
 is the only heavy one on the network: about 3.5 Mbit/s per viewer, which

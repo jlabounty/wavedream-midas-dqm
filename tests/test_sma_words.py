@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
+from sma_layouts import OLD_ROLES
 
 from mdqm.plugins import sma_words as W
 
@@ -395,7 +396,7 @@ def test_analyse_frame_end_to_end():
     words = np.concatenate(parts)
     fr = W.prepare_frame(RNG.permutation(words), 14)
     assert fr.consistent.all() and fr.keep.all()
-    a = W.analyse_frame(fr)
+    a = W.analyse_frame(fr, OLD_ROLES)
     assert a.rf_valid.all() and np.all(a.rf_phase == 99) and np.all(a.rf_period == 20)
     assert np.all(a.pattern == 0b11111)
     assert np.all(a.partner_counts == 1)
@@ -471,6 +472,6 @@ def test_seeds_ignore_a_counter_with_too_few_hits():
              words_at(5, t1[:2] + 9),                                # S5: two hits only
              words_at(6, np.concatenate([t1 + 47, t1 + 79]))]
     fr = W.prepare_frame(np.concatenate(parts), 14)
-    assert W.analyse_frame(fr).seeds.size == 4
+    assert W.analyse_frame(fr, OLD_ROLES).seeds.size == 4
     strict = W.Cuts(seed_min_hits=1)
-    assert W.analyse_frame(fr, cuts=strict).seeds.size == 0
+    assert W.analyse_frame(fr, OLD_ROLES, cuts=strict).seeds.size == 0

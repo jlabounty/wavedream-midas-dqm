@@ -269,7 +269,10 @@ def _run_cli(tmp_path, frames, *args, name="run00682_00005.mid", run=682):
 
 
 def test_cli_healthy_file(tmp_path, capsys):
-    rc, out = _run_cli(tmp_path, synth_frames(8), "--no-png")
+    # The synthetic frames are cabled without NIM copies (every NIM channel of
+    # the defaults but ch 3 would be flagged nim_missing).
+    rc, out = _run_cli(tmp_path, synth_frames(8), "--no-png", "--settings",
+                       '{"NIM": {"channels": [-1]}}')
     assert rc == S.EXIT_OK
     assert sorted(p.name for p in out.iterdir()) == ["hists.npz", "summary.json", "trend.json"]
 

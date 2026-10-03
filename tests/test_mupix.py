@@ -12,7 +12,7 @@ import json
 
 import numpy as np
 import pytest
-from test_sma_plugin import R682, R1008, _Clock, _dispatch, _feed, _plugin
+from test_sma_plugin import OLD_ROLES, R682, R1008, _Clock, _dispatch, _feed, _plugin
 from test_sma_seed_choice import SPACING, T0, build, ev
 
 from mdqm.dqm import framing
@@ -231,7 +231,7 @@ def _mixed_frame():
 def test_the_mupix_selector_is_an_and_on_the_filters(mode, filters, want):
     fr = W.prepare_frame(_mixed_frame(), mupix=W.MuPixCuts())
     cuts = W.Cuts(n_seeds=4)
-    sel = W.select_seeds_by(fr, W.Roles(), cuts, "s1", filters, mupix=mode, mcuts=W.MuPixCuts())
+    sel = W.select_seeds_by(fr, OLD_ROLES, cuts, "s1", filters, mupix=mode, mcuts=W.MuPixCuts())
     got = [int(round((t - T0) / SPACING)) for t in sel.t]
     assert got == want
     for k, n1, n2 in zip(got, sel.mp_l1, sel.mp_l2, strict=True):
@@ -253,7 +253,7 @@ def test_the_mupix_selector_is_an_and_on_the_filters(mode, filters, want):
 ])
 def test_the_pattern_selector_is_an_and_with_mupix_and_the_filters(mode, filters, pattern, want):
     fr = W.prepare_frame(_mixed_frame(), mupix=W.MuPixCuts())
-    sel = W.select_seeds_by(fr, W.Roles(), W.Cuts(n_seeds=4), "s1", filters, mupix=mode,
+    sel = W.select_seeds_by(fr, OLD_ROLES, W.Cuts(n_seeds=4), "s1", filters, mupix=mode,
                             mcuts=W.MuPixCuts(), require=W.parse_pattern(pattern))
     assert [int(round((t - T0) / SPACING)) for t in sel.t] == want
     # Through the plugin: the reply names the pattern and MuPix both.
@@ -274,11 +274,11 @@ def test_a_hit_counts_past_the_end_of_the_pixel_data_an_absence_does_not():
             + [(T0 + k * SPACING - 32, 5, 9) for k in range(19)])
     words = np.concatenate([build([ev() for _ in range(24)]), pixels(sorted(hits))])
     fr = W.prepare_frame(words, mupix=W.MuPixCuts())
-    sel = W.select_seeds_by(fr, mupix="both")
+    sel = W.select_seeds_by(fr, OLD_ROLES, mupix="both")
     assert [int(round((t - T0) / SPACING)) for t in sel.t] == [15, 16, 17, 18]
     assert list(sel.mp_covered) == [True, True, True, False]
     assert list(sel.mp_l1) == [1, 1, 1, 1] and list(sel.mp_l2) == [1, 1, 1, 1]
-    assert W.select_seeds_by(fr, mupix="none").idx.size == 0
+    assert W.select_seeds_by(fr, OLD_ROLES, mupix="none").idx.size == 0
     p = _plugin()
     _feed(p, words, run=1)
     ms = framing.decode_sma_frame(p.frame_blob("seeded"))["meta"]["mupix"]["seeds"]
@@ -288,7 +288,7 @@ def test_a_hit_counts_past_the_end_of_the_pixel_data_an_absence_does_not():
 def test_without_pixels_only_any_selects():
     fr = W.prepare_frame(build([ev() for _ in range(8)]), mupix=W.MuPixCuts())
     for mode, n in (("any", 4), ("both", 0), ("either", 0), ("none", 0)):
-        assert W.select_seeds_by(fr, W.Roles(), W.Cuts(), "s1", mupix=mode).idx.size == n, mode
+        assert W.select_seeds_by(fr, OLD_ROLES, W.Cuts(), "s1", mupix=mode).idx.size == n, mode
     with pytest.raises(ValueError):
         W.parse_mupix("L1")
     assert W.parse_mupix(None) == "any" and W.parse_mupix(" BOTH ") == "both"

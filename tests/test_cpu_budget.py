@@ -401,17 +401,20 @@ def test_the_wavedream_analyzer_is_untouched_by_the_budget():
 # --- the S1 cap ------------------------------------------------------------------------------
 
 def _dense_frame(n_s1=5000, eff=(1.0, 0.7, 0.9, 0.5, 0.8), seed=3, t0=10**12):
-    """S1 every ~600 ns, counters k with efficiency eff[k] (random), RF bursts."""
+    """S1 every ~600 ns, counters k with efficiency eff[k] (random), RF bursts.
+
+    Cabled as the plugin's default roles say (W.Roles())."""
+    roles = W.Roles()
     rng = np.random.default_rng(seed)
     t1 = t0 + np.cumsum(rng.integers(300, 900, n_s1)).astype(np.int64)
-    ts, chs = [t1], [np.full(n_s1, 1)]
-    for k, c in enumerate((2, 3, 4, 5), start=1):
+    ts, chs = [t1], [np.full(n_s1, roles.s1)]
+    for k, c in enumerate(roles.counters[1:], start=1):
         hit = rng.random(n_s1) < eff[k]
         ts.append(t1[hit] + rng.integers(0, 8, int(hit.sum())))
         chs.append(np.full(int(hit.sum()), c))
     rf = np.arange(t1[0] - 200, t1[-1] + 200, 20, dtype=np.int64)
     ts.append(rf)
-    chs.append(np.full(rf.size, 6))
+    chs.append(np.full(rf.size, roles.rf))
     t = np.concatenate(ts)
     ch = np.concatenate(chs)
     o = np.argsort(t, kind="stable")

@@ -60,6 +60,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass, field
+from typing import NamedTuple
 
 import numpy as np
 
@@ -186,6 +187,8 @@ MUPIX_MODES = ("any", "both", "either", "none")
 #: The per-counter pattern selector of the event display (sma::frame "pattern"):
 #: a hit on that counter within +-coinc of the seed, or none; "any" is no condition.
 PATTERN_STATES = ("any", "present", "absent")
+#: Counters (S1..Sn) at most: the coincidence pattern is one byte per seed.
+MAX_COUNTERS = 8
 
 _U = np.uint64
 
@@ -967,10 +970,12 @@ class Roles:
     """Which SMA channel is what (ODB ``/DQM/SMA/Channel roles``)."""
 
     s1: int = 1
-    counters: tuple = (1, 2, 3, 4, 5)
+    #: S1..S5 in order, the first the s1 channel; at most MAX_COUNTERS.
+    counters: tuple = (1, 2, 7, 4, 5)
     rf: int = 6
-    current: int = 7
-    delayed: tuple = (8, 9, 10)
+    #: -1 = none (no proton current on the SMA since run 1015).
+    current: int = -1
+    delayed: tuple = ()
 
 
 @dataclass
@@ -999,6 +1004,22 @@ class Cuts:
     #: phase, coincidences, time differences, delayed pairs); None = all. See
     #: :func:`analyse_frame`.
     max_s1: int | None = None
+
+
+class CounterHits(NamedTuple):
+    """One counter's hits in one frame, ascending in time.
+
+    By default a counter's hits are its channel's kept words
+    (:meth:`Frame.counter_hits_of`). The plugin can hand over others per
+    counter channel (:attr:`Frame.counter_hits`): the TOT + NIM merged hits,
+    where a hit carried by a NIM word takes that word's aligned time and a
+    substituted ToT. ``idx`` always points at the carrier word in the frame's
+    kept hits (``Frame.s_*``), so a seed on such a hit has a word to show.
+    """
+
+    t: np.ndarray       # int64 ns, the frame's time basis
+    tot: np.ndarray     # ToT code
+    idx: np.ndarray     # intp, into Frame.s_*
 
 
 @dataclass
@@ -1053,6 +1074,17 @@ class Frame:
     #: The MuPix pixel hits (:func:`prepare_pixels`), on the same time basis as
     #: ``s_t``; None when the frame was prepared without MuPix.
     px: Pixels | None = None
+    #: Counter hits that replace a counter channel's kept words in every
+    #: counter use (:func:`analyse_frame`, :func:`select_seeds_by`): channel ->
+    #: :class:`CounterHits`. Set by the plugin (the TOT + NIM merge); None, or a
+    #: channel not in it, means the channel's own kept words. Everything that
+    #: reads the words themselves (rates, ToT, fine/coarse, stale, the shift
+    #: scan, the raster) ignores it.
+    counter_hits: dict | None = None
+    #: The plugin's per-hit TOT/NIM pairing of this frame, indexed like
+    #: ``s_*`` (``sma.NimWords``); None when nothing was paired. Carried for
+    #: the event display only; nothing here reads it.
+    pairing: tuple | None = None
 
     @property
     def span_ns(self) -> int:
@@ -1075,6 +1107,25 @@ class Frame:
     def times(self, c) -> np.ndarray:
         """Ascending kept times of channel ``c``."""
         return self.s_t[self.chan[c]]
+
+    def counter_hits_of(self, c) -> CounterHits:
+        """Channel ``c``'s hits as a counter: :attr:`counter_hits` when it has
+        them, else its kept words."""
+        h = self.counter_hits.get(c) if self.counter_hits else None
+        if h is not None:
+            return h
+        i = self.chan[c]
+        return CounterHits(self.s_t[i], self.s_tot[i], i)
+
+    def counter_times(self, c) -> np.ndarray:
+        """Ascending times of channel ``c`` as a counter (:meth:`counter_hits_of`)."""
+        h = self.counter_hits.get(c) if self.counter_hits else None
+        return self.s_t[self.chan[c]] if h is None else h.t
+
+    def counter_idx(self, c) -> np.ndarray:
+        """The carrier word (into ``s_*``) of each of channel ``c``'s counter hits."""
+        h = self.counter_hits.get(c) if self.counter_hits else None
+        return self.chan[c] if h is None else h.idx
 
 
 def split_by_channel(ch, n_channels=N_CHANNELS) -> list:
@@ -1179,8 +1230,9 @@ class FrameAnalysis:
     #: Every kept S1 time of the frame (the S1 spacing needs all of them);
     #: None: the same as t_s1.
     t_s1_all: np.ndarray | None = None
-    #: Per row, its index among the frame's kept S1 hits (``frame.chan[s1]``);
-    #: None: row i is kept S1 hit i.
+    #: Per row, its index among the frame's S1 hits as a counter
+    #: (``frame.counter_idx(s1)``: the kept S1 words, or the merged S1 hits);
+    #: None: row i is S1 hit i.
     s1_rows: np.ndarray | None = None
 
     @property
@@ -1243,8 +1295,10 @@ def analyse_frame(frame: Frame, roles: Roles | None = None, cuts: Cuts | None = 
     """
     roles = roles or Roles()
     cuts = cuts or Cuts()
-    i1 = frame.chan[roles.s1]
-    t_s1 = frame.s_t[i1]
+    # S1 and the counters as counters (Frame.counter_hits: the merged TOT +
+    # NIM hits when the plugin set them); the shift scan reads the raw words.
+    h1 = frame.counter_hits_of(roles.s1)
+    t_s1 = h1.t
     if shift_counts is None:
         # Every S1 word of the frame, not only the kept ones: the scan needs no
         # times, and at a far-wrong shift the kept cluster is a handful of words.
@@ -1252,12 +1306,12 @@ def analyse_frame(frame: Frame, roles: Roles | None = None, cuts: Cuts | None = 
         shift_counts = shift_scan(frame.coarse[s1_all], frame.fine[s1_all], cuts.shift_scan,
                                   cuts.latch_margin_ns)
     t_rf = frame.times(roles.rf)
-    counters = [frame.times(c) for c in roles.counters]
+    counters = [frame.counter_times(c) for c in roles.counters]
     rng = complete_range([x for x in counters + [t_rf] if len(x) >= cuts.seed_min_hits])
     seeds = (select_seeds(t_s1, rng[0], rng[1], cuts.n_seeds, cuts.seed_pre_ns,
                           cuts.seed_post_ns) if rng else np.zeros(0, dtype=np.intp))
     vetoed, gap = gate_veto(t_s1, cuts.rf_gate_ns)
-    s1_tot = frame.s_tot[i1]
+    s1_tot = h1.tot
 
     sample = None
     t_all = None
@@ -1465,6 +1519,10 @@ class SeedSelection:
     require: tuple = ()
     ignore: tuple = ()
     incomplete_judged: bool = True
+    #: Per chosen seed, the ToT of the S1 hit it borrows (the merged hit's:
+    #: a NIM-only S1 hit has the substituted ToT); -1 without S1. None: read
+    #: ``Frame.s_tot[s1_idx]``.
+    s1_tot: np.ndarray | None = None
 
     @property
     def capped(self) -> bool:
@@ -1494,22 +1552,40 @@ def _nearest_within(t_ref, t_sorted, window_ns) -> np.ndarray:
 def seed_candidates(frame: Frame, roles: Roles, cuts: Cuts, mode: str) -> np.ndarray:
     """Indices into ``frame.s_*`` (ascending in time) of every possible seed.
 
-    ``s1``/``ch<N>``: that channel's kept hits. ``any``: the first hit of each
-    time cluster of the counter hits (S1..S5), a cluster being hits chained
-    within ``cuts.coinc_ns`` of the one before.
+    ``s1``: the S1 hits as a counter (:meth:`Frame.counter_hits_of`: its kept
+    words, or the merged hits, each by its carrier word). ``ch<N>``: that
+    channel's kept words, merged or not. ``any``: the first hit of each time
+    cluster of the counter hits (S1..S5), a cluster being hits chained within
+    ``cuts.coinc_ns`` of the one before.
     """
+    return _candidates(frame, roles, cuts, mode).idx
+
+
+def _candidates(frame: Frame, roles: Roles, cuts: Cuts, mode: str) -> CounterHits:
+    """:func:`seed_candidates` with each candidate's time and ToT."""
     if mode == SEED_ANY:
-        counters = np.asarray(roles.counters, dtype=frame.s_ch.dtype)
-        idx = np.flatnonzero(np.isin(frame.s_ch, counters))
+        if frame.counter_hits:
+            hs = [frame.counter_hits_of(c) for c in roles.counters]
+            idx = np.concatenate([np.asarray(h.idx, dtype=np.intp) for h in hs])
+            t = np.concatenate([h.t for h in hs])
+            tot = np.concatenate([np.asarray(h.tot, dtype=np.int64) for h in hs])
+            o = np.lexsort((idx, t))
+            idx, t, tot = idx[o], t[o], tot[o]
+        else:
+            counters = np.asarray(roles.counters, dtype=frame.s_ch.dtype)
+            idx = np.flatnonzero(np.isin(frame.s_ch, counters))
+            t, tot = frame.s_t[idx], frame.s_tot[idx]
         if idx.size == 0:
-            return idx.astype(np.intp)
-        t = frame.s_t[idx]
+            return CounterHits(t, tot, idx.astype(np.intp))
         first = np.empty(idx.size, dtype=bool)
         first[0] = True
         first[1:] = np.diff(t) > cuts.coinc_ns
-        return idx[first].astype(np.intp)
-    c = roles.s1 if mode == SEED_S1 else int(mode[2:])
-    return np.asarray(frame.chan[c], dtype=np.intp)
+        return CounterHits(t[first], tot[first], idx[first].astype(np.intp))
+    if mode == SEED_S1:
+        h = frame.counter_hits_of(roles.s1)
+        return CounterHits(h.t, h.tot, np.asarray(h.idx, dtype=np.intp))
+    i = np.asarray(frame.chan[int(mode[2:])], dtype=np.intp)
+    return CounterHits(frame.s_t[i], frame.s_tot[i], i)
 
 
 def select_seeds_by(frame: Frame, roles: Roles | None = None, cuts: Cuts | None = None,
@@ -1553,9 +1629,9 @@ def select_seeds_by(frame: Frame, roles: Roles | None = None, cuts: Cuts | None 
     require = parse_pattern(dict(require), nc)      # a dict or parse_pattern's pairs
     ignore = tuple(sorted({int(k) for k in ignore if 0 <= int(k) < nc}))
     s_t = frame.s_t
-    cand = seed_candidates(frame, roles, cuts, mode)
-    t_c = s_t[cand]
-    counters = [frame.times(c) for c in roles.counters]
+    cand_t, cand_tot, cand = _candidates(frame, roles, cuts, mode)
+    t_c = cand_t
+    counters = [frame.counter_times(c) for c in roles.counters]
     t_rf = frame.times(roles.rf)
     rng = complete_range([x for x in counters + [t_rf] if len(x) >= cuts.seed_min_hits])
     if rng is None:
@@ -1588,9 +1664,11 @@ def select_seeds_by(frame: Frame, roles: Roles | None = None, cuts: Cuts | None 
         np.cumsum(frame.s_tot >= cuts.tot_corrupt_min, out=hot[1:])
         odd |= np.where(hot[b] > hot[a], FILTER_BITS["tot"], 0).astype(np.uint8)
 
-    # RF: from S1 -- the seed itself, or the nearest S1 hit within the window.
-    i1 = np.asarray(frame.chan[roles.s1], dtype=np.intp)
-    t1 = s_t[i1]
+    # RF: from S1 -- the seed itself, or the nearest S1 hit within the window
+    # (S1 as a counter: merged when the plugin merged it).
+    h1 = frame.counter_hits_of(roles.s1)
+    i1 = np.asarray(h1.idx, dtype=np.intp)
+    t1 = h1.t
     if mode == SEED_S1:
         j = np.arange(e0, hi, dtype=np.intp)          # candidates are the S1 hits
     else:
@@ -1633,15 +1711,18 @@ def select_seeds_by(frame: Frame, roles: Roles | None = None, cuts: Cuts | None 
     pick = mi[max(0, mi.size - int(cuts.n_seeds)):] if cuts.n_seeds > 0 else mi[:0]
     s1_idx = np.full(pick.size, -1, dtype=np.intp)
     hp = has[pick]
-    s1_idx[hp] = i1[j[pick][hp]]
+    jp = j[pick][hp]
+    s1_idx[hp] = i1[jp]
     s1_dt = np.zeros(pick.size, dtype=np.int64)
-    s1_dt[hp] = s_t[s1_idx[hp]] - te[pick][hp]
+    s1_dt[hp] = t1[jp] - te[pick][hp]
+    s1_tot = np.full(pick.size, -1, dtype=np.int64)
+    s1_tot[hp] = h1.tot[jp]
     return SeedSelection(
         mode=mode, filters=filters, idx=ex[pick], t=te[pick].astype(np.int64),
-        ch=frame.s_ch[ex[pick]], tot=frame.s_tot[ex[pick]], pattern=pattern[pick],
+        ch=frame.s_ch[ex[pick]], tot=cand_tot[e0:hi][pick], pattern=pattern[pick],
         odd=odd[pick], has_s1=hp, s1_idx=s1_idx, s1_dt=s1_dt, rf_n=rf_n[pick],
         rf_valid=rf_valid[pick],
         rf_vetoed=rf_vetoed[pick], rf_phase=rf_phase[pick], rf_period=rf_period[pick],
         n_candidates=n_cand, n_examined=int(ex.size), n_matching=int(mi.size),
         mupix=mupix, mp_l1=mp1[pick], mp_l2=mp2[pick], mp_covered=mp_cov[pick],
-        require=require, ignore=ignore, incomplete_judged=judged)
+        require=require, ignore=ignore, incomplete_judged=judged, s1_tot=s1_tot)

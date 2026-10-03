@@ -15,6 +15,11 @@
 //      in-time fractions of S1 hits (L1, L2, L1+L2, with the sideband and the
 //      accidentals taken out) and the time-sync state above its plots; its
 //      per-chip column/row occupancy is drawn per plane, one line per chip.
+//      The NIM / TOT tab (since run 1015 each counter has a NIM copy, "S1L"
+//      ...) has a table per counter -- pair efficiency, purity, NIM-only share,
+//      median NIM - TOT, the lag-fault vote -- above its plots, per counter.
+//      A chip in the status line says whether the counters are the merged
+//      TOT + NIM hits (pattern, efficiencies), as nearline's are.
 //
 // Everything comes from the sma_analyzer client over brpc. Channel names come
 // from the summary, which takes them from the ODB (/DQM/SMA/Channel roles), so
@@ -42,6 +47,7 @@ const TABS = [
   ["timing", "Timing"],
   ["rf", "RF / delayed"],
   ["mupix", "MuPix"],
+  ["nim", "NIM / TOT"],
   ["trends", "Trends"],
 ];
 
@@ -62,11 +68,22 @@ const ORDER = {
   rf: [/^rf_npulses$/, /^rf_phase_s1$/, /^rf_period$/, /^rf_phase_vs_s1_tot$/, /^delayed_dt_ch/],
   mupix: [/^mupix_dt_L1$/, /^mupix_dt_L2$/, /^mupix_s1_match$/, /^mupix_tot_L1$/, /^mupix_tot_L2$/,
           /^mupix_col_chip/, /^mupix_row_chip/, /^mupix_hits_chip$/, /^mupix_/],
+  nim: [/^nim_/, /^s1_coinc_tot$/],
 };
+
+/**
+ * The NIM tab's order: the merged-vs-TOT coincidences first, then counter by
+ * counter (S1, S1L's plots; S2, ...), and within a counter the kinds below --
+ * so "is S4L all right" is one block of plots, read top to bottom.
+ */
+const NIM_KINDS = ["dt", "dt_wide", "classes", "walk", "lag", "width", "candidates"];
+
+/** 1D plots drawn with log y by default (the NIM tab's "log y for Δt" switch). */
+const LOG_Y_DEFAULT = [/^sma\/nim_dt_S\d+$/, /^sma\/nim_dt_wide_S\d+$/];
 
 function tabOf(name) {
   const s = shortName(name);
-  for (const tab of ["tot", "timing", "rf", "mupix"]) {
+  for (const tab of ["tot", "timing", "rf", "mupix", "nim"]) {
     if (ORDER[tab].some((re) => re.test(s))) return tab;
   }
   return "health";
@@ -74,6 +91,13 @@ function tabOf(name) {
 
 function rank(tab, name) {
   const s = shortName(name);
+  if (tab === "nim") {
+    if (s === "s1_coinc_tot") return 0;
+    const m = /^nim_(.+)_S(\d+)$/.exec(s);
+    const kind = m ? NIM_KINDS.indexOf(m[1]) : -1;
+    if (!m) return 10000;
+    return 1 + 100 * Number(m[2]) + (kind < 0 ? NIM_KINDS.length : kind);
+  }
   const i = ORDER[tab].findIndex((re) => re.test(s));
   return i < 0 ? ORDER[tab].length : i;
 }
@@ -87,13 +111,14 @@ const state = {
   intervalMs: 1000,
   logY: false,
   logZ: true,
+  nimLogY: true,           // the NIM tab's dt plots on log y (LOG_Y_DEFAULT)
   names: null,             // dqm::list, null until the analyzer has answered once
   epoch: null,             // summary epoch; a change means the histograms were rebuilt
   plots: {},               // tab -> [{key, names, wrap, div, mpg, title, foot}]
   meta: {},                // histogram name -> dqm::metadata (titles), fetched once
   summary: null,
   status: null,
-  trend: { rows: [], since: null, key: null, graphs: null, labels: [], counters: [] },
+  trend: { rows: [], since: null, key: null, graphs: null, labels: [], counters: [], nimCounters: [] },
   summaryUpdater: null,
   tabUpdater: null,
   graphs: new Map(),       // group key -> plot entry, reused across relists (see layoutTab)
@@ -103,6 +128,8 @@ const state = {
   flagsSig: null,
   lastOkAt: null,
   mupixSig: null,          // the MuPix plane map the MuPix tab was laid out for
+  nimSig: null,            // the NIM table's rows (counters, channels) as last built
+  mergeSig: null,          // the summary's nim_merge the tabs were laid out for
 };
 
 window.addEventListener("load", function () {
@@ -140,6 +167,19 @@ async function refreshSummary() {
     if (state.tab === "mupix") layoutTab("mupix");
   }
   state.mupixSig = sig;
+  // The merged-vs-TOT overlay exists only with the merge on (groupsFor): a
+  // merge edit lays the Timing and NIM tabs out again.
+  const msig = summary ? String(summary.nim_merge) : null;
+  if (state.mergeSig !== null && msig !== state.mergeSig) {
+    for (const tab of ["timing", "nim"]) delete state.plots[tab];
+    for (const k of [COINC, COINC_TOT]) {
+      const g = state.graphs.get(k);
+      if (g && state.seen) state.seen.unobserve(g.wrap);
+      state.graphs.delete(k);
+    }
+    if (state.tab === "timing" || state.tab === "nim") layoutTab(state.tab);
+  }
+  state.mergeSig = msig;
 
   // A histogram rebuild (a shift, cut or binning edit in the ODB) starts a new
   // epoch and can change the set of names -- dt_Sk_S1 follows the counter
@@ -243,7 +283,37 @@ function groupsFor(tab) {
     if (!byKey.has(key)) { byKey.set(key, { key, names: [] }); groups.push(byKey.get(key)); }
     byKey.get(key).names.push(n);
   }
+  // S1 coincidences on the merged counters and on the TOT words alone, on one
+  // graph: the gap between the two is what the NIM merge adds. Shown on both
+  // the Timing and the NIM tab, so each tab has its own graph (key).
+  // With the merge off the two are the same curve: no overlay then.
+  const all = state.names || [];
+  const merging = !(state.summary && state.summary.nim_merge === false);
+  if (merging && all.indexOf(COINC_TOT) >= 0 && all.indexOf(COINC) >= 0) {
+    for (const g of groups) {
+      if (g.key === COINC || g.key === COINC_TOT) g.names = [COINC, COINC_TOT];
+    }
+  }
   return groups;
+}
+
+const COINC = "sma/s1_coinc";
+const COINC_TOT = "sma/s1_coinc_tot";
+
+/** A series' legend label on an overlaid graph. */
+function seriesLabel(p, n) {
+  if (p.names.length > 1 && /^sma\/s1_coinc(_tot)?$/.test(n)) {
+    if (n === COINC_TOT) return "TOT only";
+    const s = state.summary;
+    return s && s.nim_merge === false ? "counters (merge off)" : "merged";
+  }
+  if (p.names.length > 1) return `fine bit 0 = ${n.slice(-1)}`;
+  return shortName(n);
+}
+
+/** Whether a 1D histogram is drawn with log y: the toolbar switch, or a NIM dt default. */
+function logYFor(name) {
+  return state.logY || (state.nimLogY && LOG_Y_DEFAULT.some((re) => re.test(name)));
 }
 
 function layoutTab(tab) {
@@ -321,8 +391,7 @@ function ensureGraph(p) {
     });
   } else {
     p.names.forEach(function (n, i) {
-      mpg.addPlot({ label: pair ? `fine bit 0 = ${n.slice(-1)}` : shortName(n),
-                    xData: [], yData: [], line: { color: COLOURS[i] } });
+      mpg.addPlot({ label: seriesLabel(p, n), xData: [], yData: [], line: { color: COLOURS[i] } });
     });
   }
   if (dtWin) {
@@ -375,6 +444,9 @@ function titleFor(g) {
   if (m) {
     const ch = Number(m[1]);
     return `ToT, ${labelOf(ch)} (ch ${ch})`;
+  }
+  if (g.names.length > 1 && g.names[1] === COINC_TOT) {
+    return "S1 coincidences, merged TOT + NIM vs TOT only  [s1_coinc, s1_coinc_tot]";
   }
   const meta = state.meta[g.names[0]];
   return meta && meta.title ? `${meta.title}  [${shortName(g.names[0])}]` : shortName(g.key);
@@ -500,13 +572,15 @@ async function drawPlot(p) {
 
   // 1D: redrawn only when a histogram, the y scale or the MuPix windows changed.
   const mp = state.summary && state.summary.mupix;
+  const logY = logYFor(name0);
   const sig = hists.map((h) => `${DQMHeatmap.checksum(h.data)}:${h.entries}`).join(",") +
-    `|${state.logY}|${mp ? JSON.stringify([mp.window_ns, mp.sideband_ns]) : ""}`;
+    `|${logY}|${mp ? JSON.stringify([mp.window_ns, mp.sideband_ns]) : ""}|${seriesLabel(p, name0)}`;
   if (sig === p.sig && p.mpg) return;
   ensureGraph(p);
   hists.forEach(function (hist, i) {
     const name = p.names[i];
-    applyScale(p.mpg, hist.dimensions);
+    applyScale(p.mpg, hist.dimensions, logY);
+    if (p.names.length > 1) p.mpg.param.plot[i].label = seriesLabel(p, name);
     BRPC.display(hist, p.mpg, i);
     // mplot resets a histogram's colour in setData; an overlaid pair has to be
     // told apart, so the colour is put back afterwards.
@@ -516,10 +590,12 @@ async function drawPlot(p) {
     if (name === "sma/mupix_s1_match") p.matchCounts = Array.from(hist.data);
   });
   p.mpg.redraw();
+  const lsb = /_lsb[01]$/.test(name0);
   p.foot.textContent = p.names.length > 1
-    ? p.names.map((n, i) => `lsb${n.slice(-1)}: ${counts[i].toLocaleString()}`).join(" · ") +
-      " entries"
-    : `${counts[0].toLocaleString()} entries` + (p.matchCounts ? matchText(p.matchCounts) : "");
+    ? p.names.map((n, i) => `${lsb ? `lsb${n.slice(-1)}` : seriesLabel(p, n)}: ` +
+                            `${counts[i].toLocaleString()}`).join(" · ") + " entries"
+    : `${counts[0].toLocaleString()} entries` + (p.matchCounts ? matchText(p.matchCounts) : "") +
+      (logY && !state.logY ? " · log y (NIM tab switch)" : "");
   p.sig = sig;
 }
 
@@ -544,11 +620,12 @@ function matchText(c) {
  * the minimum at 0.5 starts the axis just below one count; empty bins keep
  * their own colour in a colormap (zeroColor) because they are < 0.5.
  */
-function applyScale(mpg, dims) {
+function applyScale(mpg, dims, logY) {
   const y = mpg.param.yAxis, z = mpg.param.zAxis || (mpg.param.zAxis = {});
+  const ly = logY === undefined ? state.logY : logY;
   if (dims === 1) {
-    y.log = state.logY;
-    if (state.logY) y.min = 0.5; else delete y.min;
+    y.log = ly;
+    if (ly) y.min = 0.5; else delete y.min;
     z.log = false;
   } else {
     y.log = false;
@@ -586,9 +663,22 @@ async function refreshTrends() {
   const reply = await BRPC.json(state.client, "sma::trend", args);
   if (!reply) return;
   const tr = state.trend;
+  // Column k of a row's eff / nim_eff is counter k of the reply's lists: when
+  // those change (a counter list edit), the old rows would be relabelled, so
+  // they are dropped and the next poll asks for the whole 10 minutes again.
+  const cols = JSON.stringify([reply.counters || null, reply.nim_counters || null]);
+  if (tr.cols !== undefined && tr.cols !== cols) {
+    tr.cols = cols;
+    tr.rows = [];
+    tr.since = null;
+    tr.key = null;
+    return;
+  }
+  tr.cols = cols;
   tr.now = reply.t;
   tr.labels = reply.labels || tr.labels;
   tr.counters = reply.counters || tr.counters;
+  tr.nimCounters = reply.nim_counters || tr.nimCounters;
   const seen = new Set(tr.rows.map((r) => r.t));
   for (const r of reply.rows || []) if (!seen.has(r.t)) tr.rows.push(r);
   tr.rows.sort((a, b) => a.t - b.t);
@@ -622,7 +712,17 @@ function layoutTrends() {
       withheld[e.counter] = String(e.reason || "withheld").split(":")[0];
     }
   }
-  const key = JSON.stringify([chans, counters, chans.map(labelOf), withheld]);
+  // The TOT + NIM pair efficiency: one line per counter with a NIM copy (the
+  // summary's NIM rows), column k of each row's nim_eff (S1 first).
+  const nimRows = ((state.summary && state.summary.nim && state.summary.nim.counters) || []);
+  const nimCols = tr.nimCounters.map((name, k) => [name, k])
+    .filter(([name]) => nimRows.some((r) => r.counter === name));
+  const nimLabel = (name) => {
+    const r = nimRows.find((x) => x.counter === name);
+    return r ? `${r.label} + ${r.nim_label}` : name;
+  };
+  const key = JSON.stringify([chans, counters, chans.map(labelOf), withheld,
+                              nimCols.map(([name]) => nimLabel(name))]);
   if (tr.graphs && tr.key === key) return;
   tr.key = key;
 
@@ -650,6 +750,12 @@ function layoutTrends() {
         { label: "L1+L2 sideband", get: (r) => (r.mupix ? r.mupix.side[2] : null) },
       ] },
   ];
+  if (nimCols.length) {
+    specs.push({ id: "nim", title: "TOT + NIM pair efficiency (TOT words with a NIM copy in the window)",
+      fraction: true,
+      series: nimCols.map(([name, k]) => ({
+        label: nimLabel(name), get: (r) => (r.nim_eff ? r.nim_eff[k] : null) })) });
+  }
   tr.graphs = specs.map(function (spec) {
     const wrap = el("div", { class: "dqm-sma-plotwrap" });
     wrap.appendChild(el("div", { class: "dqm-histtitle" }, spec.title));
@@ -743,6 +849,165 @@ function render(s, status) {
   guard("dqm-sma-flags", () => renderFlags(s));
   guard("dqm-sma-table", () => renderTable(s));
   guard("dqm-sma-mupix", () => renderMupix(s));
+  guard("dqm-sma-nim", () => renderNim(s));
+}
+
+// ---------------------------------------------------------------------------
+// TOT + NIM
+// ---------------------------------------------------------------------------
+
+const LAG_CLASS = { ok: "", faulted: "alarm", ambiguous: "warn", none: "" };
+/** Which NIM table cell a NIM flag colours. */
+const NIM_FLAG_CELL = { nim_missing: 0, nim_pairing: 1, nim_offset: 4, nim_lag: 5 };
+const NIM_COLUMNS = ["counter / NIM copy", "pair efficiency", "purity", "NIM-only share",
+                     "median NIM − TOT", "lag vote (last · faulted frames · last lag)",
+                     "NIM-only held back"];
+
+/** The flags about one NIM row: those naming its TOT or its NIM channel. */
+function nimFlagsOf(s, r) {
+  const out = [];
+  for (const f of (s && s.flags) || []) {
+    if (!/^nim_/.test(f.code)) continue;
+    // The analyzer names the channels (ch, nim_ch); an older one only in the text.
+    if (typeof f.nim_ch === "number") {
+      if (f.ch === r.ch && f.nim_ch === r.nim_ch) out.push(f);
+      continue;
+    }
+    const chans = [];
+    const re = /\(ch (\d+)\)/g;
+    let m;
+    while ((m = re.exec(f.text || "")) !== null) chans.push(Number(m[1]));
+    if (chans.indexOf(r.ch) >= 0 || chans.indexOf(r.nim_ch) >= 0) out.push(f);
+  }
+  return out;
+}
+
+/**
+ * The lag state ("ok" / "FAULTED"; a frame without a decisive vote of its own
+ * takes the last one), the faulted share of the window's frames with a state,
+ * and the last voted lag.
+ */
+function lagText(lg) {
+  if (!lg) return "—";
+  const s0 = lg.state || lg.last_state;
+  const st = s0 ? (s0 === "faulted" ? "FAULTED" : s0) : "no vote";
+  const nst = (lg.state_ok || 0) + (lg.state_faulted || 0);
+  const ff = nst ? `${pct(lg.state_faulted_frac, 0)} of ${num(nst)}`
+    : lg.voted ? `${pct(lg.faulted_frac, 0)} of ${num(lg.voted)}` : "no frame voted";
+  const last = lg.last_ns === null || lg.last_ns === undefined ? "—" : `${fmtNs(lg.last_ns)}`;
+  return `${st} · ${ff} · ${last}`;
+}
+
+function fmtNs(ns) {
+  const a = Math.abs(ns);
+  if (a >= 1e6) return `${(ns / 1e6).toFixed(2)} ms`;
+  if (a >= 1e4) return `${(ns / 1e3).toFixed(1)} µs`;
+  return `${ns} ns`;
+}
+
+/**
+ * The NIM tab's head: the merge settings as chips, then one row per counter
+ * with a NIM copy. Built once per set of counters, cells updated in place;
+ * a NIM flag colours the cell it is about.
+ */
+function renderNim(s) {
+  const holder = document.getElementById("dqm-sma-nim");
+  if (!holder) return;
+  const nim = s && s.nim;
+  if (!nim || !nim.active) {
+    holder.innerHTML = "";
+    state.nimSig = null;
+    holder.appendChild(el("div", { class: "dqm-note" },
+      "No NIM copies are configured (/DQM/SMA/NIM/channels): the counters are their TOT words."));
+    return;
+  }
+  const rows = nim.counters || [];
+  const sig = JSON.stringify(rows.map((r) => [r.counter, r.ch, r.nim_ch, r.label, r.nim_label]));
+  if (state.nimSig !== sig || !holder._cells) {
+    holder.innerHTML = "";
+    holder.appendChild(el("div", { class: "dqm-strip dqm-sma-nimchips", id: "dqm-sma-nimchips" }));
+    const t = el("table", { class: "dqm-table dqm-sma-nimtable" });
+    const head = el("tr", {});
+    for (const h of NIM_COLUMNS) head.appendChild(el("th", {}, h));
+    t.appendChild(head);
+    holder._cells = rows.map(function (r) {
+      const tr = el("tr", { "data-counter": r.counter });
+      const tds = NIM_COLUMNS.map(() => { const td = el("td", {}); tr.appendChild(td); return td; });
+      t.appendChild(tr);
+      return tds;
+    });
+    const wrap = el("div", { class: "dqm-sma-nimwrap" }, t);
+    holder.appendChild(wrap);
+    holder.appendChild(el("div", { class: "dqm-footnote", id: "dqm-sma-nimfoot" }));
+    state.nimSig = sig;
+  }
+
+  const bar = document.getElementById("dqm-sma-nimchips");
+  bar.innerHTML = "";
+  bar.appendChild(mergeChip(s));
+  bar.appendChild(chip(`pair window ±${nim.pair_window_ns} ns · time from ${nim.time_source}`));
+  if (s.nim_merge) {
+    bar.appendChild(chip(nim.merge_when_lagged ? "lagged NIM channels merged too"
+      : "a lagged NIM channel's NIM-only hits are held back"));
+    const held = (s.nim_lag_held || []).map((c) => labelOf(c));
+    if (held.length) bar.appendChild(chip(`held back now: ${held.join(", ")}`, "yellow"));
+  } else {
+    bar.appendChild(chip("NIM-only hits counted, not merged: counters and pattern are TOT only"));
+  }
+
+  rows.forEach(function (r, i) {
+    const tds = holder._cells[i];
+    const marks = {};
+    for (const f of nimFlagsOf(s, r)) {
+      const k = NIM_FLAG_CELL[f.code];
+      if (k === undefined) continue;
+      const cls = f.severity === "error" ? "alarm" : "warn";
+      if (marks[k] !== "alarm") marks[k] = cls;
+    }
+    const put = (k, text, extra, title) =>
+      setCell(tds[k], text, [extra || "", marks[k] || ""].filter(Boolean).join(" "), title);
+    put(0, `${r.label} (ch ${r.ch}) / ${r.nim_label} (ch ${r.nim_ch})`, "",
+        `${num(r.tot_words)} TOT words, ${num(r.nim_words)} NIM words in the window` +
+        (r.echo_rule ? `; echo rule on (${num(r.echo)} echo words)` : ""));
+    put(1, pct(r.pair_eff, 1), "", `paired / (paired + TOT-only): ${num(r.paired)} of ` +
+        `${num((r.paired || 0) + (r.tot_only || 0))} TOT words have a NIM copy`);
+    put(2, pct(r.purity, 1), "", `paired / NIM words: ${num(r.paired)} of ${num(r.nim_words)}`);
+    put(3, pct(r.nim_only_frac, 1), "", `${num(r.nim_only)} NIM words without a TOT word, of the ` +
+        (s.nim_merge ? "merged hits: what the merge adds"
+                     : "hits a merge would make: what it would add (merge off, nothing is merged)"));
+    const med = r.median_dt_ns === null || r.median_dt_ns === undefined ? "—"
+      : `${r.median_dt_ns > 0 ? "+" : ""}${r.median_dt_ns} ns`;
+    put(4, med, "", `after the ${r.offset_ns} ns offset (NIM/offset ns); ${num(r.dt_entries)} entries`);
+    const lg = r.lag || {};
+    put(5, lagText(lg), marks[5] ? "" : (LAG_CLASS[lg.last_state] || ""),
+        `fine-time lag vote against S1: ok ${num(lg.ok)}, faulted ${num(lg.faulted)}, ambiguous ` +
+        `${num(lg.ambiguous)}, no vote ${num(lg.none)} frames; nominal ${lg.nominal_ns} ns` +
+        (lg.last_age_s === null || lg.last_age_s === undefined ? "" : `; last vote ${secs(lg.last_age_s)} s ago`));
+    if (s.nim_merge) {
+      put(6, num(r.lag_held), r.lag_held ? "warn" : "",
+          "NIM-only hits held back from the merge because the lag state was faulted in their frame");
+    } else {
+      put(6, "— (merge off)", "dqm-sma-na", "The merge is off, so nothing is held back from it; " +
+          "the lag state (previous column) is measured all the same");
+    }
+  });
+  const foot = `Over the last ${Math.round(s.window_s || 0)} s. A healthy counter pairs ≳ 95 % of its ` +
+    "TOT words with a median NIM − TOT near 0; a lag fault moves the NIM copy by ~150 µs or ~0.9 µs " +
+    "(nim_dt_wide) and is measured only, never corrected. Hover a cell for the counts.";
+  const fn = document.getElementById("dqm-sma-nimfoot");
+  if (fn.textContent !== foot) fn.textContent = foot;
+}
+
+/** "NIM merge on/off": whether the counters (pattern, efficiencies, seeds) include NIM-only hits. */
+function mergeChip(s) {
+  const on = !!(s && s.nim_merge);
+  const c = chip(on ? "NIM merge on" : "NIM merge off", on ? "blue" : "");
+  c.setAttribute("title", on
+    ? "The counters are the merged TOT + NIM hits (TOT words plus NIM-only hits), as nearline's: " +
+      "pattern, coincidences, efficiencies and seeds use them"
+    : "The counters are the TOT words only (/DQM/SMA/NIM/merge = n, or no NIM copies)");
+  c.id = "dqm-sma-mergechip";
+  return c;
 }
 
 const SYNC_CLASS = { ok: "green", low: "yellow", flagged: "red", insufficient: "", off: "" };
@@ -820,6 +1085,7 @@ function guard(id, fn) {
     if (id === "dqm-sma-table") state.table = null;
     if (id === "dqm-sma-flags") state.flagsSig = null;
     if (id === "dqm-sma-banner") state.banners = {};
+    if (id === "dqm-sma-nim") state.nimSig = null;
     const node = document.getElementById(id);
     if (node) {
       node.innerHTML = "";
@@ -883,6 +1149,7 @@ function renderStatus(s, st) {
     bar.appendChild(chip(`last frame ${Math.round(f.last_age_s)} s ago`, "yellow"));
   }
 
+  if (s.nim && s.nim.active) bar.appendChild(mergeChip(s));
   const sh = s.shift || {};
   const verdictCls = { ok: "green", mismatch: "red", "no fit": "yellow" }[sh.verdict] || "";
   const best = sh.best !== null && sh.best !== undefined && sh.best !== sh.configured
@@ -1045,8 +1312,15 @@ function renderFlags(s) {
   }
   for (const f of flags) {
     const cls = { error: "red", warn: "yellow" }[f.severity] || "blue";
-    holder.appendChild(el("div", { class: `dqm-diagnosis ${cls} dqm-sma-flag`, "data-code": f.code },
-                          f.text));
+    const div = el("div", { class: `dqm-diagnosis ${cls} dqm-sma-flag`, "data-code": f.code }, f.text);
+    if (/^nim_/.test(f.code)) {
+      // The TOT + NIM flags point at the tab with the numbers and plots behind them.
+      const go = el("button", { type: "button", class: "dqm-sma-flaglink" }, "NIM / TOT tab ›");
+      go.onclick = function () { showTab("nim"); };
+      div.appendChild(document.createTextNode(" "));
+      div.appendChild(go);
+    }
+    holder.appendChild(div);
   }
 }
 
@@ -1089,6 +1363,18 @@ function renderTable(s) {
   for (const e of s.efficiency || []) {
     if (e && typeof e.ch === "number") eff[e.ch] = e;
   }
+  // A NIM copy's row: its counter's NIM line (pair efficiency, lag vote), and
+  // the NIM flags about it colour its cells.
+  const nimRow = {};
+  for (const r of (s.nim && s.nim.counters) || []) {
+    nimRow[r.nim_ch] = r;
+    for (const f of nimFlagsOf(s, r)) {
+      const col = { nim_pairing: "eff", nim_missing: "role", nim_lag: "role" }[f.code];
+      if (!col) continue;
+      const k = `${r.nim_ch}:${col}`;
+      if (marks[k] !== "alarm") marks[k] = f.severity === "error" ? "alarm" : "warn";
+    }
+  }
 
   if (!state.table || state.table.rows.length !== s.channels.length) {
     holder.innerHTML = "";
@@ -1118,14 +1404,21 @@ function renderTable(s) {
 
     put(0, String(c.ch));
     put(1, c.label || "");
-    put(2, roleText(c, eff[c.ch]));
+    const nr = c.role === "nim" ? nimRow[c.ch] : null;
+    if (nr) {
+      const lg = nr.lag || {};
+      put(2, `${roleText(c, eff[c.ch])}${lg.last_state === "faulted" ? " · lag FAULTED" : ""}`, "role",
+          "", `NIM copy of ${labelOf(c.pair_of)}; lag vote: ${lagText(lg)}`);
+    } else {
+      put(2, roleText(c, eff[c.ch]));
+    }
     put(3, fmtRate(c.rate_hz));
     put(4, c.hits_per_frame === null || c.hits_per_frame === undefined ? "—" : c.hits_per_frame.toFixed(1));
     put(5, pct(c.tot_ge250_frac, 2), "tot");
     if (c.flagged === false && c.mismatch_frac !== null && c.mismatch_frac !== undefined && c.hits) {
-      // Not a counter (the current channel, the delayed ones): the analyzer
-      // does not judge its fine/coarse agreement, so a 100 % here is not a
-      // fault and must not read like one.
+      // Not S1, a counter or RF (no role, the current, a delayed channel): the
+      // analyzer does not judge its fine/coarse agreement, so a 100 % here is
+      // not a fault and must not read like one.
       put(6, `${pct(c.mismatch_frac, 1)} (not flagged)`, null, "dqm-sma-na",
           "Not judged: only S1, the counters and RF are checked for fine/coarse mismatch");
     } else {
@@ -1137,7 +1430,11 @@ function renderTable(s) {
     // analyzer declines to quote (a timestamp fault makes the window
     // meaningless) says n/a and why, inline and in full on hover.
     const e = eff[c.ch];
-    if (!e || c.role === "s1" || e.counter === "S1") {
+    if (nr) {
+      // Not an efficiency given S1: the share of its counter's TOT words it pairs with.
+      put(8, `pair ${pct(nr.pair_eff, 1)}`, "eff", "", "TOT + NIM pair efficiency: the share of " +
+          `${labelOf(nr.ch)}'s TOT words with this NIM copy within ±${s.nim.pair_window_ns} ns`);
+    } else if (!e || c.role === "s1" || e.counter === "S1") {
       put(8, "—", "eff");
     } else if (e.eff === null || e.eff === undefined) {
       const why = e.reason || e.note || e.why || "";
@@ -1169,6 +1466,9 @@ function setAttr(node, k, v) { if (node.getAttribute(k) !== v) node.setAttribute
 
 function roleText(c, e) {
   if (c.role === "s1") return "S1 (seed)";
+  if (c.role === "nim") {
+    return typeof c.pair_of === "number" ? `NIM copy of ${labelOf(c.pair_of)}` : "NIM copy";
+  }
   if (e && e.counter) return e.counter;
   return c.role || "";
 }
@@ -1261,6 +1561,13 @@ function build() {
                              "aria-labelledby": `dqm-sma-tab-${id}` });
     pane.appendChild(el("div", { id: `dqm-sma-tabnote-${id}` }));
     if (id === "mupix") pane.appendChild(el("div", { id: "dqm-sma-mupix", class: "dqm-panel" }));
+    if (id === "nim") {
+      pane.appendChild(el("div", { id: "dqm-sma-nim", class: "dqm-panel" }));
+      // Built once, outside the per-second redraw, so a click on it is not lost.
+      pane.appendChild(el("div", { class: "dqm-strip dqm-sma-nimtools" },
+        checkbox("dqm-sma-nimlogy", "log y for the Δt plots (nim_dt, nim_dt_wide)", state.nimLogY,
+          function (v) { state.nimLogY = v; save(); redrawVisible(); })));
+    }
     pane.appendChild(el("div", { class: "dqm-grid", id: `dqm-sma-grid-${id}` }));
     r.appendChild(pane);
   }
@@ -1344,7 +1651,7 @@ function save() {
   try {
     window.localStorage.setItem(LS, JSON.stringify({
       client: state.client, tab: state.tab, intervalMs: state.intervalMs,
-      logY: state.logY, logZ: state.logZ,
+      logY: state.logY, logZ: state.logZ, nimLogY: state.nimLogY,
     }));
   } catch (e) { /* private browsing or quota */ }
 }
@@ -1357,6 +1664,7 @@ function restore() {
     if (o.intervalMs !== undefined) state.intervalMs = Number(o.intervalMs);
     if (o.logY !== undefined) state.logY = !!o.logY;
     if (o.logZ !== undefined) state.logZ = !!o.logZ;
+    if (o.nimLogY !== undefined) state.nimLogY = !!o.nimLogY;
   } catch (e) { /* defaults are fine */ }
 }
 

@@ -17,7 +17,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
-from test_sma_plugin import R682, R1008, _Clock, _dispatch, _feed, _plugin, synth_frame
+from test_sma_plugin import OLD_ROLES, R682, R1008, _Clock, _dispatch, _feed, _plugin, synth_frame
 
 from mdqm.dqm import framing
 from mdqm.plugins import sma as P
@@ -143,8 +143,8 @@ def test_update_then_drop_meta_gives_the_payload_back():
 def test_s1_without_filters_is_the_analysis_seeds(words, max_s1):
     fr = W.prepare_frame(words)
     cuts = W.Cuts(max_s1=max_s1)
-    an = W.analyse_frame(fr, W.Roles(), cuts)
-    sel = W.select_seeds_by(fr, W.Roles(), cuts, "s1", ())
+    an = W.analyse_frame(fr, OLD_ROLES, cuts)
+    sel = W.select_seeds_by(fr, OLD_ROLES, cuts, "s1", ())
     assert sel.idx.size == an.seeds.size > 0
     assert np.array_equal(sel.t, an.t_s1[an.seeds])
     assert np.array_equal(sel.pattern, an.pattern[an.seeds])
@@ -177,12 +177,12 @@ def test_any_seeds_are_the_first_hit_of_each_counter_cluster():
     # the RF and ch 8 are no counters.
     e = {2: [0], 3: [30], 4: [60], 5: [1000], 6: [5, 20], 8: [10]}
     fr = W.prepare_frame(build([e]))
-    cand = W.seed_candidates(fr, W.Roles(), W.Cuts(), "any")
+    cand = W.seed_candidates(fr, OLD_ROLES, W.Cuts(), "any")
     assert [int(x) for x in fr.s_t[cand] - T0] == [0, 1000]
     assert [int(x) for x in fr.s_ch[cand]] == [2, 5]
     # A gap of 51 ns splits the chain.
     fr = W.prepare_frame(build([{2: [0], 3: [51]}]))
-    assert W.seed_candidates(fr, W.Roles(), W.Cuts(), "any").size == 2
+    assert W.seed_candidates(fr, OLD_ROLES, W.Cuts(), "any").size == 2
 
 
 def test_a_frame_without_s1_still_has_any_and_ch2_seeds_with_rf_na():
@@ -215,8 +215,8 @@ def test_a_non_s1_seed_borrows_the_rf_of_the_nearest_s1_hit():
     # S2 fires 20 ns before S1 (and a second S1 60 ns after S2 is further).
     e = {1: [20], 2: [0], 3: [3], 4: [4], 5: [5], 6: [60, 80]}
     frame = W.prepare_frame(build([e] * 10))
-    sel = W.select_seeds_by(frame, mode="ch2")
-    ref = W.select_seeds_by(frame, mode="s1")
+    sel = W.select_seeds_by(frame, OLD_ROLES, mode="ch2")
+    ref = W.select_seeds_by(frame, OLD_ROLES, mode="s1")
     assert sel.has_s1.all() and (sel.s1_dt == 20).all()
     assert np.array_equal(sel.rf_phase, ref.rf_phase)
     assert (sel.rf_phase == 60).all() and sel.rf_valid.all()
@@ -291,7 +291,7 @@ def test_mismatch_and_tot_hits_are_flagged_in_the_payload():
 
 def test_the_candidate_cap_is_reported():
     frame = W.prepare_frame(_odd_frame())
-    sel = W.select_seeds_by(frame, filters=["incomplete"], max_candidates=3)
+    sel = W.select_seeds_by(frame, OLD_ROLES, filters=["incomplete"], max_candidates=3)
     assert sel.capped and sel.n_examined == 3 and sel.n_candidates > 3
     assert sel.idx.size == 0, "event 3 is not among the latest three"
 
@@ -565,7 +565,7 @@ def test_all_counters_but_s1_faulted_cannot_be_judged():
 
 def test_a_faulted_s1_is_ignored_like_any_other_counter():
     frame = W.prepare_frame(_faulty_frame(bad=(), missing={5: [1], 8: [4]}))
-    sel = W.select_seeds_by(frame, mode="ch2", filters=["incomplete"], ignore=[0])
+    sel = W.select_seeds_by(frame, OLD_ROLES, mode="ch2", filters=["incomplete"], ignore=[0])
     assert [round((t - T0) / SPACING, 1) for t in sel.t] == [8.0]
     assert sel.ignore == (0,) and sel.incomplete_judged
 
@@ -614,7 +614,8 @@ def _t(sel):
 ])
 def test_the_pattern_selector_tri_states(mode, pattern, want):
     fr = W.prepare_frame(_pattern_frame())
-    sel = W.select_seeds_by(fr, W.Roles(), W.Cuts(n_seeds=4), mode, require=W.parse_pattern(pattern))
+    sel = W.select_seeds_by(fr, OLD_ROLES, W.Cuts(n_seeds=4), mode,
+                            require=W.parse_pattern(pattern))
     assert _t(sel) == want
     for pat in sel.pattern:
         for k, st in W.parse_pattern(pattern):
@@ -629,11 +630,13 @@ def test_the_pattern_is_an_and_on_the_or_filters():
     events[9] = ev(drop=[3], tot={4: 254})
     fr = W.prepare_frame(build(events))
     cuts = W.Cuts(n_seeds=8)
-    sel = W.select_seeds_by(fr, cuts=cuts, filters=["tot"], require=((3, "absent"),))
+    sel = W.select_seeds_by(fr, OLD_ROLES, cuts=cuts, filters=["tot"], require=((3, "absent"),))
     assert _t(sel) == [9]
-    sel = W.select_seeds_by(fr, cuts=cuts, filters=["incomplete", "tot"], require=((3, "present"),))
+    sel = W.select_seeds_by(fr, OLD_ROLES, cuts=cuts, filters=["incomplete", "tot"],
+                            require=((3, "present"),))
     assert _t(sel) == [5]
-    sel = W.select_seeds_by(fr, cuts=cuts, filters=["incomplete"], require=((3, "absent"),))
+    sel = W.select_seeds_by(fr, OLD_ROLES, cuts=cuts, filters=["incomplete"],
+                            require=((3, "absent"),))
     assert _t(sel) == [3, 9]
 
 
@@ -695,8 +698,8 @@ def test_run_1008_ignores_s5_for_incomplete():
     assert [f["counter"] for f in p.timestamp_faults()["counters"]] == [5]
     d = blob_of(p, filters=["incomplete"])
     fr = p._last.fr
-    before = W.select_seeds_by(fr, filters=["incomplete"])
-    after = W.select_seeds_by(fr, filters=["incomplete"], ignore=[4])
+    before = W.select_seeds_by(fr, OLD_ROLES, filters=["incomplete"])
+    after = W.select_seeds_by(fr, OLD_ROLES, filters=["incomplete"], ignore=[4])
     assert d["meta"]["select"]["matching"] == after.n_matching < before.n_matching
     assert before.n_matching / before.n_examined > 0.95, "without the ignore nearly all match"
     for s in d["meta"]["seeds"]:

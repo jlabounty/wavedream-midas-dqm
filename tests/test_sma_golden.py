@@ -22,6 +22,8 @@ DATA = Path(__file__).resolve().parent / "data"
 FILES = ("sma_run00682_frames.npz", "sma_run01008_frame.npz")
 S1, RF = 1, 6
 OTHERS = {"S2": 2, "S3": 3, "S4": 4, "S5": 5}
+#: How these runs were cabled (before run 1015; the plugin's defaults are the 1015 layout).
+ROLES = W.Roles(s1=S1, counters=(S1, *OTHERS.values()), rf=RF, current=7, delayed=(8, 9, 10))
 
 
 def digest(a) -> str:
@@ -151,7 +153,7 @@ def test_prepare_and_analyse_run(frame):
     assert np.all(np.diff(fr.s_t) >= 0)
     for c in range(W.N_CHANNELS):
         assert np.all(fr.s_ch[fr.chan[c]] == c)
-    a = W.analyse_frame(fr)
+    a = W.analyse_frame(fr, ROLES)
     if fr.keep.all():
         # nothing stale: the RF phase is the reference's on the whole frame
         assert eq_nan(a.rf_phase, frame["bpm_last_phase"])

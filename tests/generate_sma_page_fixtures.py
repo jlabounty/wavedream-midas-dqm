@@ -40,6 +40,30 @@ Written to ``tests/js/sma-summary-fixture.json``:
 ``summary_noseeds``    sma::summary after 12 s of frames without S1: ``no_seeds``
 ``seeded_mupix_both``  seed S1 with the MuPix selector "both" (``select.mupix``)
 ``seeded_mupix_none``  seed S1 with the MuPix selector "none"
+``summary_1015``       the good 682 frames under the plugin's own defaults (the run-1015
+                       cabling: S3 on ch 7, no current channel, no delayed channel);
+                       ``raster_1015`` its raster, asked for with drop=[] as the page does,
+                       ``seeded_1015`` its seeded view (the roles block in the frame)
+``summary_3counters``  the same with Channel roles/counters = [1, 2, 4] (and no NIM
+                       copies: the five-entry NIM defaults do not fit three counters);
+                       ``seeded_3counters`` its seeded view
+``summary_nim``        dense synthetic 1015-cabled frames (``sma_layouts.dense_1015``)
+                       under the defaults plus ``NIM_ON`` (merge on, every frame
+                       voted, two faulted votes enough for ``nim_lag``), S4L with a
+                       155 us fine-time lag in two of three frames: ``nim`` per counter,
+                       ``nim_merge``,
+                       ``nim_lag_held`` = [11], the ``nim_lag`` / ``nim_pairing`` flags;
+                       ``trend_nim`` its sma::trend (``nim_eff``); ``hist_names_nim`` /
+                       ``hist_dims_nim`` its dqm::list and ``hists_nim`` a few of its
+                       histograms (the NIM dt, classes, the merged/TOT-only S1
+                       coincidences); ``raster_nim`` its last frame's raster as smaf v3
+                       (per-hit pairing, S4L's NIM-only words held back)
+``summary_nim_off``    / ``seeded_nim_off``: the same two with NIM/merge off (the
+                       default): the lag still flagged, nothing held back
+``seeded_nim``         the seeded view (smaf v3, ``NIM_ON``) of one dense 1015 frame with TOT words
+                       at 85 % (NIM-only hits), S3 echoes, and S4L 900 ns late in the
+                       fine field (the 0.9 us lag fault: its NIM-only words held back,
+                       inside every seed window)
 ``summary_mupix_sync`` the 682 frames with the MuPix in-time window moved 1 us late
                        (nothing in it), after the sync hold: a ``mupix_sync`` warning
 ``trend_mupix_sync``   its sma::trend (MuPix fractions near 0)
@@ -49,6 +73,9 @@ Written to ``tests/js/sma-summary-fixture.json``:
                        and pattern {"1": "present", "3": "absent"} (``select.pattern``)
 ``hists`` also carries four MuPix histograms of the normal case (dt L1/L2, the
 S1 match, the column occupancy).
+
+Every case but the ``_1015``/``_3counters`` ones is built with the cabling those runs
+had (``sma_layouts.OLD_LAYOUT``: S1..S5 on ch 1-5, RF 6, current 7, delayed 8-10).
 
 The 682 frames carry MuPix pixel words, so ``seeded`` / ``raster`` /
 ``raster_words`` have the smaf pixel block (``meta.mupix``) as the analyzer
@@ -66,9 +93,18 @@ from pathlib import Path
 
 import numpy as np
 
+from sma_layouts import dense_1015, old_layout
+
 from mdqm.dqm import framing
 from mdqm.dqm.hist import HistStore
 from mdqm.plugins.sma import SmaPlugin
+
+#: The NIM cases: the merge is off by default (until the offsets are measured);
+#: the pages are shown it on, with the lag of every frame voted (a fault that
+#: starts in the second frame) and two faulted votes enough for the flag.
+NIM_ON = {"NIM": {"merge": True, "lag vote every": 1}, "Self check": {"nim lag min votes": 2}}
+#: The same with the merge off, as shipped: what the pages show by default.
+NIM_OFF = {"NIM": {"merge": False, "lag vote every": 1}, "Self check": {"nim lag min votes": 2}}
 
 HERE = Path(__file__).resolve().parent
 DATA = HERE / "data"
@@ -112,7 +148,7 @@ def build() -> dict:
 
     # -- the normal case: the good 682 frames, a few per second for 6 s --
     clock = _Clock(T0)
-    p = SmaPlugin(HistStore(), clock=clock)
+    p = SmaPlugin(HistStore(), clock=clock, settings=old_layout())
     serial = 0
     for sec in range(6):
         clock.t = T0 + sec + 0.1
@@ -164,13 +200,92 @@ def build() -> dict:
     seeded_mupix_none = p.frame_blob("seeded", mupix="none")
     assert framing.decode_sma_frame(raster)["pixels"]["n"] > 100, "the raster's pixel hits"
 
+    # -- the plugin's defaults (the run-1015 cabling) on the same frames: no
+    # current channel, S3 on ch 7; and a three-counter layout --
+    def defaults_on_682(settings=None):
+        ck = _Clock(T0)
+        d = SmaPlugin(HistStore(), clock=ck, settings=settings)
+        n = 0
+        for sec in range(3):
+            ck.t = T0 + sec + 0.1
+            for w in r682[2:]:
+                d.process(_Event(w, serial=n), run_number=682)
+                n += 1
+        ck.t = T0 + 3.5
+        return d
+
+    d1015 = defaults_on_682()
+    assert d1015.cfg.roles.current == -1 and d1015.cfg.roles.delayed == ()
+    summary_1015 = d1015.summary(run_active=True)
+    assert not any(c["role"] == "current" for c in summary_1015["channels"])
+    raster_1015 = d1015.frame_blob("raster", drop=[])
+    seeded_1015 = d1015.frame_blob("seeded")
+    d3c = defaults_on_682({"Channel roles": {"counters": [1, 2, 4]}, "NIM": {"channels": [-1]}})
+    summary_3c = d3c.summary(run_active=True)
+    seeded_3c = d3c.frame_blob("seeded")
+    assert summary_3c["settings_errors"] == [], summary_3c["settings_errors"]
+
+    # -- TOT + NIM: dense synthetic 1015 frames, S4L lagged in two of three --
+    ckn = _Clock(T0)
+    nimp = SmaPlugin(HistStore(), clock=ckn, settings=NIM_ON)
+    for k in range(3):
+        ckn.t = T0 + k + 0.1
+        w = dense_1015(seed=k, t0=10**12 + k * 40_000_000,
+                       fine_lag={11: 155_000} if k else None)
+        nimp.process(_Event(w, serial=k), run_number=1015)
+    ckn.t = T0 + 3.5
+    summary_nim = nimp.summary(run_active=True)
+    trend_nim = nimp.trend()
+    assert summary_nim["nim_lag_held"] == [11], summary_nim["nim_lag_held"]
+    names_nim = nimp.store.names()
+    dims_nim = {n: (2 if hasattr(nimp.store.get(n), "y") else 1) for n in names_nim}
+    hists_nim = {n: nimp.store.get(n).encode().hex() for n in
+                 ("sma/nim_dt_S1", "sma/nim_dt_S4", "sma/nim_classes_S4", "sma/s1_coinc",
+                  "sma/s1_coinc_tot")}
+    raster_nim = nimp.frame_blob("raster", max_hits=3000)
+    shw = SmaPlugin(HistStore(), clock=_Clock(T0), settings=NIM_ON)
+    shw.process(_Event(dense_1015(seed=4, eff_tot=0.85, echo_frac=0.3, fine_lag={11: 900})),
+                run_number=1015)
+    seeded_nim = shw.frame_blob("seeded")
+    dn = framing.decode_sma_frame(seeded_nim)
+    assert dn["version"] == 3 and dn["meta"]["roles"]["nim"] == [3, 9, 10, 11, 12], dn["meta"]
+    assert ((dn["cls"] & framing.PAIR_LAG_HELD) != 0).any(), "a held-back S4L word in a seed"
+    assert (dn["pair"] >= 0).any()
+    cl = dn["cls"] & framing.PAIR_CLASS_MASK
+    assert ((cl == 3) & ((dn["cls"] & framing.PAIR_LAG_HELD) == 0)).any(), "a merged NIM-only word"
+    assert (cl == 2).any(), "an S3 echo word"
+    assert framing.decode_sma_frame(raster_nim)["version"] == 3
+    assert {"nim_lag", "nim_pairing"} <= {f["code"] for f in summary_nim["flags"]}
+
+    # -- the same with the merge off (the default): lag flagged, nothing held --
+    cko = _Clock(T0)
+    offp = SmaPlugin(HistStore(), clock=cko, settings=NIM_OFF)
+    for k in range(3):
+        cko.t = T0 + k + 0.1
+        offp.process(_Event(dense_1015(seed=k, t0=10**12 + k * 40_000_000,
+                                       fine_lag={11: 155_000} if k else None), serial=k),
+                     run_number=1015)
+    cko.t = T0 + 3.5
+    summary_nim_off = offp.summary(run_active=True)
+    assert summary_nim_off["nim_merge"] is False and summary_nim_off["nim_lag_held"] == []
+    assert "nim_lag" in {f["code"] for f in summary_nim_off["flags"]}
+    shw_off = SmaPlugin(HistStore(), clock=_Clock(T0), settings=NIM_OFF)
+    shw_off.process(_Event(dense_1015(seed=4, eff_tot=0.85, echo_frac=0.3,
+                                      fine_lag={11: 900})), run_number=1015)
+    seeded_nim_off = shw_off.frame_blob("seeded")
+    do = framing.decode_sma_frame(seeded_nim_off)
+    assert do["meta"]["nim_merge"] is False
+    assert not ((do["cls"] & framing.PAIR_LAG_HELD) != 0).any(), "nothing held with merge off"
+    assert ((do["cls"] & framing.PAIR_CLASS_MASK) == 3).any(), "NIM-only words still shown"
+    assert [e["counter"] for e in summary_3c["efficiency"]] == ["S2", "S3"]
+
     # -- MuPix out of time: the in-time window moved 1 us late (nothing real
     # in it), the sync flag after its hold time --
     clock5 = _Clock(T0)
-    v = SmaPlugin(HistStore(), clock=clock5, settings={
+    v = SmaPlugin(HistStore(), clock=clock5, settings=old_layout({
         "MuPix": {"window lo ns": 1000, "window hi ns": 1600},
         "Self check": {"mupix sync hold s": 3.0, "mupix sync window s": 3.0,
-                       "mupix sync min S1": 100}})
+                       "mupix sync min S1": 100}}))
     serial5 = 0
     for sec in range(8):
         for w in r682[2:]:
@@ -184,7 +299,7 @@ def build() -> dict:
 
     # -- S1 goes missing: 682 frames without their S1 words, for 12 s --
     clock4 = _Clock(T0)
-    u = SmaPlugin(HistStore(), clock=clock4)
+    u = SmaPlugin(HistStore(), clock=clock4, settings=old_layout())
     u.process(_Event(r682[4], serial=0), run_number=682)
     s1 = u.cfg.roles.s1
 
@@ -210,7 +325,7 @@ def build() -> dict:
 
     # -- the shift-mismatch case --
     clock2 = _Clock(T0)
-    q = SmaPlugin(HistStore(), settings={"Coarse shift": 13}, clock=clock2)
+    q = SmaPlugin(HistStore(), settings=old_layout({"Coarse shift": 13}), clock=clock2)
     for k in range(3):
         clock2.t = T0 + k
         q.process(_Event(r1008, serial=k), run_number=1008)
@@ -220,7 +335,7 @@ def build() -> dict:
 
     # -- run 1008 at its own shift: S5's fine = t/2 fault is a known timestamp fault --
     clock5 = _Clock(T0)
-    f = SmaPlugin(HistStore(), clock=clock5)
+    f = SmaPlugin(HistStore(), clock=clock5, settings=old_layout())
     for k in range(3):
         clock5.t = T0 + k
         f.process(_Event(r1008, serial=k), run_number=1008)
@@ -240,8 +355,8 @@ def build() -> dict:
     # it has enough, so the check's word minimum is raised out of reach here.
     r342 = _load("sma_run00342_frames.npz")
     clock3 = _Clock(T0)
-    t = SmaPlugin(HistStore(), clock=clock3, settings={
-        "Coarse shift": 14, "Self check": {"shift min words": 10**9}})
+    t = SmaPlugin(HistStore(), clock=clock3, settings=old_layout({
+        "Coarse shift": 14, "Self check": {"shift min words": 10**9}}))
     for k in range(4):
         clock3.t = T0 + k
         for j, w in enumerate(r342):
@@ -258,7 +373,7 @@ def build() -> dict:
         hand them over under ``mode`` (its sampling_state set by hand, as
         DqmAnalyzer._publish_sampling_state does)."""
         ck = _Clock(T0)
-        q = SmaPlugin(HistStore(), clock=ck, settings=settings)
+        q = SmaPlugin(HistStore(), clock=ck, settings=old_layout(settings))
         serial = 100
         for k in range(len(serial_steps) + 1):
             ck.t = T0 + 0.5 * k + 0.1
@@ -337,6 +452,20 @@ def build() -> dict:
         "seeded_mupix_none": seeded_mupix_none.hex(),
         "summary_1008": json.loads(json.dumps(summary_1008)),
         "seeded_pattern": seeded_pattern.hex(),
+        "summary_1015": json.loads(json.dumps(summary_1015)),
+        "raster_1015": raster_1015.hex(),
+        "seeded_1015": seeded_1015.hex(),
+        "seeded_3counters": seeded_3c.hex(),
+        "summary_3counters": json.loads(json.dumps(summary_3c)),
+        "summary_nim": json.loads(json.dumps(summary_nim)),
+        "trend_nim": json.loads(json.dumps(trend_nim)),
+        "hist_names_nim": names_nim,
+        "hist_dims_nim": dims_nim,
+        "hists_nim": hists_nim,
+        "seeded_nim": seeded_nim.hex(),
+        "raster_nim": raster_nim.hex(),
+        "summary_nim_off": json.loads(json.dumps(summary_nim_off)),
+        "seeded_nim_off": seeded_nim_off.hex(),
         "summary_mupix_sync": json.loads(json.dumps(mupix_sync)),
         "trend_mupix_sync": json.loads(json.dumps(trend_sync)),
     }

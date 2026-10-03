@@ -1,6 +1,6 @@
 //
-// dqm-smaframe.js -- the SMA event-display frame ("smaf" v1 and v2, with or
-// without the MuPix pixel block), decoded.
+// dqm-smaframe.js -- the SMA event-display frame ("smaf" v1, v2 and v3, with
+// or without the MuPix pixel block), decoded.
 //
 // Mirror of mdqm/dqm/framing.py's encode_sma_frame. Keep the two in step: the
 // cross-language test in tests/js/smaframe.test.js decodes Python's bytes with
@@ -10,8 +10,9 @@
 //
 // Layout (offsets from the payload start, envelope already removed):
 //
-//     0   u8   version = 1, or 2 with per-hit words (flag WORDS)
-//     1   u8   flags        SEEDED | STALE | TRUNCATED | SUSPECT | WORDS
+//     0   u8   version = 1, 2 with per-hit words (flag WORDS), 3 with the
+//               per-hit TOT + NIM pairing (flag PAIRING; words optional)
+//     1   u8   flags        SEEDED | STALE | TRUNCATED | SUSPECT | WORDS | PIXELS | PAIRING
 //     2   u16  time shift k (0 = reserved in the first v1 encoder): the u32
 //               times are in units of 2^k ns, t_rel_ns = t << k
 //     4   u32  n_hits       n
@@ -28,11 +29,24 @@
 //     A + 5n   u8  tot[n]               A + 12n  u32 word_index[n]
 //     A + 6n   u8  hit_flags[n]         A + 16n  u8  ch[n], tot[n], hit_flags[n]
 //
+//   version 3 without words (8 bytes)   version 3 with words (24 bytes a hit)
+//     A        u32 t_rel[n]             A        u64 raw_word[n]
+//     A + 4n   u8  ch, tot, hit_flags,  A + 8n   u32 t_rel[n]
+//              cls [n each]             A + 12n  u32 word_index[n]
+//                                       A + 16n  i32 pair[n]
+//                                       A + 20n  u8  ch, tot, hit_flags, cls [n each]
+//
+// pair (with the words only: the live raster needs the classes, not the
+// partners): the index in this hit list of the word this hit is paired with
+// (TOT word <-> its NIM copy), -1 when none or not shipped. cls: bits 2:0 the class
+// (PAIR.PAIRED 0, TOT_ONLY 1, ECHO 2, NIM_ONLY 3, NONE 7 = not a paired
+// counter's word), then MULTI, SHADOW, EDGE, LAG_HELD, NIM_SIDE (see PAIR).
+//
 // hit time = meta.t0_ns + t_rel * 2^k. raw_word is the 64-bit word as the
 // board sent it and word_index its position in the H000 bank (in 64-bit words,
 // filler and pixel words included): what finds the hit again in the file.
 //
-// The MuPix pixel block (header flag PIXELS), in either version, after the hit
+// The MuPix pixel block (header flag PIXELS), in any version, after the hit
 // arrays at P = their end rounded up to 8 (an old decoder simply ignores it):
 //
 //     P      u32 n_pix m, u16 pixel time shift kp, u8 block version 1, u8 block flags
@@ -57,10 +71,25 @@
 
 const VERSION = 1;
 const VERSION_WORDS = 2;
+const VERSION_PAIRING = 3;
 const HEADER_BYTES = 32;
 
 const FLAGS = { SEEDED: 1 << 0, STALE: 1 << 1, TRUNCATED: 1 << 2, SUSPECT: 1 << 3, WORDS: 1 << 4,
-                PIXELS: 1 << 5 };
+                PIXELS: 1 << 5, PAIRING: 1 << 6 };
+// The v3 cls byte (framing.py PAIR_*): the class in bits 2:0, then the sub-flags.
+const PAIR = {
+  CLASS_MASK: 0x07,
+  PAIRED: 0,              // a TOT word with its NIM copy (or that NIM copy)
+  TOT_ONLY: 1,            // a TOT word with no NIM copy in the window
+  ECHO: 2,                // a TOT echo word (late, or on the previous word's edge): not paired
+  NIM_ONLY: 3,            // a NIM copy with no TOT word: what the merge adds
+  NONE: 7,                // not a paired counter's word (RF, S1 without a copy, ...)
+  MULTI: 1 << 3,          // more than one candidate in the window
+  SHADOW: 1 << 4,         // in the previous TOT word's shadow
+  EDGE: 1 << 5,           // near the frame's first/last hit
+  LAG_HELD: 1 << 6,       // a NIM-only word held back from the merge (lag fault)
+  NIM_SIDE: 1 << 7,       // the word is a NIM copy (else a TOT word)
+};
 const PIX = { PLANE_MASK: 0x3, OFF_SENSOR: 1 << 2, IN_SEED: 1 << 3 };
 const PIXB = { VERSION: 1, WORDS: 1 << 0, HEADER_BYTES: 8 };
 const HIT = {
@@ -88,6 +117,15 @@ function u32Array(buffer, base, dv, at, n) {
   return out;
 }
 
+/** The same for i32, as an Int32Array. */
+function i32Array(buffer, base, dv, at, n) {
+  if (n === 0) return new Int32Array(0);
+  if ((base + at) % 4 === 0 && LITTLE_ENDIAN) return new Int32Array(buffer, base + at, n);
+  const out = new Int32Array(n);
+  for (let i = 0; i < n; i++) out[i] = dv.getInt32(at + 4 * i, true);
+  return out;
+}
+
 /** The same for u64, as a BigUint64Array (a view needs an 8-aligned offset). */
 function u64Array(buffer, base, dv, at, n) {
   if (n === 0) return new BigUint64Array(0);
@@ -99,7 +137,7 @@ function u64Array(buffer, base, dv, at, n) {
 }
 
 /**
- * Decode one smaf payload, version 1 or 2.
+ * Decode one smaf payload, version 1, 2 or 3.
  *
  * Accepts an ArrayBuffer or any ArrayBufferView (a Node Buffer, a Uint8Array
  * slice of a bigger reply). A view can start at any byte offset, and a
@@ -108,7 +146,9 @@ function u64Array(buffer, base, dv, at, n) {
  * underlying buffer is copied out. BRPC.call hands over a fresh slice starting
  * at 0, where the arrays are aligned by construction and nothing is copied.
  *
- * `rawWord` (BigUint64Array) and `wordIndex` (Uint32Array) are null in v1.
+ * `rawWord` (BigUint64Array) and `wordIndex` (Uint32Array) are null without
+ * words; `cls` (Uint8Array) is null without pairing, `pair` (Int32Array)
+ * without pairing or without words.
  */
 function decode(input) {
   let buffer, base, length;
@@ -124,12 +164,14 @@ function decode(input) {
   const dv = new DataView(buffer, base, length);
   const LE = true;
   const version = dv.getUint8(0);
-  if (version !== VERSION && version !== VERSION_WORDS) {
+  if (version !== VERSION && version !== VERSION_WORDS && version !== VERSION_PAIRING) {
     throw new Error(`unknown smaf version ${version}`);
   }
   const flags = dv.getUint8(1);
-  const words = version === VERSION_WORDS;
-  if (words !== !!(flags & FLAGS.WORDS)) {
+  // v1: neither; v2: words; v3: pairing, with or without words.
+  const words = !!(flags & FLAGS.WORDS);
+  const pairing = version === VERSION_PAIRING;
+  if (pairing !== !!(flags & FLAGS.PAIRING) || (!pairing && words !== (version === VERSION_WORDS))) {
     throw new Error(`smaf version ${version} with flags 0x${flags.toString(16)}`);
   }
   // Coarser time units let a frame longer than 4.29 s (a stale buffer can
@@ -149,7 +191,7 @@ function decode(input) {
 
   let at = HEADER_BYTES + jsonLen;
   if (at % 8) at += 8 - (at % 8);
-  const perHit = words ? 19 : 7;
+  const perHit = 7 + (words ? 12 : 0) + (pairing ? 1 : 0) + (pairing && words ? 4 : 0);
   if (length < at + perHit * nHits) {
     throw new Error(`short smaf payload: ${length} bytes for ${nHits} hits at ${at}`);
   }
@@ -158,8 +200,15 @@ function decode(input) {
   const offsets = words
     ? { rawWord: at, t: at + 8 * nHits, wordIndex: at + 12 * nHits, ch: at + 16 * nHits }
     : { rawWord: null, t: at, wordIndex: null, ch: at + 4 * nHits };
+  offsets.pair = null;
+  offsets.cls = null;
+  if (pairing && words) {
+    offsets.pair = offsets.ch;
+    offsets.ch += 4 * nHits;
+  }
   offsets.tot = offsets.ch + nHits;
   offsets.hitFlags = offsets.ch + 2 * nHits;
+  if (pairing) offsets.cls = offsets.ch + 3 * nHits;
 
   let t = u32Array(buffer, base, dv, offsets.t, nHits);
   const tRaw = t;
@@ -175,8 +224,10 @@ function decode(input) {
   const ch = new Uint8Array(buffer, base + offsets.ch, nHits);
   const tot = new Uint8Array(buffer, base + offsets.tot, nHits);
   const hitFlags = new Uint8Array(buffer, base + offsets.hitFlags, nHits);
+  const pair = pairing && words ? i32Array(buffer, base, dv, offsets.pair, nHits) : null;
+  const cls = pairing ? new Uint8Array(buffer, base + offsets.cls, nHits) : null;
 
-  const end = offsets.hitFlags + nHits;
+  const end = offsets.hitFlags + nHits + (pairing ? nHits : 0);
   const pixels = flags & FLAGS.PIXELS
     ? decodePixels(buffer, base, dv, length, end + ((8 - (end % 8)) % 8)) : null;
 
@@ -188,8 +239,8 @@ function decode(input) {
     // No usable time base: most hits fell outside the time clusters, which
     // usually means the coarse shift is wrong rather than the board.
     suspect: !!(flags & FLAGS.SUSPECT),
-    words,
-    meta, t, tRaw, ch, tot, hitFlags, rawWord, wordIndex,
+    words, pairing,
+    meta, t, tRaw, ch, tot, hitFlags, rawWord, wordIndex, pair, cls,
   };
 }
 
@@ -262,7 +313,8 @@ async function fetchRaw(client, seq) {
   return payload;
 }
 
-const SMAF = { decode, fetchFrame, fetchRaw, hex64, FLAGS, HIT, PIX, VERSION, VERSION_WORDS, HEADER_BYTES };
+const SMAF = { decode, fetchFrame, fetchRaw, hex64, FLAGS, HIT, PIX, PAIR, VERSION, VERSION_WORDS,
+               VERSION_PAIRING, HEADER_BYTES };
 root.SMAF = SMAF;
 if (typeof module !== "undefined" && module.exports) module.exports = SMAF;
 

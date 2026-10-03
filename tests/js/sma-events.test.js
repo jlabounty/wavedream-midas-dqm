@@ -120,7 +120,8 @@ test("the seeded view draws one panel per seed, with lanes and a pattern", async
     const canvas = p.byTag("canvas")[0];
     const ctx = canvas.getContext("2d");
     const labels = ctx.texts();
-    for (const lane of ["S1 (1)", "S2 (2)", "S5 (5)", "RF (6)", "current (7)"]) {
+    // The fixture is old-layout data (S1..S5 on ch 1-5, RF 6, the current channel).
+    for (const lane of ["S1 (1)", "S2 (2)", "S5 (5)", "RF (6)", `current (${FX.current_channel})`]) {
       assert.ok(labels.includes(lane), `lane ${lane} missing: ${labels.join(",")}`);
     }
     assert.ok(ctx.count("fillRect") > 10, "hit bars were drawn");
@@ -226,7 +227,7 @@ test("the raster hides the current channel by asking the analyzer not to send it
   assert.ok(asks.length > 0);
   for (const a of asks) {
     assert.strictEqual(a.view, "raster");
-    assert.deepStrictEqual(a.drop, [7], "the drop list comes from the summary's current role");
+    assert.deepStrictEqual(a.drop, [FX.current_channel], "the drop list comes from the summary's current role");
   }
   const box = byId(page, "dqm-smaev-hidecur");
   box.checked = false;
@@ -579,7 +580,7 @@ test("Single on the raster tab keeps the drop and max_hits args", async () => {
   let asks = frameCalls(page, mark);
   assert.strictEqual(asks.length, 1);
   // A frame stepped to by hand comes with its words, in the same request.
-  assert.deepStrictEqual(asks[0], { view: "raster", drop: [7], max_hits: 60000, words: true });
+  assert.deepStrictEqual(asks[0], { view: "raster", drop: [FX.current_channel], max_hits: 60000, words: true });
   assert.ok(byId(page, "dqm-smaev-rasterhead").textContent.includes(`seq ${Number(/(\d+)$/.exec(seqText(page))[1])}`));
 
   // The switch while frozen changes what the next Single asks for, not polling.
@@ -1379,7 +1380,7 @@ test("the default request sends seed s1 and no filters; the dropdown lists the r
   assert.deepStrictEqual(opts.map((o) => o[0]), ["s1", "ch2", "ch3", "ch4", "ch5", "ch8", "ch9", "ch10", "any"]);
   assert.strictEqual(opts[0][1], "S1 (default)");
   assert.strictEqual(opts[1][1], "S2 (ch 2)");
-  assert.ok(!opts.some((o) => o[0] === "ch6" || o[0] === "ch7"), "no RF, no current");
+  assert.ok(!opts.some((o) => o[0] === "ch6" || o[0] === `ch${FX.current_channel}`), "no RF, no current");
   assert.strictEqual(byId(page, "dqm-smaev-tab-seeded").textContent, "S1-seeded events");
   assert.strictEqual(banner(page).style.display, "none", "a fresh frame has no banner");
 });
@@ -1898,4 +1899,347 @@ test("Single and a frozen re-ask send the pattern", async () => {
   assert.ok(Number.isInteger(asks[0].seq), "the frozen frame, by its seq");
   assert.deepStrictEqual(asks[0].pattern, { 1: "absent", 4: "present" });
   assert.strictEqual(byId(page, "dqm-smaev-live").textContent, "FROZEN");
+});
+
+// --- the run-1015 cabling: no current channel, the counters from the roles ------------------
+
+test("the 1015 fixtures carry what the page is tested on", () => {
+  const roles = FX.summary_1015.channels.map((c) => c.role);
+  assert.ok(roles.indexOf("current") < 0, "no current channel");
+  assert.strictEqual(FX.summary_1015.channels[7].role, "counter", "S3 on ch 7");
+  assert.strictEqual(FX.summary_1015.channels[7].label, "S3");
+  assert.ok(roles.indexOf("delayed") < 0, "no delayed channel");
+  assert.deepStrictEqual(FX.summary_3counters.efficiency.map((e) => e.ch), [2, 4]);
+});
+
+/**
+ * An analyzer with the 1015 summary (or `summary`, with its own seeded frame
+ * `seeded`); the frames carry the same roles block as the summary.
+ */
+function cabled1015(summary, seeded) {
+  return {
+    "sma::summary": () => json(summary || FX.summary_1015),
+    "sma::frame": (args) => {
+      const a = JSON.parse(args || "{}");
+      return envelope("smaf", Buffer.from(a.view === "raster" ? FX.raster_1015
+        : (seeded || FX.seeded_1015), "hex"));
+    },
+  };
+}
+
+test("no current channel: the raster drops nothing and the switch is hidden", async () => {
+  const page = await boot(cabled1015(), { tab: "raster", hideCurrent: true });
+  const asks = frameCalls(page);
+  assert.ok(asks.length > 0);
+  for (const a of asks) assert.deepStrictEqual(a.drop, [], "nothing to hide");
+  const lab = byId(page, "dqm-smaev-hidecurlab");
+  assert.strictEqual(lab.style.display, "none", "no 'hide the current channel' without one");
+  // The old-layout summary has one: the switch is back.
+  const old = await boot(undefined, { tab: "raster" });
+  assert.strictEqual(byId(old, "dqm-smaev-hidecurlab").style.display, "");
+});
+
+test("no current channel: the seeded lanes have none, S3 is ch 7", async () => {
+  const page = await boot(cabled1015());
+  const ctx = byId(page, "dqm-smaev-seeds").byTag("canvas")[0].getContext("2d");
+  const labels = ctx.texts();
+  assert.ok(labels.includes("S3 (7)"), labels.join(","));
+  assert.ok(!labels.some((l) => /^current/.test(l)), labels.join(","));
+  const pat = [1, 2, 3, 4, 5].map((k) => byId(page, `dqm-smaev-pattext-${k}`).textContent);
+  assert.deepStrictEqual(pat, ["S1", "S2", "S3", "S4", "S5"]);
+  assert.strictEqual(byId(page, "dqm-smaev-pat-6"), null);
+});
+
+test("the pattern selector has one box per counter of the roles", async () => {
+  const ss = session({ "dqm-sma-events-seed": JSON.stringify(
+    { seed: "s1", filters: [], mupix: "any", pattern: { 2: "present", 4: "absent" } }) });
+  const page = await boot(cabled1015(FX.summary_3counters, FX.seeded_3counters), undefined, undefined,
+                          { session: ss });
+  const row = byId(page, "dqm-smaev-patternrow");
+  assert.strictEqual(row.byClass("dqm-smaev-pat").length, 3, "S1..S3");
+  assert.deepStrictEqual([1, 2, 3].map((k) => byId(page, `dqm-smaev-pattext-${k}`).textContent),
+                         ["S1", "S2", "S3"]);
+  assert.strictEqual(byId(page, "dqm-smaev-pat-4"), null);
+  // A stored choice for a counter that no longer exists is not sent.
+  for (const a of frameCalls(page)) assert.deepStrictEqual(a.pattern, { 2: "present" });
+  assert.strictEqual(byId(page, "dqm-smaev-pat-2").value, "present");
+});
+
+test("no summary and no frame: no counters are guessed", async () => {
+  const page = await boot({
+    "sma::summary": () => { throw new Error("analyzer down"); },
+    "sma::frame": () => { throw new Error("analyzer down"); },
+  });
+  assert.strictEqual(byId(page, "dqm-smaev-patternrow").byClass("dqm-smaev-pat").length, 0);
+  assert.strictEqual(byId(page, "dqm-smaev-pat-1"), null);
+  assert.strictEqual(byId(page, "dqm-smaev-hidecurlab").style.display, "none");
+  // Then a frame arrives: its labels are the roles.
+  const later = await boot({ "sma::summary": () => { throw new Error("no summary"); } });
+  assert.deepStrictEqual([1, 2, 3, 4, 5].map((k) => byId(later, `dqm-smaev-pattext-${k}`).textContent),
+                         ["S1", "S2", "S3", "S4", "S5"]);
+});
+
+// --- TOT + NIM: NIM lanes, class styling, pair ticks (smaf v3) --------------------------------
+
+const SEEDED_NIM = SMAF.decode(new Uint8Array(Buffer.from(FX.seeded_nim, "hex")));
+const RASTER_NIM = SMAF.decode(new Uint8Array(Buffer.from(FX.raster_nim, "hex")));
+const P = SMAF.PAIR;
+const clone = (o) => JSON.parse(JSON.stringify(o));
+
+/** An analyzer cabled as since run 1015, with NIM copies: frames are smaf v3. */
+function nimEvents(over = {}, seededHex) {
+  return Object.assign({
+    "sma::summary": () => json(FX.summary_nim),
+    "sma::frame": (args) => {
+      const a = JSON.parse(args || "{}");
+      return envelope("smaf", Buffer.from(a.view === "raster" ? FX.raster_nim
+        : (seededHex || FX.seeded_nim), "hex"));
+    },
+  }, over);
+}
+
+/** The page's lighten(), from its spec: each channel moved f of the way to 255. */
+function lighter(hex, f) {
+  const v = parseInt(hex.slice(1), 16);
+  return `#${[16, 8, 0].map((sh) => Math.round(((v >> sh) & 255) + (255 - ((v >> sh) & 255)) * f)
+    .toString(16).padStart(2, "0")).join("")}`;
+}
+
+/** The page's darken(), from its spec: each channel moved f of the way to 0. */
+function darker(hex, f) {
+  const v = parseInt(hex.slice(1), 16);
+  return `#${[16, 8, 0].map((sh) => Math.round(((v >> sh) & 255) * (1 - f))
+    .toString(16).padStart(2, "0")).join("")}`;
+}
+/** WCAG contrast of two #rrggbb colours. */
+function contrast(a, b) {
+  const L = (h) => {
+    const c = [1, 3, 5].map((i) => parseInt(h.slice(i, i + 2), 16) / 255)
+      .map((x) => (x <= 0.03928 ? x / 12.92 : ((x + 0.055) / 1.055) ** 2.4));
+    return 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
+  };
+  const [hi, lo] = [L(a), L(b)].sort((x, y) => y - x);
+  return (hi + 0.05) / (lo + 0.05);
+}
+const COUNTER_COLOURS = ["#1f77b4", "#2ca02c", "#17becf", "#9467bd", "#8c564b", "#bcbd22"];
+const NIM_CH = [3, 9, 10, 11, 12];
+
+/** Seed k's hits [a, b) on screen in the full window, by class. */
+function seedClasses(f, k) {
+  const seed = f.meta.seeds[k];
+  const [a, b] = seed.hits;
+  const out = { held: [], hollow: [], echo: [], nimSolid: {}, nimHollow: {}, ticks: 0 };
+  for (let i = a; i < b; i++) {
+    const t = f.t[i] - seed.t_rel;
+    if (t + f.tot[i] < -200 || t > 3000) continue;
+    const c = f.cls[i] & P.CLASS_MASK;
+    if (c === P.NIM_ONLY) out[f.cls[i] & P.LAG_HELD ? "held" : "hollow"].push(i);
+    const k = NIM_CH.indexOf(f.ch[i]);
+    if (k >= 0 && c !== P.NIM_ONLY) out.nimSolid[k] = (out.nimSolid[k] || 0) + 1;
+    if (k >= 0 && c === P.NIM_ONLY && !(f.cls[i] & P.LAG_HELD)) out.nimHollow[k] = (out.nimHollow[k] || 0) + 1;
+    if (c === P.ECHO) out.echo.push(i);
+    const j = f.pair[i];
+    if (j >= a && j < b && !(f.cls[i] & P.NIM_SIDE) && t >= -200 && f.t[j] - seed.t_rel <= 3000) out.ticks++;
+  }
+  return out;
+}
+
+/** Where to point at hit i of seed k on its canvas (its bar's start, mid-lane). */
+function pointAt(page, f, k, i) {
+  const canvas = byId(page, "dqm-smaev-seeds").byTag("canvas")[k];
+  const lane = laneMap(canvas.getContext("2d"))[f.ch[i]];
+  const x = 84 + (f.t[i] - f.meta.seeds[k].t_rel + 200) / 3200 * (888 - 84);
+  return { canvas, ev: { clientX: x + 1, clientY: 6 + lane * 20 + 10 } };
+}
+
+test("the NIM fixture frame is what the tests assume", () => {
+  assert.strictEqual(SEEDED_NIM.version, 3);
+  assert.ok(SEEDED_NIM.pairing && SEEDED_NIM.words);
+  assert.deepStrictEqual(SEEDED_NIM.meta.roles.nim, [3, 9, 10, 11, 12]);
+  assert.strictEqual(SEEDED_NIM.meta.nim_merge, true);
+  assert.strictEqual(RASTER_NIM.version, 3);
+  const all = SEEDED_NIM.meta.seeds.map((_, k) => seedClasses(SEEDED_NIM, k));
+  assert.ok(all.some((c) => c.held.length) && all.some((c) => c.hollow.length) &&
+            all.some((c) => c.echo.length) && all.some((c) => c.ticks), JSON.stringify(all));
+});
+
+test("each NIM copy has its own lane right under its counter, in its colour but lighter", async () => {
+  const page = await boot(nimEvents());
+  const canvas = byId(page, "dqm-smaev-seeds").byTag("canvas")[0];
+  const lanes = laneMap(canvas.getContext("2d"));
+  const order = Object.entries(lanes).sort((x, y) => x[1] - y[1]).map(([ch]) => Number(ch));
+  assert.deepStrictEqual(order.slice(0, 11), [1, 3, 2, 9, 7, 10, 4, 11, 5, 12, 6],
+                         "S1 S1L S2 S2L S3 S3L S4 S4L S5 S5L RF");
+  const labels = canvas.getContext("2d").texts();
+  for (const l of ["S1L (3)", "S3L (10)", "S4L (11)"]) assert.ok(labels.includes(l), labels.join(","));
+  const paint = lastPaint(canvas.getContext("2d"));
+  const nimFill = lighter("#1f77b4", 0.35);
+  assert.ok(paint.count("fillRect", nimFill) > 0, `S1L bars in ${nimFill}`);
+  assert.ok(paint.count("strokeRect", darker("#1f77b4", 0.3)) > 0, "outlined in the darker counter colour");
+  assert.ok(paint.count("fillRect", "#1f77b4") > 0, "S1 bars in the counter colour");
+  // The outline carries the contrast on the lane stripe: >= 3:1 for every counter colour.
+  for (const c of COUNTER_COLOURS) {
+    assert.ok(contrast(darker(c, 0.3), "#f4f4f4") >= 3, `${c}: ${contrast(darker(c, 0.3), "#f4f4f4")}`);
+  }
+  assert.ok(contrast("#6f6f6f", "#f4f4f4") >= 3, "the held-back outline");
+  assert.ok(!byId(page, "dqm-smaev-nimlegend").style.display, "the NIM legend is shown");
+});
+
+test("hit styles by class: NIM-only hollow, lag-held grey, echo cross-hatched, pair ticks", async () => {
+  const page = await boot(nimEvents());
+  const canvases = byId(page, "dqm-smaev-seeds").byTag("canvas");
+  let held = 0, hollow = 0, echo = 0, ticks = 0;
+  SEEDED_NIM.meta.seeds.forEach(function (seed, k) {
+    const want = seedClasses(SEEDED_NIM, k);
+    const paint = lastPaint(canvases[k].getContext("2d"));
+    assert.strictEqual(paint.count("strokeRect", "#6f6f6f"), want.held.length, `seed ${k}: grey outlines`);
+    assert.strictEqual(paint.count("fillRect", "#d4d4d4"), want.held.length, `seed ${k}: grey fill`);
+    NIM_CH.forEach(function (_ch, j) {
+      // Solid NIM bars: light fill + dark outline; hollow ones: the outline only
+      // (a 10 ns word is narrower than the hollow minimum, so it is not filled).
+      const solid = want.nimSolid[j] || 0, hol = want.nimHollow[j] || 0;
+      assert.strictEqual(paint.count("fillRect", lighter(COUNTER_COLOURS[j], 0.35)), solid, `seed ${k} NIM ${j} fill`);
+      assert.strictEqual(paint.count("strokeRect", darker(COUNTER_COLOURS[j], 0.3)), solid + hol,
+                         `seed ${k} NIM ${j} outlines`);
+    });
+    assert.strictEqual(paint.count("stroke", "rgba(0, 0, 0, 0.55)"), want.echo.length, `seed ${k}: echo hatch`);
+    assert.strictEqual(paint.count("stroke", "#3a3a3a"), want.ticks ? 1 : 0, `seed ${k}: one tick path`);
+    if (want.ticks) {
+      // One moveTo/lineTo per pair, after the tick colour is set.
+      const ops = paint.ops;
+      const at = ops.findIndex((o) => o[0] === "stroke" && o[2] === "#3a3a3a");
+      let begin = at;
+      while (begin > 0 && ops[begin][0] !== "beginPath") begin--;
+      assert.strictEqual(ops.slice(begin, at).filter((o) => o[0] === "lineTo").length, want.ticks);
+    }
+    held += want.held.length; hollow += want.hollow.length; echo += want.echo.length; ticks += want.ticks;
+    assert.strictEqual(paint.count("strokeRect", "#d00"),
+      (() => { let n = 0; const [a, b] = seed.hits;
+        for (let i = a; i < b; i++) if (SEEDED_NIM.hitFlags[i] & SMAF.HIT.MISMATCH) n++; return n; })(),
+      "the red mismatch outline only for mismatches, never for an echo");
+  });
+  assert.ok(held && hollow && echo && ticks);
+  const head = byId(page, "dqm-smaev-seeds").textContent;
+  assert.ok(/NIM-only held back \(lag fault\)/.test(head) && /NIM-only \(merged\)/.test(head), head);
+});
+
+test("a frame without pairing (v2) draws no ticks and no NIM styles", async () => {
+  const page = await boot();
+  for (const c of byId(page, "dqm-smaev-seeds").byTag("canvas")) {
+    const paint = lastPaint(c.getContext("2d"));
+    assert.strictEqual(paint.count("stroke", "#3a3a3a"), 0);
+    assert.strictEqual(paint.count("strokeRect", "#6f6f6f"), 0);
+  }
+  assert.strictEqual(byId(page, "dqm-smaev-nimlegend").style.display, "none");
+});
+
+test("hovering says a hit's class, its partner and NIM - TOT, and its flags", async () => {
+  const page = await boot(nimEvents());
+  const f = SEEDED_NIM;
+  const k = f.meta.seeds.findIndex((_, s) => seedClasses(f, s).held.length);
+  const i = seedClasses(f, k).held[0];
+  const panel = byId(page, "dqm-smaev-seeds").byClass("dqm-sma-seed")[k];
+  const hover = panel.byClass("dqm-smaev-hover")[0];
+  let { canvas, ev } = pointAt(page, f, k, i);
+  canvas.dispatch("mousemove", ev);
+  assert.match(hover.textContent, /^ch 11 \(S4L\) · ToT \d+ · .* · NIM word: NIM only \(held back from the merge: lag fault\) \[(.*, )?lag-held\] · word \d+/);
+  // A paired TOT word: its NIM copy and the time between them.
+  const [a, b] = f.meta.seeds[k].hits;
+  let tot = -1;
+  for (let x = a; x < b && tot < 0; x++) {
+    if ((f.cls[x] & P.CLASS_MASK) === P.PAIRED && !(f.cls[x] & P.NIM_SIDE) && f.pair[x] >= 0 &&
+        f.ch[x] !== 1) tot = x;
+  }
+  ({ canvas, ev } = pointAt(page, f, k, tot));
+  canvas.dispatch("mousemove", ev);
+  const j = f.pair[tot];
+  const dt = f.t[j] - f.t[tot];
+  const nimLab = f.meta.labels[f.ch[j]];
+  assert.ok(hover.textContent.includes(
+    `TOT word: paired with ${nimLab} (ch ${f.ch[j]}), NIM − TOT ${dt > 0 ? "+" : ""}${dt} ns`), hover.textContent);
+});
+
+test("roles come from the frame's roles block, even without a summary", async () => {
+  const page = await boot(nimEvents({ "sma::summary": () => { throw new Error("no summary"); } }));
+  const labels = byId(page, "dqm-smaev-seeds").byTag("canvas")[0].getContext("2d").texts();
+  assert.ok(labels.includes("S1L (3)") && labels.includes("S3 (7)"), labels.join(","));
+  // The frame's block wins over the summary's when they disagree (a frame analysed before an edit).
+  const s = clone(FX.summary_nim);
+  s.roles.nim = [-1, -1, -1, -1, -1];
+  const p2 = await boot(nimEvents({ "sma::summary": () => json(s) }));
+  const l2 = byId(p2, "dqm-smaev-seeds").byTag("canvas")[0].getContext("2d").texts();
+  assert.ok(l2.includes("S4L (11)"), l2.join(","));
+  // No block in the frame (an older analyzer or no NIM copies): the summary's.
+  const noRoles = withMeta(FX.seeded_nim, (m) => { delete m.roles; delete m.nim_merge; });
+  const p3 = await boot(nimEvents({ "sma::summary": () => json(s) }, noRoles.toString("hex")));
+  const l3 = byId(p3, "dqm-smaev-seeds").byTag("canvas")[0].getContext("2d").texts();
+  assert.ok(!l3.some((l) => /^S\dL/.test(l)), "the summary says no NIM copies");
+});
+
+test("the pattern selector and the seed's pattern say merged when the merge is on", async () => {
+  const page = await boot(nimEvents());
+  const head = byId(page, "dqm-smaev-patternhead");
+  assert.strictEqual(head.textContent, "and counters (merged TOT + NIM):");
+  assert.ok(/Merged: a counter's hits are its TOT words plus its NIM-only hits/.test(head.getAttribute("title")));
+  const pat = byId(page, "dqm-smaev-seeds").byClass("dqm-sma-pattern")[0];
+  assert.ok(/merged counters/.test(pat.getAttribute("title")));
+  assert.ok(/merged into its counter/.test(byId(page, "dqm-smaev-nimlegend").textContent));
+});
+
+test("merge off (the default): TOT-only pattern, NIM-only shown but not merged, nothing grey", async () => {
+  const off = SMAF.decode(new Uint8Array(Buffer.from(FX.seeded_nim_off, "hex")));
+  assert.strictEqual(off.meta.nim_merge, false);
+  const page = await boot(nimEvents({ "sma::summary": () => json(FX.summary_nim_off) }, FX.seeded_nim_off));
+  const head = byId(page, "dqm-smaev-patternhead");
+  assert.strictEqual(head.textContent, "and counters (TOT only, merge off):");
+  assert.ok(/TOT only: the NIM merge is off/.test(head.getAttribute("title")));
+  assert.strictEqual(byId(page, "dqm-smaev-seeds").byClass("dqm-sma-pattern")[0].getAttribute("title"),
+                     "coincidence pattern of the TOT words only (NIM merge off)");
+  const legend = byId(page, "dqm-smaev-nimlegend").textContent;
+  assert.ok(/shown, not merged: NIM merge off/.test(legend) && !/held back/.test(legend), legend);
+  const text = byId(page, "dqm-smaev-seeds").textContent;
+  assert.ok(!/held back/.test(text), "no held-back badge with nothing merged");
+  assert.ok(/NIM-only \(not merged: merge off\)/.test(text), text);
+  for (const c of byId(page, "dqm-smaev-seeds").byTag("canvas")) {
+    assert.strictEqual(lastPaint(c.getContext("2d")).count("fillRect", "#d4d4d4"), 0, "no grey bars");
+  }
+  // A NIM-only hit's line says it is not merged.
+  const k = off.meta.seeds.findIndex((_, j) => seedClasses(off, j).hollow.length);
+  const i = seedClasses(off, k).hollow[0];
+  const { canvas, ev } = pointAt(page, off, k, i);
+  canvas.dispatch("mousemove", ev);
+  const hover = byId(page, "dqm-smaev-seeds").byClass("dqm-sma-seed")[k].byClass("dqm-smaev-hover")[0];
+  assert.ok(/NIM word: NIM only \(merge off\)/.test(hover.textContent), hover.textContent);
+});
+
+test("the raster labels the NIM rows and marks the NIM-only words; colour stays ToT", async () => {
+  const page = await boot(nimEvents(), { tab: "raster" });
+  const ctx = byId(page, "dqm-smaev-raster").getContext("2d");
+  const paint = lastPaint(ctx);
+  const texts = paint.texts();
+  for (const l of ["S1L (3)", "S4L (11)", "S5L (12)"]) assert.ok(texts.includes(l), texts.join(","));
+  let hollow = 0, held = 0;
+  for (let i = 0; i < RASTER_NIM.nHits; i++) {
+    if ((RASTER_NIM.cls[i] & P.CLASS_MASK) !== P.NIM_ONLY) continue;
+    if (RASTER_NIM.cls[i] & P.LAG_HELD) held++; else hollow++;
+  }
+  assert.ok(hollow > 0 && held > 0);
+  assert.strictEqual(paint.count("fill", "#3a3a3a"), 1, "one path of NIM-only marks");
+  assert.strictEqual(paint.count("fill", "#6f6f6f"), 1, "one path of held-back marks");
+  const rects = paint.ops.filter((o) => o[0] === "rect").length;
+  assert.ok(rects >= RASTER_NIM.nHits + hollow + held, "every hit plus each mark");
+  assert.ok(!byId(page, "dqm-smaev-rasternim").style.display, "the raster's NIM note is shown");
+  // The live raster carries the classes only: its partners come with the words (Freeze).
+  assert.strictEqual(RASTER_NIM.pair, null);
+  assert.ok(/merged; grey: held back/.test(byId(page, "dqm-smaev-rasternim").textContent));
+});
+
+test("with no roles block anywhere, the NIM lanes come from the channel rows' pair_of", async () => {
+  const s = clone(FX.summary_nim);
+  delete s.roles;
+  const bare = withMeta(FX.seeded_nim, (m) => { delete m.roles; });
+  const page = await boot(nimEvents({ "sma::summary": () => json(s) }, bare.toString("hex")));
+  const lanes = laneMap(byId(page, "dqm-smaev-seeds").byTag("canvas")[0].getContext("2d"));
+  const order = Object.entries(lanes).sort((x, y) => x[1] - y[1]).map(([ch]) => Number(ch));
+  assert.deepStrictEqual(order.slice(0, 10), [1, 3, 2, 9, 7, 10, 4, 11, 5, 12]);
 });
