@@ -20,11 +20,21 @@
 //      sideband and the accidentals taken out) and the time-sync state above
 //      the timing, ToT and occupancy plots; the per-chip column/row occupancy
 //      is drawn per plane, one line per chip.
+//      "MuPix pairs (unseeded)": every L1 pixel paired with the nearest-in-time
+//      L2 pixel within the window, with or without an S1 hit, as the nearline
+//      pairs them: a note (paired fraction, partners, window, cap, cuts, stage),
+//      x/y, x/x', y/y' as rows of all / light / heavy, the L2 - L1 dt with the
+//      window outlined, and the partners per L1 pixel.
 //      The NIM / TOT tab (since run 1015 each counter has a NIM copy, "S1L"
 //      ...) has a table per counter -- pair efficiency, purity, NIM-only share,
 //      median NIM - TOT, the lag-fault vote -- above its plots, per counter.
 //      A chip in the status line says whether the counters are the merged
 //      TOT + NIM hits (pattern, efficiencies), as nearline's are.
+//
+// The same script draws the MuPix page (/Custom/MuPixPlots, mupix.html): its
+// <body data-view="mupix"> picks a VIEWS entry below, which keeps only the MuPix
+// tabs, the status chips, the banners and the MuPix flags, and remembers its
+// settings under its own localStorage key.
 //
 // Everything comes from the sma_analyzer client over brpc. Channel names come
 // from the summary, which takes them from the ODB (/DQM/SMA/Channel roles), so
@@ -55,10 +65,43 @@ const TABS = [
   // keeps the old tab's id, so a page that remembered "mupix" opens it.
   // [id, label, short label for a phone-width tab bar]
   ["mupixxy", "MuPix phase space", "MuPix x/y"],
+  ["mupixpair", "MuPix pairs (unseeded)", "MuPix pairs"],
   ["mupix", "MuPix diagnostics", "MuPix diag."],
   ["nim", "NIM / TOT"],
   ["trends", "Trends"],
 ];
+
+/**
+ * The pages this script draws, chosen by <body data-view="...">; none is "sma".
+ *
+ * tabs   the tab ids shown, in TABS order (null: all); the first is the default.
+ * store  the localStorage key of the page's settings (tab, scales, rate), so
+ *        two pages open side by side do not overwrite each other's tab.
+ * page   the menu key for mhttpd_init when the URL has no ?page=.
+ * flags  which flags are listed (null: all); the banners are always shown,
+ *        since a wrong coarse shift or time base spoils the S1-seeded maps too.
+ * table  whether the per-channel table is drawn.
+ */
+const VIEWS = {
+  sma: { tabs: null, store: LS, page: "SMAPlots", flags: null, table: true },
+  mupix: { tabs: ["mupixxy", "mupixpair", "mupix"], store: "dqm-sma-mupix-settings", page: "MuPixPlots",
+           // The MuPix flags, and those that leave the MuPix plots empty or wrong:
+           // no frames, every frame stale, no S1 seeds, a settings error (a bad
+           // chip list turns x/y off with one).
+           flags: /^(mupix_\w+|settings|no_frames|all_stale|no_seeds)$/, table: false },
+};
+
+/** The view named by the page's <body data-view>, else the SMAPlots page. */
+function viewOf(doc) {
+  const b = doc && doc.body;
+  const name = b && typeof b.getAttribute === "function" ? b.getAttribute("data-view") : null;
+  return VIEWS[name] || VIEWS.sma;
+}
+
+/** The tabs of a view, in TABS order. */
+function tabsOf(view) {
+  return view.tabs ? TABS.filter(([id]) => view.tabs.indexOf(id) >= 0) : TABS;
+}
 
 /**
  * Which tab a histogram belongs on, and in what order.
@@ -82,6 +125,12 @@ const ORDER = {
             /^mupix_track_xxp$/, /^mupix_track_xxp_light$/, /^mupix_track_xxp_heavy$/,
             /^mupix_track_yyp$/, /^mupix_track_yyp_light$/, /^mupix_track_yyp_heavy$/,
             /^mupix_track_tot$/, /^mupix_track_state$/, /^mupix_hits_xy_/, /^mupix_track_/],
+  // MuPix pairs: all / light / heavy for x/y, x/x', y/y', then the L2 - L1 dt
+  // and the partners per L1 pixel. Checked before the diagnostics' /^mupix_/.
+  mupixpair: [/^mupix_pair_xy$/, /^mupix_pair_xy_light$/, /^mupix_pair_xy_heavy$/,
+              /^mupix_pair_xxp$/, /^mupix_pair_xxp_light$/, /^mupix_pair_xxp_heavy$/,
+              /^mupix_pair_yyp$/, /^mupix_pair_yyp_light$/, /^mupix_pair_yyp_heavy$/,
+              /^mupix_pair_dt$/, /^mupix_pair_partners$/, /^mupix_pair_/],
   // Every other mupix_ histogram is a diagnostic.
   mupix: [/^mupix_dt_L1$/, /^mupix_dt_L2$/, /^mupix_s1_match$/, /^mupix_tot_L1$/, /^mupix_tot_L2$/,
           /^mupix_col_chip/, /^mupix_row_chip/, /^mupix_hits_chip$/, /^mupix_/],
@@ -108,6 +157,14 @@ const XY_TRACK_MAP = /^sma\/mupix_track_(xy|xxp|yyp)(_light|_heavy)?$/;
 /** The MuPix x/y histograms: the note on them goes in front of the first. */
 const XY_ANY = /^sma\/mupix_(hits_xy_L\d|track_\w+)$/;
 
+/** The unseeded pair maps: linear z by default too, with the pairs tab's own switch. */
+const PAIR_MAP = /^sma\/mupix_pair_(xy|xxp|yyp)(_light|_heavy)?$/;
+
+/** The pairs tab's histograms: its note goes in front of the first. */
+const PAIR_ANY = /^sma\/mupix_pair_\w+$/;
+
+const PAIR_DT = "sma/mupix_pair_dt";
+
 /**
  * Plots laid out side by side in a row of their own, `cols` to a row on a wide
  * screen, one below the other on a phone: the two hit maps; all / light /
@@ -119,6 +176,8 @@ function rowOf(name) {
   if (/^mupix_hits_xy_L\d$/.test(s)) return { key: "xyhits", cols: 2, square: true };
   const m = /^mupix_track_(xy|xxp|yyp)(_light|_heavy)?$/.exec(s);
   if (m) return { key: `xy${m[1]}`, cols: 3, square: true };
+  const q = /^mupix_pair_(xy|xxp|yyp)(_light|_heavy)?$/.exec(s);
+  if (q) return { key: `pair${q[1]}`, cols: 3, square: true };
   return null;
 }
 
@@ -127,7 +186,7 @@ const SQUARE = [/^sma\/mupix_track_tot$/];
 
 function tabOf(name) {
   const s = shortName(name);
-  for (const tab of ["tot", "timing", "rf", "mupixxy", "mupix", "nim"]) {
+  for (const tab of ["tot", "timing", "rf", "mupixxy", "mupixpair", "mupix", "nim"]) {
     if (ORDER[tab].some((re) => re.test(s))) return tab;
   }
   return "health";
@@ -150,6 +209,8 @@ const COLOURS = ["#1f77b4", "#d62728", "#2ca02c", "#ff7f0e", "#9467bd", "#8c564b
                  "#e377c2", "#7f7f7f", "#bcbd22", "#17becf", "#393b79", "#637939"];
 
 const state = {
+  view: VIEWS.sma,         // which page this is (VIEWS), set at load
+  tabs: TABS,              // the view's tabs
   client: "sma_analyzer",
   tab: "health",
   intervalMs: 1000,
@@ -159,6 +220,9 @@ const state = {
   xyLogZ: false,           // the MuPix x/y track maps on log z (XY_TRACK_MAP)
   xyHead: null,            // the MuPix x/y note and switch, placed by layoutTab
   xyNoteSig: null,         // the note's parts as last drawn
+  pairLogZ: false,         // the unseeded pair maps on log z (PAIR_MAP)
+  pairHead: null,          // the pairs tab's note and switch, placed by layoutTab
+  pairNoteSig: null,
   names: null,             // dqm::list, null until the analyzer has answered once
   epoch: null,             // summary epoch; a change means the histograms were rebuilt
   plots: {},               // tab -> [{key, names, wrap, div, mpg, title, foot}]
@@ -180,7 +244,10 @@ const state = {
 };
 
 window.addEventListener("load", function () {
-  mhttpd_init(mhttpd_getParameterByName("page") || "SMAPlots", 1000);
+  state.view = viewOf(document);
+  state.tabs = tabsOf(state.view);
+  state.tab = state.tabs[0][0];
+  mhttpd_init(mhttpd_getParameterByName("page") || state.view.page, 1000);
   restore();
   build();
   state.summaryUpdater = new BRPC.AutoUpdater(refreshSummary, state.intervalMs || 1000);
@@ -263,13 +330,14 @@ function retire(u) {
 }
 
 function showTab(tab) {
+  if (!state.tabs.some(([id]) => id === tab)) tab = state.tabs[0][0];
   state.tab = tab;
   save();
-  for (const [id] of TABS) {
+  for (const [id] of state.tabs) {
     const pane = document.getElementById(`dqm-sma-pane-${id}`);
     if (pane) pane.style.display = id === tab ? "" : "none";
   }
-  markTabs(TABS, "dqm-sma", tab);
+  markTabs(state.tabs, "dqm-sma", tab);
   if (tab === "trends") layoutTrends();
   else layoutTab(tab);
   // The pane was hidden, so every plot reads as off screen. Poll them all
@@ -366,9 +434,14 @@ function logYFor(name) {
   return state.logY || (state.nimLogY && LOG_Y_DEFAULT.some((re) => re.test(name)));
 }
 
-/** Whether a 2D histogram is drawn with log z: the MuPix switch for the track maps, else the toolbar's. */
+/**
+ * Whether a 2D histogram is drawn with log z: the phase-space tab's switch for
+ * the track maps, the pairs tab's for the pair maps, else the toolbar's.
+ */
 function logZFor(name) {
-  return XY_TRACK_MAP.test(name) ? state.xyLogZ : state.logZ;
+  if (XY_TRACK_MAP.test(name)) return state.xyLogZ;
+  if (PAIR_MAP.test(name)) return state.pairLogZ;
+  return state.logZ;
 }
 
 function layoutTab(tab) {
@@ -379,13 +452,15 @@ function layoutTab(tab) {
   const plots = [];
   const rows = new Map();
   const groups = groupsFor(tab);
-  // The MuPix x/y note goes in front of the x/y plots (at the end without them:
-  // "XY off" has to be said somewhere).
-  let head = tab === "mupixxy" ? xyHead() : null;
+  // The MuPix x/y note goes in front of the x/y plots, the pairs note in front
+  // of the pair plots (at the end without them: "XY off" / "pairs off" has to
+  // be said somewhere).
+  let head = tab === "mupixxy" ? xyHead() : tab === "mupixpair" ? pairHead() : null;
+  const headOf = tab === "mupixpair" ? PAIR_ANY : XY_ANY;
   // Where a plot goes: into its row (made at its first plot, so rows keep
   // the plots' order), or straight into the grid.
   const into = function (g) {
-    if (head && XY_ANY.test(g.names[0])) { grid.appendChild(head); head = null; }
+    if (head && headOf.test(g.names[0])) { grid.appendChild(head); head = null; }
     if (!g.row) return grid;
     if (!rows.has(g.row.key)) {
       const r = el("div", { class: `dqm-sma-row dqm-sma-row${g.row.cols}`, "data-row": g.row.key });
@@ -420,8 +495,8 @@ function layoutTab(tab) {
     plots.push(entry);
   }
   if (head) grid.appendChild(head);
-  // On the phase-space tab the note says why there is nothing (XY off).
-  if (!plots.length && tab !== "mupixxy") {
+  // On the phase-space and pairs tabs the note says why there is nothing.
+  if (!plots.length && tab !== "mupixxy" && tab !== "mupixpair") {
     grid.appendChild(el("div", { class: "dqm-note" },
       state.names && state.names.length
         ? "The analyzer has no histograms for this tab."
@@ -450,12 +525,13 @@ function ensureGraph(p) {
   if (p.heat) { p.div.innerHTML = ""; p.heat = null; p.div.heatmap = null; }
   const pair = p.names.length > 1;
   const dtWin = /^sma\/mupix_dt_L[12]$/.test(p.key);
+  const pairDt = p.key === PAIR_DT;
   const mpg = new MPlotGraph(p.div, {
     showMenuButtons: true,
     mouseWheelZoom: true,
     title: { text: "" },
     stats: { show: false },
-    legend: { show: pair || dtWin || !!p.occupancy },
+    legend: { show: pair || dtWin || pairDt || !!p.occupancy },
     xAxis: { title: { text: "", textSize: 12 }, textSize: 12 },
     yAxis: { title: { text: "", textSize: 12 }, textSize: 12 },
   });
@@ -475,6 +551,11 @@ function ensureGraph(p) {
                   line: { draw: true, width: 2, color: "#2ca02c" }, marker: { draw: false } });
     mpg.addPlot({ label: "sideband", type: "scatter", xData: [], yData: [],
                   line: { draw: true, width: 2, color: "#7f7f7f" }, marker: { draw: false } });
+  }
+  if (pairDt) {
+    // The pairing window, outlined over the L2 - L1 dt.
+    mpg.addPlot({ label: "pairing window", type: "scatter", xData: [], yData: [],
+                  line: { draw: true, width: 2, color: "#2ca02c" }, marker: { draw: false } });
   }
   coalesce(mpg);
   p.mpg = mpg;
@@ -552,7 +633,8 @@ function titleFor(g) {
   if (!(meta && meta.title)) return shortName(g.key);
   // The x/y maps' frame, "(bt2026-v4, +x beam-left)", is said once, in the
   // note above them; three-across titles are short enough to stay level.
-  const t = XY_ANY.test(g.names[0]) ? meta.title.replace(/\s*\([^()]*\+x beam-left\)$/, "") : meta.title;
+  const framed = XY_ANY.test(g.names[0]) || PAIR_ANY.test(g.names[0]);
+  const t = framed ? meta.title.replace(/\s*\([^()]*\+x beam-left\)$/, "") : meta.title;
   return `${t}  [${shortName(g.names[0])}]`;
 }
 
@@ -627,6 +709,24 @@ async function drawOccupancy(p) {
   p.sig = sig;
 }
 
+/** The pairing window [-w, +w] ns outlined on the L2 - L1 dt (series 1). */
+function markPairWindow(p, hist) {
+  const w = pairWindow(state.summary && state.summary.pairs);
+  if (!w || p.mpg.param.plot.length < 2) return;
+  let top = 1;
+  for (const v of hist.data) if (v > top) top = v;
+  const lo = logYFor(PAIR_DT) ? 0.5 : 0;
+  p.mpg.setData(1, [w[0], w[0], w[1], w[1]], [lo, top, top, lo]);
+}
+
+/** summary.pairs.window_ns as [lo, hi] ns: a half-width (40 -> [-40, 40]) or a pair; null if absent. */
+function pairWindow(pr) {
+  const w = pr ? pr.window_ns : null;
+  if (typeof w === "number" && Number.isFinite(w)) return [-Math.abs(w), Math.abs(w)];
+  if (Array.isArray(w) && w.length === 2 && w.every((x) => typeof x === "number")) return w;
+  return null;
+}
+
 /** The in-time window and sideband outlines on a t(pixel) - t(S1) plot (series 1 and 2). */
 function markMupixWindows(p, hist) {
   const mp = state.summary && state.summary.mupix;
@@ -677,9 +777,10 @@ async function drawPlot(p) {
 
   // 1D: redrawn only when a histogram, the y scale or the MuPix windows changed.
   const mp = state.summary && state.summary.mupix;
+  const pw = name0 === PAIR_DT ? JSON.stringify(pairWindow(state.summary && state.summary.pairs)) : "";
   const logY = logYFor(name0);
   const sig = hists.map((h) => `${DQMHeatmap.checksum(h.data)}:${h.entries}`).join(",") +
-    `|${logY}|${mp ? JSON.stringify([mp.window_ns, mp.sideband_ns]) : ""}|${seriesLabel(p, name0)}`;
+    `|${logY}|${mp ? JSON.stringify([mp.window_ns, mp.sideband_ns]) : ""}|${pw}|${seriesLabel(p, name0)}`;
   if (sig === p.sig && p.mpg) return;
   ensureGraph(p);
   hists.forEach(function (hist, i) {
@@ -692,6 +793,7 @@ async function drawPlot(p) {
     if (hist.dimensions === 1 && p.names.length > 1) p.mpg.param.plot[i].line.color = COLOURS[i];
     applyAxisTitles(p.mpg, state.meta[name], hist.dimensions);
     if (/^sma\/mupix_dt_L[12]$/.test(name)) markMupixWindows(p, hist);
+    if (name === PAIR_DT) markPairWindow(p, hist);
     if (name === "sma/mupix_s1_match") p.matchCounts = Array.from(hist.data);
   });
   p.mpg.redraw();
@@ -955,6 +1057,7 @@ function render(s, status) {
   guard("dqm-sma-table", () => renderTable(s));
   guard("dqm-sma-mupix", () => renderMupix(s));
   guard("dqm-sma-xynote", () => renderXy(s));
+  guard("dqm-sma-pairnote", () => renderPairs(s));
   guard("dqm-sma-nim", () => renderNim(s));
 }
 
@@ -1248,18 +1351,7 @@ function xyNoteParts(xy) {
   const unit = c.tot_ns ? ` (×${c.tot_ns} ns)` : "";
   parts.push([`light ${pct(xy.light_frac, 1)}, heavy ${pct(xy.heavy_frac, 1)} of the tracks ` +
               `(light: both planes' max ToT ≤ ${c.tot_light_max}${unit} · heavy: ≥ ${c.tot_heavy_min})`, ""]);
-  const sh = st.shift_mm || [0, 0];
-  const shift = `x ${fmtShift(sh[0])}, y ${fmtShift(sh[1])} mm`;
-  const note = st.note || undefined;
-  if (st.applied === false) parts.push(["stage shift off", "", note]);
-  else if (st.source === "missing") parts.push(["stage: missing, (0, 0) mm used", "warn", note]);
-  else if (st.source === "error") parts.push([`stage: read failed, last shift kept (${shift})`, "warn", note]);
-  else if (st.source === "none") parts.push(["stage: no reading yet, (0, 0) mm used", "muted", note]);
-  else {
-    const from = { odb: "XY table", file: "the file's begin-of-run ODB", manual: "set by hand" }[st.source] ||
-      String(st.source);
-    parts.push([`stage shift ${shift} (${from})`, "", note]);
-  }
+  parts.push(stagePart(st));
   parts.push([`${xy.geometry || "?"}, +x beam-left, seen looking upstream`, ""]);
   const qt = quadText(xy.quadrants || []);
   if (qt) parts.push([qt[0], "", qt[1]]);
@@ -1267,6 +1359,20 @@ function xyNoteParts(xy) {
   if (un.length) parts.push([`chips with no place: ${un.join(", ")}`, "warn"]);
   if (xy.resets) parts.push([`maps reset ${xy.resets}× by XY edits`, "muted"]);
   return parts;
+}
+
+/** The stage shift as a note part, [text, kind, title], from a summary's stage block. */
+function stagePart(st) {
+  const sh = st.shift_mm || [0, 0];
+  const shift = `x ${fmtShift(sh[0])}, y ${fmtShift(sh[1])} mm`;
+  const note = st.note || undefined;
+  if (st.applied === false) return ["stage shift off", "", note];
+  if (st.source === "missing") return ["stage: missing, (0, 0) mm used", "warn", note];
+  if (st.source === "error") return [`stage: read failed, last shift kept (${shift})`, "warn", note];
+  if (st.source === "none") return ["stage: no reading yet, (0, 0) mm used", "muted", note];
+  const from = { odb: "XY table", file: "the file's begin-of-run ODB", manual: "set by hand" }[st.source] ||
+    String(st.source);
+  return [`stage shift ${shift} (${from})`, "", note];
 }
 
 /** The MuPix x/y note, redrawn only when its text changed. */
@@ -1277,7 +1383,77 @@ function renderXy(s) {
   const sig = JSON.stringify(parts);
   if (sig === state.xyNoteSig) return;
   state.xyNoteSig = sig;
-  const note = head._note;
+  drawNote(head._note, parts);
+}
+
+// ---------------------------------------------------------------------------
+// MuPix pairs (unseeded)
+// ---------------------------------------------------------------------------
+
+/** The pairs tab's head: a one-line note from summary.pairs and the log-z switch for the pair maps. */
+function pairHead() {
+  if (state.pairHead) return state.pairHead;
+  const note = el("div", { class: "dqm-sma-xynote", id: "dqm-sma-pairnote" }, "MuPix pairs: …");
+  const tools = el("div", { class: "dqm-sma-xytools" },
+    checkbox("dqm-sma-pairlogz", "log z for the pair maps", state.pairLogZ,
+      function (v) { state.pairLogZ = v; save(); redrawVisible(); }));
+  state.pairHead = el("div", { class: "dqm-sma-xyhead", id: "dqm-sma-pairhead" }, note, tools);
+  state.pairHead._note = note;
+  if (state.summary) renderPairs(state.summary);
+  return state.pairHead;
+}
+
+/** A plain number with `digits` decimals, or a dash. */
+function fixed(x, digits) {
+  return typeof x === "number" && Number.isFinite(x) ? x.toFixed(digits) : "—";
+}
+
+/**
+ * The pairs note's parts, as xyNoteParts: [[text, kind, title], ...], from
+ * summary.pairs alone.
+ */
+function pairNoteParts(pr) {
+  const label = ["MuPix pairs:", "label"];
+  if (!pr) return [label, ["no pairs summary from the analyzer", "warn"]];
+  if (!pr.enabled) {
+    return [label, [`pairs off: ${pr.off_reason || "MuPix/Pairs/enable = n, or the MuPix analysis is off"}`,
+                    pr.off_reason && !/enable = n/.test(pr.off_reason) ? "warn" : ""]];
+  }
+  const c = pr.cuts || {};
+  const w = pairWindow(pr);
+  const win = !w ? "—" : w[0] === -w[1] ? `±${w[1]} ns` : `[${w[0]}, ${w[1]}] ns`;
+  const parts = [label];
+  parts.push([`${pct(pr.paired_frac, 1)} of ${num(pr.n_l1)} L1 pixels paired`, "",
+              "L1 pixels with an L2 pixel within the window; each takes the nearest in time, " +
+              "ties to the earlier, and one L2 pixel may serve several L1 pixels"]);
+  parts.push([`mean partners ${fixed(pr.mean_partners, 2)}`, "",
+              "L2 pixels within the window per paired L1 pixel: 1 is no ambiguity " +
+              "(every sampled L1 pixel is in mupix_pair_partners)"]);
+  parts.push([`window ${win} · at most ${num(pr.max_l1)} L1 pixels per frame`, ""]);
+  const unit = c.tot_ns ? ` (×${c.tot_ns} ns)` : "";
+  parts.push([`light ${pct(pr.light_frac, 1)}, heavy ${pct(pr.heavy_frac, 1)} of the pairs ` +
+              `(light: both pixels' ToT ≤ ${c.tot_light_max}${unit} · heavy: ≥ ${c.tot_heavy_min})`, ""]);
+  parts.push(stagePart(pr.stage || {}));
+  if (pr.resets) parts.push([`maps reset ${pr.resets}× by Pairs or ToT-cut edits`, "muted"]);
+  parts.push(["pixel pairs, not particles", "muted",
+              "No clustering and no S1: a particle that fires several pixels gives several pairs, " +
+              "as on the nearline (track_xy, xxp_central, yyp_central)"]);
+  return parts;
+}
+
+/** The pairs note, redrawn only when its text changed. */
+function renderPairs(s) {
+  const head = state.pairHead;
+  if (!head) return;
+  const parts = pairNoteParts(s ? s.pairs : null);
+  const sig = JSON.stringify(parts);
+  if (sig === state.pairNoteSig) return;
+  state.pairNoteSig = sig;
+  drawNote(head._note, parts);
+}
+
+/** A note from its parts: "label part · part · ...", a hover text on the parts that have one. */
+function drawNote(note, parts) {
   note.innerHTML = "";
   parts.forEach(function ([text, kind, title], i) {
     if (i > 1) note.appendChild(document.createTextNode(" · "));
@@ -1294,6 +1470,7 @@ function guard(id, fn) {
     // it has to be rebuilt on the next good summary.
     if (id === "dqm-sma-table") state.table = null;
     if (id === "dqm-sma-xynote") state.xyNoteSig = null;
+    if (id === "dqm-sma-pairnote") state.pairNoteSig = null;
     if (id === "dqm-sma-flags") state.flagsSig = null;
     if (id === "dqm-sma-banner") state.banners = {};
     if (id === "dqm-sma-nim") state.nimSig = null;
@@ -1509,16 +1686,22 @@ const BANNER_CODES = ["shift_mismatch", "time_base"];
 function renderFlags(s) {
   const holder = document.getElementById("dqm-sma-flags");
   const all = (s && s.flags) || [];
-  const flags = all.filter((f) => BANNER_CODES.indexOf(f.code) < 0);
+  const only = state.view.flags;
+  const others = all.filter((f) => BANNER_CODES.indexOf(f.code) < 0);
+  const flags = only ? others.filter((f) => only.test(f.code)) : others;
+  // On the MuPix page the flags it leaves out are counted, not hidden silently.
+  // "the SMA plots page", not its menu key: pinky registers it as WDSMAPlots.
+  const hidden = others.length - flags.length;
   const order = { error: 0, warn: 1, info: 2 };
   flags.sort((a, b) => (order[a.severity] ?? 3) - (order[b.severity] ?? 3));
-  const sig = JSON.stringify([flags, all.length]);
+  const sig = JSON.stringify([flags, all.length, hidden]);
   if (sig === state.flagsSig) return;           // unchanged: leave the DOM alone
   state.flagsSig = sig;
   holder.innerHTML = "";
+  const more = hidden ? ` ${hidden} other flag${hidden > 1 ? "s" : ""} on the SMA plots page.` : "";
   if (!flags.length) {
     holder.appendChild(el("div", { class: "dqm-diagnosis" },
-      all.length ? "No other flags." : "No flags."));
+      only ? `No MuPix flags.${more}` : all.length ? "No other flags." : "No flags."));
     return;
   }
   for (const f of flags) {
@@ -1527,7 +1710,7 @@ function renderFlags(s) {
     // The TOT + NIM and the MuPix flags point at the tab with the numbers and
     // plots behind them (the MuPix ones are all about the readout and time sync).
     const to = /^nim_/.test(f.code) ? "nim" : /^mupix_/.test(f.code) ? "mupix" : null;
-    if (to) {
+    if (to && state.tabs.some(([id]) => id === to)) {
       const label = TABS.find(([id]) => id === to)[1];   // the full label
       const go = el("button", { type: "button", class: "dqm-sma-flaglink" }, `${label} tab ›`);
       go.onclick = function () { showTab(to); };
@@ -1536,6 +1719,7 @@ function renderFlags(s) {
     }
     holder.appendChild(div);
   }
+  if (more) holder.appendChild(el("div", { class: "dqm-footnote dqm-sma-flagsmore" }, more.trim()));
 }
 
 /** The channel a flag is about: its "ch" field, else "(ch N)" in the text. */
@@ -1558,6 +1742,7 @@ const COLUMNS = [["ch", ""], ["label", "label"], ["role", "label"], ["rate", ""]
  */
 function renderTable(s) {
   const holder = document.getElementById("dqm-sma-table");
+  if (!holder) return;                        // a view without the table (the MuPix page)
   if (!s || !s.channels) { holder.innerHTML = ""; state.table = null; return; }
 
   const marks = {};                           // "ch:column" -> warn|alarm
@@ -1709,7 +1894,7 @@ function tabOk(tab) {
  */
 function setStale(stale) {
   for (const id of ["dqm-sma-banner", "dqm-sma-sampling", "dqm-sma-flags", "dqm-sma-table",
-                    ...TABS.map(([t]) => `dqm-sma-pane-${t}`)]) {
+                    ...state.tabs.map(([t]) => `dqm-sma-pane-${t}`)]) {
     const node = document.getElementById(id);
     if (node) node.classList.toggle("dqm-sma-stale", stale);
   }
@@ -1744,7 +1929,7 @@ function build() {
   note.style.display = "none";
   r.appendChild(note);
   r.appendChild(el("div", { id: "dqm-sma-flags", class: "dqm-sma-flags" }));
-  r.appendChild(el("div", { id: "dqm-sma-table", class: "dqm-panel" }));
+  if (state.view.table) r.appendChild(el("div", { id: "dqm-sma-table", class: "dqm-panel" }));
 
   // The page's controls on a row of their own above the tab strip, so they
   // do not read as more tabs.
@@ -1768,9 +1953,10 @@ function build() {
   };
   bar.appendChild(clear);
   r.appendChild(bar);
-  r.appendChild(tabStrip(TABS, "dqm-sma", "SMA plots", () => state.tab, showTab));
+  r.appendChild(tabStrip(state.tabs, "dqm-sma", state.view.tabs ? "MuPix plots" : "SMA plots",
+                         () => state.tab, showTab));
 
-  for (const [id] of TABS) {
+  for (const [id] of state.tabs) {
     const pane = el("div", { id: `dqm-sma-pane-${id}`, class: "dqm-sma-pane", role: "tabpanel",
                              "aria-labelledby": `dqm-sma-tab-${id}` });
     pane.appendChild(el("div", { id: `dqm-sma-tabnote-${id}` }));
@@ -1869,23 +2055,25 @@ function markTabs(tabs, prefix, shown) {
 
 function save() {
   try {
-    window.localStorage.setItem(LS, JSON.stringify({
+    window.localStorage.setItem(state.view.store, JSON.stringify({
       client: state.client, tab: state.tab, intervalMs: state.intervalMs,
       logY: state.logY, logZ: state.logZ, nimLogY: state.nimLogY, xyLogZ: state.xyLogZ,
+      pairLogZ: state.pairLogZ,
     }));
   } catch (e) { /* private browsing or quota */ }
 }
 
 function restore() {
   try {
-    const o = JSON.parse(window.localStorage.getItem(LS) || "{}");
+    const o = JSON.parse(window.localStorage.getItem(state.view.store) || "{}");
     if (o.client) state.client = o.client;
-    if (o.tab && TABS.some(([id]) => id === o.tab)) state.tab = o.tab;
+    if (o.tab && state.tabs.some(([id]) => id === o.tab)) state.tab = o.tab;
     if (o.intervalMs !== undefined) state.intervalMs = Number(o.intervalMs);
     if (o.logY !== undefined) state.logY = !!o.logY;
     if (o.logZ !== undefined) state.logZ = !!o.logZ;
     if (o.nimLogY !== undefined) state.nimLogY = !!o.nimLogY;
     if (o.xyLogZ !== undefined) state.xyLogZ = !!o.xyLogZ;
+    if (o.pairLogZ !== undefined) state.pairLogZ = !!o.pairLogZ;
   } catch (e) { /* defaults are fine */ }
 }
 

@@ -33,11 +33,11 @@ Differences from the daemon, all deliberate:
 * there is no run: the summary is asked for with ``run_active=false``, so the
   "no SMA frames for > 5 s while a run is active" flag cannot fire;
 * ``Sampling`` is ignored: every frame is processed;
-* MuPix x/y takes the XY table's position (``/Equipment/XYTable/Variables/
-  Measured``) from the file's begin-of-run ODB dump, as the nearline does,
-  not from a live ODB; ``--stage X Y`` (mm) overrides it. The summary says
-  which (``xy.stage.source`` "file" or "manual"; "missing", with (0, 0) and a
-  note, when the dump has no such key).
+* MuPix x/y and the MuPix pairs take the XY table's position
+  (``/Equipment/XYTable/Variables/Measured``) from the file's begin-of-run ODB
+  dump, as the nearline does, not from a live ODB; ``--stage X Y`` (mm)
+  overrides it. The summary says which (``xy.stage.source`` "file" or
+  "manual"; "missing", with (0, 0) and a note, when the dump has no such key).
 
 Outputs (``--out``, default ``./sma-file-<run>_<subrun>/``)
 ------------------------------------------------------------
@@ -53,6 +53,9 @@ Outputs (``--out``, default ``./sma-file-<run>_<subrun>/``)
 ``nim.png``        the TOT + NIM page, when a counter has a NIM copy (same condition).
 ``mupix_xy.png``   the MuPix x/y page (hit maps, tracks all / light / heavy, ToT map),
                    when MuPix/XY is on (same condition).
+``mupix_pairs.png`` the unseeded MuPix L1-L2 pairs page (L2 - L1 dt, partners per L1
+                   pixel, pairs all / light / heavy), when MuPix/Pairs is on (same
+                   condition).
 
 A short text summary goes to stdout.
 
@@ -420,6 +423,8 @@ def text_summary(summary: dict, stats: FeedStats, file_label: str, elapsed_s: fl
         lines.append(mupix_line(mp))
     if summary.get("xy"):
         lines.append(mupix_xy_line(summary["xy"]))
+    if summary.get("pairs"):
+        lines.append(mupix_pairs_line(summary["pairs"]))
     lines += nim_lines(summary)
     flags = summary["flags"]
     if flags:
@@ -753,6 +758,82 @@ def mupix_xy_figure(summary: dict, store: HistStore, title: str):
     return fig
 
 
+def mupix_pairs_line(pr: dict) -> str:
+    """One line on the unseeded MuPix pairs: paired fraction, partners, classes, window, stage."""
+    if not pr.get("enabled"):
+        return f"MuPix pairs: off ({pr.get('off_reason') or 'MuPix/Pairs/enable = n'})"
+    c, st = pr["cuts"], pr["stage"]
+    return (f"MuPix pairs (unseeded, nearest L2 pixel within +-{pr['window_ns']} ns, raw times): "
+            f"{pr['n_l1']} L1 pixels sampled (at most {pr['max_l1']} a frame), paired "
+            f"{_frac(pr['paired_frac'])}, "
+            + (f"{pr['mean_partners']}" if pr["mean_partners"] is not None else "-")
+            + " L2 candidates per pair; of the "
+            f"{pr['n_pairs']} pairs light (both ToT <= {c['tot_light_max']}) "
+            f"{_frac(pr['light_frac'])}, heavy (both ToT >= {c['tot_heavy_min']}) "
+            f"{_frac(pr['heavy_frac'])}; stage x {st['x_mm']}, y {st['y_mm']} mm ({st['source']}"
+            + (f", shift {st['shift_mm'][0]:+g}, {st['shift_mm'][1]:+g} mm" if st["applied"]
+               else ", not applied") + "). Entries are pixel pairs, not particles.")
+
+
+def mupix_pairs_figure(summary: dict, store: HistStore, title: str):
+    """The unseeded MuPix pairs page: dt, partners, pairs all / light / heavy; None when off."""
+    pr = summary.get("pairs") or {}
+    if not pr.get("enabled") or store.get("sma/mupix_pair_xy") is None:
+        return None
+    from matplotlib.backends.backend_agg import FigureCanvasAgg
+    from matplotlib.figure import Figure
+
+    text = textwrap.wrap(mupix_pairs_line(pr), width=125, subsequent_indent="    ")
+    line_in = TEXT_PT * 1.2 / 72
+    plots_in, gap_in, top_in, bottom_in = 13.0, 0.8, 0.75, 0.3
+    text_in = (len(text) + 1.5) * line_in
+    height = top_in + plots_in + gap_in + text_in + bottom_in
+    fig = Figure(figsize=(11, height), dpi=100)
+    FigureCanvasAgg(fig)
+    gs = fig.add_gridspec(4, 3, hspace=0.55, wspace=0.5, left=0.07, right=0.93,
+                          top=1 - top_in / height,
+                          bottom=(bottom_in + text_in + gap_in) / height)
+    fig.suptitle(title + "  -  MuPix L1-L2 pairs, unseeded (+x beam-left)", fontsize=13)
+
+    def get(name):
+        return store.get(f"sma/{name}")
+
+    w = pr["window_ns"]
+    hd = get("mupix_pair_dt")
+    ax = fig.add_subplot(gs[0, 0:2])
+    _step(ax, hd, color=COLORS[0])
+    for x in (-w, w):
+        ax.axvline(x, color=COLORS[3], ls="--", lw=1)
+    ax.set_xlabel("t(L2) - t(L1) (ns)", fontsize=8)
+    ax.set_ylabel("L2 candidates", fontsize=8)
+    ax.tick_params(labelsize=7)
+    ax.set_title(f"L2 - L1 time, every L2 pixel within +-100 ns; window +-{w} ns dashed "
+                 f"({hd.entries})", fontsize=9)
+    hn = get("mupix_pair_partners")
+    ax = fig.add_subplot(gs[0, 2])
+    _step(ax, hn, color=COLORS[0])
+    ax.set_xlabel("L2 pixels in the window", fontsize=8)
+    ax.set_ylabel("L1 pixels", fontsize=8)
+    ax.tick_params(labelsize=7)
+    ax.set_title(f"Partners per L1 pixel ({hn.entries})", fontsize=9)
+    c = pr["cuts"]
+    rows = (("", "all pairs"), ("_light", f"light, ToT <= {c['tot_light_max']}"),
+            ("_heavy", f"heavy, ToT >= {c['tot_heavy_min']}"))
+    for r, (suf, what) in enumerate(rows, start=1):
+        _map(fig, fig.add_subplot(gs[r, 0]), get(f"mupix_pair_xy{suf}"), f"L1 y / x, {what}",
+             "x (mm)", "y (mm)")
+        _map(fig, fig.add_subplot(gs[r, 1]), get(f"mupix_pair_xxp{suf}"), f"x' / x, {what}",
+             "x (mm)", "x' (mrad)")
+        _map(fig, fig.add_subplot(gs[r, 2]), get(f"mupix_pair_yyp{suf}"), f"y' / y, {what}",
+             "y (mm)", "y' (mrad)")
+    y0 = (bottom_in + text_in) / height
+    fig.text(0.07, y0, "Unseeded L1-L2 pixel pairs (the nearline monitor's rule)", va="top",
+             ha="left", fontsize=10, weight="bold")
+    fig.text(0.07, y0 - 1.5 * line_in / height, "\n".join(text), va="top", ha="left",
+             fontsize=TEXT_PT, family="monospace")
+    return fig
+
+
 # ---------------------------------------------------------------------------
 # main
 # ---------------------------------------------------------------------------
@@ -778,7 +859,7 @@ def _parser() -> argparse.ArgumentParser:
                     help="settings over the defaults: inline JSON or a JSON file, same "
                          "tree as /DQM/SMA, e.g. '{\"Cuts\": {\"coinc window ns\": 30}}'")
     ap.add_argument("--no-png", action="store_true",
-                    help="skip summary.png, nim.png and mupix_xy.png")
+                    help="skip summary.png, nim.png, mupix_xy.png and mupix_pairs.png")
     ap.add_argument("--stage", type=float, nargs=2, default=None, metavar=("X", "Y"),
                     help="the XY table's position in mm (/Equipment/XYTable/Variables/Measured) "
                          "for MuPix x/y; default: from the file's begin-of-run ODB, else 0 0. "
@@ -1014,6 +1095,9 @@ def main(argv=None) -> int:
             xfig = mupix_xy_figure(summary, plugin.store, title)
             if xfig is not None:
                 xfig.savefig(out / "mupix_xy.png")
+            pfig = mupix_pairs_figure(summary, plugin.store, title)
+            if pfig is not None:
+                pfig.savefig(out / "mupix_pairs.png")
         except ImportError:
             print("mdqm-sma-file: matplotlib not installed, no summary.png "
                   "(pip install 'mdqm[offline]', or pass --no-png)", file=sys.stderr)
@@ -1027,7 +1111,8 @@ def main(argv=None) -> int:
         print(f"wrote {out}/: hists.npz, summary.json, trend.json"
               + (", summary.png" if png else "")
               + (", nim.png" if png and (out / "nim.png").exists() else "")
-              + (", mupix_xy.png" if png and (out / "mupix_xy.png").exists() else ""))
+              + (", mupix_xy.png" if png and (out / "mupix_xy.png").exists() else "")
+              + (", mupix_pairs.png" if png and (out / "mupix_pairs.png").exists() else ""))
     errors = [f for f in summary["flags"] if f["severity"] == "error"]
     return EXIT_ERROR_FLAG if errors else EXIT_OK
 

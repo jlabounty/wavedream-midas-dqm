@@ -127,3 +127,35 @@ def test_js_defaults_match_python_defaults():
             assert float(got) == pytest.approx(want), key
         else:
             assert got == want, key
+
+
+@pytest.mark.parametrize("prefix", ["", "WD"])
+def test_no_menu_key_is_a_substring_of_another(prefix):
+    """mhttpd's sidenav highlights item when current_page.search(item) hits.
+
+    The key is an unescaped regex there, and with no metacharacters (check_key)
+    that is a substring test, tried with the key and with its lower case. A
+    menu key inside another lights both entries up on the longer one's page
+    (the old "SMA" did on SMAEvents). The prefix is what pinky registers with.
+    """
+    keys = [prefix + e.key for e in ENTRIES if e.menu]
+    for a in keys:
+        for b in keys:
+            if a == b:
+                continue
+            assert a not in b and a.lower() not in b, (
+                f"menu key {a!r} is inside {b!r}: mhttpd would highlight both on {b!r}")
+
+
+def test_the_mupix_page_is_in_the_menu():
+    entry = next((e for e in ENTRIES if e.key == "MuPixPlots"), None)
+    assert entry is not None, "the MuPix page has its own sidenav entry"
+    assert entry.menu and entry.path == "mupix.html"
+    assert "SMA analyzer" in entry.summary
+    # It is the SMAPlots page's script in its MuPix view, with the same assets.
+    html = (REPO / "pages" / "mupix.html").read_text()
+    sma = (REPO / "pages" / "sma.html").read_text()
+    assert 'data-view="mupix"' in html
+    import re
+    assets = re.compile(r'(?:src|href)="(dqm[^"]+)"')
+    assert assets.findall(html) == assets.findall(sma), "same scripts and ?v= strings as sma.html"

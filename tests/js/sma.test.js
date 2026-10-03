@@ -144,7 +144,7 @@ test("the flags are listed worst first", async () => {
 
 test("no shift banner when the shift fits", async () => {
   const page = await boot();
-  assert.strictEqual(byId(page, "dqm-sma-shift-banner"), null);
+  assert.ok(byId(page, "dqm-sma-shift-banner") === null, "no dqm-sma-shift-banner");
   assert.ok(/shift 14: ok/.test(byId(page, "dqm-sma-status").textContent));
 });
 
@@ -172,7 +172,7 @@ test("a broken time base gets the same banner, and a suspect-frame chip", async 
   const flag = FX.summary_timebase.flags.find((f) => f.code === "time_base");
   assert.ok(banner.textContent.includes(flag.text), banner.textContent);
   assert.ok(!byId(page, "dqm-sma-flags").textContent.includes(flag.text), "not repeated below");
-  assert.strictEqual(byId(page, "dqm-sma-shift-banner"), null, "the shift check has no verdict");
+  assert.ok(byId(page, "dqm-sma-shift-banner") === null, "the shift check has no verdict");
   const status = byId(page, "dqm-sma-status").textContent;
   assert.ok(new RegExp(`${FX.summary_timebase.frames.suspect} suspect time base`).test(status), status);
 });
@@ -211,7 +211,7 @@ test("only the visible tab is polled", async () => {
 
 test("the tab strip is a tablist: aria-selected follows the tab, arrows move it", async () => {
   const page = await boot();
-  const ids = ["health", "tot", "timing", "rf", "mupixxy", "mupix", "nim", "trends"];
+  const ids = ["health", "tot", "timing", "rf", "mupixxy", "mupixpair", "mupix", "nim", "trends"];
   const tab = (id) => byId(page, `dqm-sma-tab-${id}`);
   const strip = tab("health").parent;
   assert.strictEqual(strip.getAttribute("role"), "tablist");
@@ -240,7 +240,10 @@ test("the tab strip is a tablist: aria-selected follows the tab, arrows move it"
     return prevented; };
   assert.ok(key("ArrowRight"));
   assert.deepStrictEqual(selected(), ["mupixxy"], "MuPix phase space follows RF");
-  assert.strictEqual(El.focused, tab("mupixxy"), "the new tab has the focus");
+  assert.ok(El.focused === tab("mupixxy"), "the new tab has the focus");
+  key("ArrowRight");
+  assert.deepStrictEqual(selected(), ["mupixpair"], "then MuPix pairs");
+  assert.ok(El.focused === tab("mupixpair"), "MuPix pairs has the focus");
   key("ArrowRight");
   assert.deepStrictEqual(selected(), ["mupix"], "then MuPix diagnostics");
   key("ArrowRight");
@@ -462,11 +465,11 @@ test("the table and banner are updated in place, so a tooltip or a click survive
   const td = byId(page, "dqm-sma-table").find((e) => e.attrs && e.attrs["data-ch"] === "1").byTag("td")[3];
   const text = banner.textContent, rate = td.textContent;
   await settle(page, 3);
-  assert.strictEqual(byId(page, "dqm-sma-shift-banner"), banner, "same banner element");
+  assert.ok(byId(page, "dqm-sma-shift-banner") === banner, "same banner element");
   assert.notStrictEqual(banner.textContent, text, "with new text");
   assert.strictEqual(banner.getAttribute("role"), "alert");
   const td2 = byId(page, "dqm-sma-table").find((e) => e.attrs && e.attrs["data-ch"] === "1").byTag("td")[3];
-  assert.strictEqual(td2, td, "same cell element");
+  assert.ok(td2 === td, "same cell element");
   assert.notStrictEqual(td2.textContent, rate);
 });
 
@@ -523,7 +526,8 @@ test("graphs are reused across epochs when the histograms are the same", async (
   for (epoch = 1; epoch <= 5; epoch++) await settle(page, 1);
   assert.strictEqual(made, before, "no new MPlotGraph for a run change");
   const after = byId(page, "dqm-sma-grid-health").byClass("dqm-plot").map((d) => d.mpg);
-  assert.deepStrictEqual(after, graphs);
+  assert.strictEqual(after.length, graphs.length, "as many graphs as before");
+  after.forEach((g, i) => assert.ok(g === graphs[i], `graph ${i} is the same object`));
   assert.ok(page.an.calls.filter((c) => c.cmd === "dqm::list").length >= 2, "but it did relist");
 });
 
@@ -826,10 +830,10 @@ test("MuPix phase space: the x/y plots alone, in rows, in their order; the rest 
   const inRow = (r) => r.byClass("dqm-histtitle").map((t) => /\[(\w+)\]$/.exec(t.textContent)[1]);
   assert.deepStrictEqual(inRow(rows[2]), ["mupix_track_xxp", "mupix_track_xxp_light", "mupix_track_xxp_heavy"]);
   const tot = grid.byClass("dqm-sma-plotwrap").find((w) => /\[mupix_track_tot\]$/.test(w.children[0].textContent));
-  assert.strictEqual(tot.parent, grid, "the ToT map is not in a row");
+  assert.ok(tot.parent === grid, "the ToT map is not in a row");
   assert.ok(tot.classList.contains("dqm-sma-square"));
   // The note heads the tab.
-  assert.strictEqual(grid.children[0], byId(page, "dqm-sma-xyhead"));
+  assert.ok(grid.children[0] === byId(page, "dqm-sma-xyhead"), "the x/y note heads the tab");
 });
 
 test("MuPix x/y track maps are linear z by default, the hit maps follow the toolbar", async () => {
@@ -924,7 +928,10 @@ test("the MuPix x/y note: XY off says so, and the note stays on the tab", async 
   assert.strictEqual(byId(page, "dqm-sma-xynote").byClass("dqm-sma-xy-warn").length, 0, "a choice, not a fault");
   const grid = mupixGrid(page);
   assert.strictEqual(grid.byClass("dqm-sma-row").length, 0);
-  assert.deepStrictEqual(grid.children, [byId(page, "dqm-sma-xyhead")], "the note alone, no 'no histograms' line");
+  // Identity, not deepStrictEqual on stub DOM nodes (a failing deep diff of the
+  // cyclic graph allocates without bound).
+  assert.strictEqual(grid.children.length, 1, "the note alone, no 'no histograms' line");
+  assert.ok(grid.children[0] === byId(page, "dqm-sma-xyhead"), "the note alone");
 });
 
 test("the MuPix x/y note: no S1 hits judged yet gives dashes, not NaN", async () => {
@@ -1204,4 +1211,264 @@ test("the trends tab has the TOT + NIM pair efficiency per counter", async () =>
   await settle(old);
   assert.ok(!byId(old, "dqm-sma-grid-trends").byClass("dqm-histtitle")
     .some((t) => /pair efficiency/.test(t.textContent)));
+});
+
+// -- MuPix pairs (unseeded) and the MuPix page ------------------------------------------
+//
+// Hand-built summary.pairs blocks and pair histograms, so each test pins the
+// numbers it checks and does not follow the plugin's defaults or the fixture:
+// the 2D maps are drawn from a fixture 2D histogram, dt / partners from a 1D one.
+
+const PAIR_ORDER = ["mupix_pair_xy", "mupix_pair_xy_light", "mupix_pair_xy_heavy",
+  "mupix_pair_xxp", "mupix_pair_xxp_light", "mupix_pair_xxp_heavy",
+  "mupix_pair_yyp", "mupix_pair_yyp_light", "mupix_pair_yyp_heavy",
+  "mupix_pair_dt", "mupix_pair_partners"];
+const PAIR_2D = PAIR_ORDER.filter((n) => !/_(dt|partners)$/.test(n));
+
+function pairsSummary(pairs) {
+  const s = clone(FX.summary);
+  s.pairs = Object.assign({
+    enabled: true, n_l1: 41234, paired_frac: 0.6321, mean_partners: 1.4166,
+    light_frac: 0.401, heavy_frac: 0.1203, window_ns: 40, max_l1: 2000,
+    cuts: clone(FX.summary.xy.cuts),
+    stage: { x_mm: 1.5, y_mm: -2, source: "odb", applied: true, shift_mm: [-1.5, -2], note: null },
+    off_reason: null,
+  }, pairs || {});
+  return s;
+}
+
+/** The analyzer with the pair histograms listed (names shuffled: the page orders them). */
+function pairsOver(summary, extra) {
+  // A Set: the fixture's list already has the pair maps once the plugin books them.
+  const names = [...new Set(FX.hist_names.concat(PAIR_ORDER.slice().reverse().map((n) => `sma/${n}`)))].sort();
+  return Object.assign({
+    "sma::summary": () => json(summary || pairsSummary()),
+    "dqm::list": () => envelope("list", new TextEncoder().encode(names.join("\n"))),
+    "dqm::histogram": (name) => {
+      const two = PAIR_2D.includes(name.slice(4)) || FX.hist_dims[name] === 2;
+      const hex = FX.hists[name] || (two ? FX.hists["sma/tot_vs_ch_lsb0"] : FX.hists["sma/words_per_ch"]);
+      return envelope("hist", Buffer.from(hex, "hex"));
+    },
+  }, extra || {});
+}
+
+async function pairsTab(summary, stored) {
+  const page = await boot(pairsOver(summary), stored);
+  byId(page, "dqm-sma-tab-mupixpair").onclick();
+  await settle(page);
+  return page;
+}
+const pairNote = (page) => byId(page, "dqm-sma-pairnote").textContent;
+const pairGrid = (page) => byId(page, "dqm-sma-grid-mupixpair");
+const titleNames = (g) => g.byClass("dqm-histtitle").map((t) => /\[(\w+)\]$/.exec(t.textContent)[1]);
+
+test("MuPix pairs: its own tab between phase space and diagnostics, short label on a phone", async () => {
+  const page = await pairsTab();
+  const t = byId(page, "dqm-sma-tab-mupixpair");
+  assert.strictEqual(t.byClass("dqm-sma-tabfull")[0].textContent, "MuPix pairs (unseeded)");
+  assert.strictEqual(t.byClass("dqm-sma-tabshort")[0].textContent, "MuPix pairs");
+  const strip = t.parent.children.map((b) => b.id.replace("dqm-sma-tab-", ""));
+  assert.deepStrictEqual(strip.slice(strip.indexOf("mupixxy"), strip.indexOf("mupix") + 1),
+                         ["mupixxy", "mupixpair", "mupix"]);
+});
+
+test("MuPix pairs: the pair plots alone, all / light / heavy rows, then dt and partners", async () => {
+  const page = await pairsTab();
+  const grid = pairGrid(page);
+  assert.deepStrictEqual(titleNames(grid), PAIR_ORDER);
+  assert.ok(grid.children[0] === byId(page, "dqm-sma-pairhead"), "the note heads the tab");
+  const rows = grid.byClass("dqm-sma-row");
+  assert.deepStrictEqual(rows.map((r) => r.attrs["data-row"]), ["pairxy", "pairxxp", "pairyyp"]);
+  assert.ok(rows.every((r) => r.className === "dqm-sma-row dqm-sma-row3"));
+  assert.deepStrictEqual(titleNames(rows[1]), ["mupix_pair_xxp", "mupix_pair_xxp_light", "mupix_pair_xxp_heavy"]);
+  for (const n of ["mupix_pair_dt", "mupix_pair_partners"]) {
+    const w = grid.byClass("dqm-sma-plotwrap").find((x) => new RegExp(`\\[${n}\\]$`).test(x.children[0].textContent));
+    assert.ok(w.parent === grid, `${n} is not in a row`);
+  }
+  assert.ok(histCalls(page).filter((n) => /mupix_/.test(n)).every((n) => PAIR_ORDER.includes(n.slice(4))),
+            "only the pair histograms are asked for");
+  // Neither phase space nor diagnostics takes a pair plot.
+  for (const tab of ["mupixxy", "mupix"]) {
+    byId(page, `dqm-sma-tab-${tab}`).onclick();
+    await settle(page);
+    const names = titleNames(byId(page, `dqm-sma-grid-${tab}`));
+    assert.ok(names.length > 0 && !names.some((n) => /^mupix_pair_/.test(n)), `${tab}: ${names.join(" ")}`);
+  }
+});
+
+test("MuPix pairs: maps linear z by default with their own switch; dt shows the window", async () => {
+  const page = await pairsTab();
+  const plot = (n) => pairGrid(page).byClass("dqm-sma-plotwrap")
+    .find((w) => new RegExp(`\\[${n}\\]$`).test(w.children[0].textContent)).children[1];
+  for (const n of PAIR_2D) assert.strictEqual(plot(n).heatmap.logZ, false, n);
+  const dt = plot("mupix_pair_dt").mpg;
+  assert.deepStrictEqual(dt.param.plot.map((q) => q.label), ["mupix_pair_dt", "pairing window"]);
+  assert.deepStrictEqual(dt.data[1].x, [-40, -40, 40, 40], "±window_ns outlined");
+  assert.ok(dt.data[1].y[1] >= Math.max(...dt.data[0].y));
+  const box = byId(page, "dqm-sma-pairlogz");
+  assert.strictEqual(box.checked, false);
+  box.checked = true;
+  box.onchange.call(box);
+  await settle(page);
+  assert.strictEqual(plot("mupix_pair_xy_heavy").heatmap.logZ, true);
+  const stored = JSON.parse(globalThis.localStorage._d["dqm-sma-settings"]);
+  assert.strictEqual(stored.pairLogZ, true, "remembered");
+  assert.strictEqual(stored.xyLogZ, false, "the phase-space switch is a separate one");
+});
+
+test("the MuPix pairs note: fraction, partners, window, cap, cuts, stage, the pixel-pair hint", async () => {
+  const page = await pairsTab();
+  const t = pairNote(page);
+  const c = FX.summary.xy.cuts;
+  assert.strictEqual(t, "MuPix pairs: 63.2 % of 41,234 L1 pixels paired · mean partners 1.42 · " +
+    "window ±40 ns · at most 2,000 L1 pixels per frame · light 40.1 %, heavy 12.0 % of the pairs " +
+    `(light: both pixels' ToT ≤ ${c.tot_light_max} (×${c.tot_ns} ns) · heavy: ≥ ${c.tot_heavy_min}) · ` +
+    "stage shift x −1.50, y −2.00 mm (XY table) · pixel pairs, not particles");
+  const hint = byId(page, "dqm-sma-pairnote").byClass("dqm-sma-xy-muted")[0];
+  assert.strictEqual(hint.textContent, "pixel pairs, not particles");
+  assert.ok(/several pairs/.test(hint.getAttribute("title")), hint.getAttribute("title"));
+  assert.strictEqual(byId(page, "dqm-sma-pairnote").byClass("dqm-sma-xy-warn").length, 0);
+});
+
+test("the MuPix pairs note: off says why; a fault is a warning, a choice is not", async () => {
+  let page = await pairsTab(pairsSummary({ enabled: false, off_reason: "MuPix/Pairs/enable = n" }));
+  assert.strictEqual(pairNote(page), "MuPix pairs: pairs off: MuPix/Pairs/enable = n");
+  assert.strictEqual(byId(page, "dqm-sma-pairnote").byClass("dqm-sma-xy-warn").length, 0);
+  page = await pairsTab(pairsSummary({ enabled: false, off_reason: "XY off: L1 chips: chip 3 is listed twice" }));
+  assert.strictEqual(pairNote(page), "MuPix pairs: pairs off: XY off: L1 chips: chip 3 is listed twice");
+  assert.strictEqual(byId(page, "dqm-sma-pairnote").byClass("dqm-sma-xy-warn").length, 1);
+  // Off and no pair histograms: the note alone, no "no histograms" line.
+  // Pairs off books no mupix_pair_* histograms, so the list must not offer them
+  // (the regenerated fixture's list has them: the plugin's defaults book them).
+  const s = pairsSummary({ enabled: false, off_reason: "MuPix/Pairs/enable = n" });
+  const names = FX.hist_names.filter((n) => !n.startsWith("sma/mupix_pair_"));
+  page = await boot({ "sma::summary": () => json(s),
+    "dqm::list": () => envelope("list", new TextEncoder().encode(names.join("\n"))) });
+  byId(page, "dqm-sma-tab-mupixpair").onclick();
+  await settle(page);
+  // Compare by identity, not deepStrictEqual on stub DOM nodes: a failing deep
+  // diff of that cyclic graph allocates without bound and takes the runner down.
+  const kids = pairGrid(page).children;
+  assert.strictEqual(kids.length, 1, `children: ${kids.map((k) => k.id || k.className).join(", ")}`);
+  assert.ok(kids[0] === byId(page, "dqm-sma-pairhead"), "only the note row");
+});
+
+test("the MuPix pairs note: nothing sampled yet gives dashes; no pairs block says so", async () => {
+  const page = await pairsTab(pairsSummary({ n_l1: 0, paired_frac: null, mean_partners: null,
+    light_frac: null, heavy_frac: null,
+    stage: { x_mm: 0, y_mm: 0, source: "none", applied: true, shift_mm: [0, 0], note: "no reading" } }));
+  const t = pairNote(page);
+  assert.ok(t.startsWith("MuPix pairs: — of 0 L1 pixels paired · mean partners — · window ±40 ns"), t);
+  assert.ok(t.includes("light —, heavy — of the pairs"), t);
+  assert.ok(t.includes("stage: no reading yet, (0, 0) mm used"), t);
+  assert.ok(!/NaN|undefined|null/.test(t), t);
+  assert.ok(!/reset/.test(t), t);
+  const reset = await pairsTab(pairsSummary({ resets: 3 }));
+  assert.ok(pairNote(reset).includes("· maps reset 3× by Pairs or ToT-cut edits · pixel pairs"), pairNote(reset));
+  const old = clone(FX.summary);
+  delete old.pairs;
+  const p2 = await pairsTab(old);
+  assert.strictEqual(pairNote(p2), "MuPix pairs: no pairs summary from the analyzer");
+});
+
+// -- the MuPix page (mupix.html: <body data-view="mupix">) ----------------------------------
+
+async function bootMupixPage(over, store, params) {
+  globalThis.__alerts = [];
+  globalThis.localStorage = {
+    _d: Object.assign({}, store || {}),
+    getItem(k) { return this._d[k] || null; }, setItem(k, v) { this._d[k] = v; },
+  };
+  const an = analyzer(over);
+  const page = runPage(SMA, { brpc: an.brpc }, { params: params || {} });
+  page.doc.body.setAttribute("data-view", "mupix");
+  globalThis.dlgConfirm = (text, cb) => cb(true);
+  await page.load();
+  await settle(page);
+  page.an = an;
+  return page;
+}
+const tabIds = (page) => byId(page, "dqm-sma-tab-mupixxy").parent.children.map((b) => b.id.replace("dqm-sma-tab-", ""));
+
+test("the MuPix page: only the three MuPix tabs, phase space first, no per-channel table", async () => {
+  const page = await bootMupixPage(pairsOver());
+  assert.deepStrictEqual(tabIds(page), ["mupixxy", "mupixpair", "mupix"]);
+  assert.strictEqual(byId(page, "dqm-sma-tab-mupixxy").getAttribute("aria-selected"), "true", "default tab");
+  for (const gone of ["health", "nim", "trends"]) {
+    assert.ok(byId(page, `dqm-sma-pane-${gone}`) === null, gone);
+  }
+  assert.ok(byId(page, "dqm-sma-table") === null, "no dqm-sma-table");
+  assert.ok(byId(page, "dqm-sma-status").textContent.includes("sma_analyzer connected"), "status chips kept");
+  assert.ok(byId(page, "dqm-sma-toolbar"), "the toolbar too");
+  assert.ok(page.calls.some((c) => c.method === "mhttpd_init" && c.params[0] === "MuPixPlots"));
+  assert.ok(histCalls(page).length > 0 && histCalls(page).every((n) => /^sma\/mupix_/.test(n)),
+            "only MuPix histograms are polled");
+  // The keyboard wraps within the page's tabs.
+  const strip = byId(page, "dqm-sma-tab-mupixxy").parent;
+  strip.dispatch("keydown", { key: "ArrowLeft", preventDefault() {} });
+  assert.strictEqual(byId(page, "dqm-sma-tab-mupix").getAttribute("aria-selected"), "true");
+  assert.deepStrictEqual(globalThis.__alerts, []);
+});
+
+test("the MuPix page remembers its tab under its own key, apart from SMAPlots", async () => {
+  const sma = JSON.stringify({ tab: "nim", logY: true });
+  let page = await bootMupixPage(pairsOver(), { "dqm-sma-settings": sma });
+  assert.strictEqual(byId(page, "dqm-sma-tab-mupixxy").getAttribute("aria-selected"), "true",
+                     "SMAPlots' remembered tab is not this page's");
+  assert.strictEqual(byId(page, "dqm-sma-logy").checked, false, "nor its scales");
+  byId(page, "dqm-sma-tab-mupixpair").onclick();
+  await settle(page);
+  assert.strictEqual(globalThis.localStorage._d["dqm-sma-settings"], sma, "SMAPlots' settings untouched");
+  const mine = JSON.parse(globalThis.localStorage._d["dqm-sma-mupix-settings"]);
+  assert.strictEqual(mine.tab, "mupixpair");
+  page = await bootMupixPage(pairsOver(), { "dqm-sma-mupix-settings": JSON.stringify(mine) });
+  assert.strictEqual(byId(page, "dqm-sma-tab-mupixpair").getAttribute("aria-selected"), "true");
+  // A tab this page does not have falls back to its first.
+  page = await bootMupixPage(pairsOver(), { "dqm-sma-mupix-settings": JSON.stringify({ tab: "health" }) });
+  assert.strictEqual(byId(page, "dqm-sma-tab-mupixxy").getAttribute("aria-selected"), "true");
+  // And SMAPlots keeps its own key.
+  const p2 = await boot(undefined, { tab: "rf" });
+  assert.strictEqual(byId(p2, "dqm-sma-tab-rf").getAttribute("aria-selected"), "true");
+});
+
+test("the MuPix page lists the MuPix flags, counts the rest, and keeps the banners", async () => {
+  // Hand-built flags: the count must not follow the fixture's.
+  const OTHER = [{ severity: "error", code: "mismatch", ch: 5, text: "S5 (ch 5): 93% fine/coarse inconsistent" },
+                 { severity: "warn", code: "stale_frames", text: "3 stale frames" }];
+  const BANNER = { severity: "error", code: "time_base", text: "made-up time base fault" };
+  const MUPIX = [{ severity: "warn", code: "mupix_sync", text: "MuPix lost sync with the SMA" },
+                 { severity: "warn", code: "settings", text: "MuPix/XY: L1 chips: chip 3 is listed twice" }];
+  const withFlags = (flags) => { const s = clone(FX.summary); s.flags = flags; return s; };
+  const s = withFlags([OTHER[0], MUPIX[0], BANNER, OTHER[1], MUPIX[1]]);
+  let page = await bootMupixPage({ "sma::summary": () => json(s) });
+  const flags = byId(page, "dqm-sma-flags").byClass("dqm-sma-flag");
+  assert.deepStrictEqual(flags.map((f) => f.attrs["data-code"]), ["mupix_sync", "settings"]);
+  assert.ok(byId(page, "dqm-sma-timebase-banner"), "the banner is shown, and not counted below");
+  const go = flags[0].byTag("button")[0];
+  assert.strictEqual(go.textContent, "MuPix diagnostics tab ›");
+  go.onclick();
+  await settle(page);
+  assert.strictEqual(byId(page, "dqm-sma-tab-mupix").getAttribute("aria-selected"), "true");
+  assert.strictEqual(byId(page, "dqm-sma-flags").byClass("dqm-sma-flagsmore")[0].textContent,
+                     "2 other flags on the SMA plots page.");
+  // No MuPix flag: said so, with the count of the others (one: singular).
+  page = await bootMupixPage({ "sma::summary": () => json(withFlags([OTHER[0], BANNER, OTHER[1]])) });
+  assert.strictEqual(byId(page, "dqm-sma-flags").textContent,
+                     "No MuPix flags. 2 other flags on the SMA plots page.");
+  page = await bootMupixPage({ "sma::summary": () => json(withFlags([OTHER[1]])) });
+  assert.strictEqual(byId(page, "dqm-sma-flags").textContent,
+                     "No MuPix flags. 1 other flag on the SMA plots page.");
+  page = await bootMupixPage({ "sma::summary": () => json(withFlags([])) });
+  assert.strictEqual(byId(page, "dqm-sma-flags").textContent, "No MuPix flags.");
+  // A coarse-shift mismatch spoils the S1-seeded maps too: the banner stays.
+  page = await bootMupixPage({ "sma::summary": () => json(FX.summary_shift13) });
+  assert.ok(byId(page, "dqm-sma-shift-banner"));
+});
+
+test("SMAPlots lists every flag, links them as before, and has no other-flags line", async () => {
+  const page = await boot({ "sma::summary": () => json(FX.summary_mupix_sync) });
+  const flag = byId(page, "dqm-sma-flags").byClass("dqm-sma-flag").find((f) => f.attrs["data-code"] === "mupix_sync");
+  assert.strictEqual(flag.byTag("button")[0].textContent, "MuPix diagnostics tab ›");
+  assert.strictEqual(byId(page, "dqm-sma-flags").byClass("dqm-sma-flagsmore").length, 0,
+                     "SMAPlots lists every flag");
 });

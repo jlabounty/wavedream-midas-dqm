@@ -534,6 +534,36 @@
    },
    "unplaced_chips": []
   },
+  "pairs": {
+   "enabled": true,
+   "off_reason": null,
+   "resets": 0,
+   "n_l1": 8615,
+   "n_pairs": 2638,
+   "paired_frac": 0.3062,
+   "mean_partners": 1.278,
+   "light_frac": 0.4318,
+   "heavy_frac": 0.1539,
+   "window_ns": 64,
+   "max_l1": 1000,
+   "cuts": {
+    "tot_light_max": 9,
+    "tot_heavy_min": 13,
+    "tot_ns": 256
+   },
+   "stage": {
+    "x_mm": 0.0,
+    "y_mm": 0.0,
+    "source": "none",
+    "applied": true,
+    "shift_mm": [
+     0.0,
+     0.0
+    ],
+    "note": "no stage reading yet: (0, 0) mm used"
+   },
+   "mupix_only_frames": 0
+  },
   "roles": {
    "s1": 1,
    "counters": [
@@ -1115,6 +1145,36 @@
    },
    "unplaced_chips": []
   },
+  "pairs": {
+   "enabled": true,
+   "off_reason": null,
+   "resets": 0,
+   "n_l1": 0,
+   "n_pairs": 0,
+   "paired_frac": null,
+   "mean_partners": null,
+   "light_frac": null,
+   "heavy_frac": null,
+   "window_ns": 64,
+   "max_l1": 1000,
+   "cuts": {
+    "tot_light_max": 9,
+    "tot_heavy_min": 13,
+    "tot_ns": 256
+   },
+   "stage": {
+    "x_mm": 0.0,
+    "y_mm": 0.0,
+    "source": "none",
+    "applied": true,
+    "shift_mm": [
+     0.0,
+     0.0
+    ],
+    "note": "no stage reading yet: (0, 0) mm used"
+   },
+   "mupix_only_frames": 0
+  },
   "roles": {
    "s1": 1,
    "counters": [
@@ -1680,6 +1740,36 @@
     "max_s1": 250
    },
    "unplaced_chips": []
+  },
+  "pairs": {
+   "enabled": true,
+   "off_reason": null,
+   "resets": 0,
+   "n_l1": 0,
+   "n_pairs": 0,
+   "paired_frac": null,
+   "mean_partners": null,
+   "light_frac": null,
+   "heavy_frac": null,
+   "window_ns": 64,
+   "max_l1": 1000,
+   "cuts": {
+    "tot_light_max": 9,
+    "tot_heavy_min": 13,
+    "tot_ns": 256
+   },
+   "stage": {
+    "x_mm": 0.0,
+    "y_mm": 0.0,
+    "source": "none",
+    "applied": true,
+    "shift_mm": [
+     0.0,
+     0.0
+    ],
+    "note": "no stage reading yet: (0, 0) mm used"
+   },
+   "mupix_only_frames": 0
   },
   "roles": {
    "s1": 1,
@@ -2247,6 +2337,36 @@
     "max_s1": 250
    },
    "unplaced_chips": []
+  },
+  "pairs": {
+   "enabled": true,
+   "off_reason": null,
+   "resets": 0,
+   "n_l1": 3743,
+   "n_pairs": 915,
+   "paired_frac": 0.2445,
+   "mean_partners": 1.266,
+   "light_frac": 0.4415,
+   "heavy_frac": 0.1497,
+   "window_ns": 64,
+   "max_l1": 1000,
+   "cuts": {
+    "tot_light_max": 9,
+    "tot_heavy_min": 13,
+    "tot_ns": 256
+   },
+   "stage": {
+    "x_mm": 0.0,
+    "y_mm": 0.0,
+    "source": "none",
+    "applied": true,
+    "shift_mm": [
+     0.0,
+     0.0
+    ],
+    "note": "no stage reading yet: (0, 0) mm used"
+   },
+   "mupix_only_frames": 0
   },
   "roles": {
    "s1": 1,
@@ -2895,6 +3015,36 @@
    },
    "unplaced_chips": []
   },
+  "pairs": {
+   "enabled": true,
+   "off_reason": null,
+   "resets": 0,
+   "n_l1": 4230,
+   "n_pairs": 1263,
+   "paired_frac": 0.2986,
+   "mean_partners": 1.273,
+   "light_frac": 0.4323,
+   "heavy_frac": 0.1544,
+   "window_ns": 64,
+   "max_l1": 1000,
+   "cuts": {
+    "tot_light_max": 9,
+    "tot_heavy_min": 13,
+    "tot_ns": 256
+   },
+   "stage": {
+    "x_mm": 0.0,
+    "y_mm": 0.0,
+    "source": "none",
+    "applied": true,
+    "shift_mm": [
+     0.0,
+     0.0
+    ],
+    "note": "no stage reading yet: (0, 0) mm used"
+   },
+   "mupix_only_frames": 0
+  },
   "roles": {
    "s1": 1,
    "counters": [
@@ -3534,6 +3684,36 @@
    },
    "unplaced_chips": []
   },
+  "pairs": {
+   "enabled": true,
+   "off_reason": null,
+   "resets": 0,
+   "n_l1": 3913,
+   "n_pairs": 1040,
+   "paired_frac": 0.2658,
+   "mean_partners": 1.257,
+   "light_frac": 0.4356,
+   "heavy_frac": 0.1538,
+   "window_ns": 64,
+   "max_l1": 1000,
+   "cuts": {
+    "tot_light_max": 9,
+    "tot_heavy_min": 13,
+    "tot_ns": 256
+   },
+   "stage": {
+    "x_mm": 0.0,
+    "y_mm": 0.0,
+    "source": "none",
+    "applied": true,
+    "shift_mm": [
+     0.0,
+     0.0
+    ],
+    "note": "no stage reading yet: (0, 0) mm used"
+   },
+   "mupix_only_frames": 0
+  },
   "roles": {
    "s1": 1,
    "counters": [
@@ -4120,6 +4300,17 @@
   "sma/mupix_hits_chip",
   "sma/mupix_hits_xy_L1",
   "sma/mupix_hits_xy_L2",
+  "sma/mupix_pair_dt",
+  "sma/mupix_pair_partners",
+  "sma/mupix_pair_xxp",
+  "sma/mupix_pair_xxp_heavy",
+  "sma/mupix_pair_xxp_light",
+  "sma/mupix_pair_xy",
+  "sma/mupix_pair_xy_heavy",
+  "sma/mupix_pair_xy_light",
+  "sma/mupix_pair_yyp",
+  "sma/mupix_pair_yyp_heavy",
+  "sma/mupix_pair_yyp_light",
   "sma/mupix_row_chip",
   "sma/mupix_s1_match",
   "sma/mupix_tot_L1",
@@ -4188,6 +4379,17 @@
   "sma/mupix_hits_chip": 2,
   "sma/mupix_hits_xy_L1": 2,
   "sma/mupix_hits_xy_L2": 2,
+  "sma/mupix_pair_dt": 1,
+  "sma/mupix_pair_partners": 1,
+  "sma/mupix_pair_xxp": 2,
+  "sma/mupix_pair_xxp_heavy": 2,
+  "sma/mupix_pair_xxp_light": 2,
+  "sma/mupix_pair_xy": 2,
+  "sma/mupix_pair_xy_heavy": 2,
+  "sma/mupix_pair_xy_light": 2,
+  "sma/mupix_pair_yyp": 2,
+  "sma/mupix_pair_yyp_heavy": 2,
+  "sma/mupix_pair_yyp_light": 2,
   "sma/mupix_row_chip": 2,
   "sma/mupix_s1_match": 1,
   "sma/mupix_tot_L1": 1,
@@ -4775,6 +4977,36 @@
    },
    "unplaced_chips": []
   },
+  "pairs": {
+   "enabled": true,
+   "off_reason": null,
+   "resets": 0,
+   "n_l1": 4385,
+   "n_pairs": 1375,
+   "paired_frac": 0.3136,
+   "mean_partners": 1.282,
+   "light_frac": 0.4313,
+   "heavy_frac": 0.1535,
+   "window_ns": 64,
+   "max_l1": 1000,
+   "cuts": {
+    "tot_light_max": 9,
+    "tot_heavy_min": 13,
+    "tot_ns": 256
+   },
+   "stage": {
+    "x_mm": 0.0,
+    "y_mm": 0.0,
+    "source": "none",
+    "applied": true,
+    "shift_mm": [
+     0.0,
+     0.0
+    ],
+    "note": "no stage reading yet: (0, 0) mm used"
+   },
+   "mupix_only_frames": 0
+  },
   "roles": {
    "s1": 1,
    "counters": [
@@ -5355,6 +5587,36 @@
    },
    "unplaced_chips": []
   },
+  "pairs": {
+   "enabled": true,
+   "off_reason": null,
+   "resets": 0,
+   "n_l1": 3000,
+   "n_pairs": 2553,
+   "paired_frac": 0.851,
+   "mean_partners": 1.087,
+   "light_frac": 0.4101,
+   "heavy_frac": 0.0564,
+   "window_ns": 64,
+   "max_l1": 1000,
+   "cuts": {
+    "tot_light_max": 9,
+    "tot_heavy_min": 13,
+    "tot_ns": 256
+   },
+   "stage": {
+    "x_mm": 0.0,
+    "y_mm": 0.0,
+    "source": "none",
+    "applied": true,
+    "shift_mm": [
+     0.0,
+     0.0
+    ],
+    "note": "no stage reading yet: (0, 0) mm used"
+   },
+   "mupix_only_frames": 0
+  },
   "roles": {
    "s1": 1,
    "counters": [
@@ -5933,6 +6195,36 @@
     "max_s1": 250
    },
    "unplaced_chips": []
+  },
+  "pairs": {
+   "enabled": true,
+   "off_reason": null,
+   "resets": 0,
+   "n_l1": 4230,
+   "n_pairs": 1263,
+   "paired_frac": 0.2986,
+   "mean_partners": 1.273,
+   "light_frac": 0.4323,
+   "heavy_frac": 0.1544,
+   "window_ns": 64,
+   "max_l1": 1000,
+   "cuts": {
+    "tot_light_max": 9,
+    "tot_heavy_min": 13,
+    "tot_ns": 256
+   },
+   "stage": {
+    "x_mm": 0.0,
+    "y_mm": 0.0,
+    "source": "none",
+    "applied": true,
+    "shift_mm": [
+     0.0,
+     0.0
+    ],
+    "note": "no stage reading yet: (0, 0) mm used"
+   },
+   "mupix_only_frames": 0
   },
   "roles": {
    "s1": 1,
@@ -6751,6 +7043,36 @@
    },
    "unplaced_chips": []
   },
+  "pairs": {
+   "enabled": true,
+   "off_reason": null,
+   "resets": 0,
+   "n_l1": 4230,
+   "n_pairs": 1263,
+   "paired_frac": 0.2986,
+   "mean_partners": 1.273,
+   "light_frac": 0.4323,
+   "heavy_frac": 0.1544,
+   "window_ns": 64,
+   "max_l1": 1000,
+   "cuts": {
+    "tot_light_max": 9,
+    "tot_heavy_min": 13,
+    "tot_ns": 256
+   },
+   "stage": {
+    "x_mm": 0.0,
+    "y_mm": 0.0,
+    "source": "none",
+    "applied": true,
+    "shift_mm": [
+     0.0,
+     0.0
+    ],
+    "note": "no stage reading yet: (0, 0) mm used"
+   },
+   "mupix_only_frames": 0
+  },
   "roles": {
    "s1": 1,
    "counters": [
@@ -7310,6 +7632,36 @@
    },
    "unplaced_chips": []
   },
+  "pairs": {
+   "enabled": true,
+   "off_reason": null,
+   "resets": 0,
+   "n_l1": 0,
+   "n_pairs": 0,
+   "paired_frac": null,
+   "mean_partners": null,
+   "light_frac": null,
+   "heavy_frac": null,
+   "window_ns": 64,
+   "max_l1": 1000,
+   "cuts": {
+    "tot_light_max": 9,
+    "tot_heavy_min": 13,
+    "tot_ns": 256
+   },
+   "stage": {
+    "x_mm": 0.0,
+    "y_mm": 0.0,
+    "source": "none",
+    "applied": true,
+    "shift_mm": [
+     0.0,
+     0.0
+    ],
+    "note": "no stage reading yet: (0, 0) mm used"
+   },
+   "mupix_only_frames": 0
+  },
   "roles": {
    "s1": 1,
    "counters": [
@@ -7756,6 +8108,17 @@
   "sma/mupix_hits_chip",
   "sma/mupix_hits_xy_L1",
   "sma/mupix_hits_xy_L2",
+  "sma/mupix_pair_dt",
+  "sma/mupix_pair_partners",
+  "sma/mupix_pair_xxp",
+  "sma/mupix_pair_xxp_heavy",
+  "sma/mupix_pair_xxp_light",
+  "sma/mupix_pair_xy",
+  "sma/mupix_pair_xy_heavy",
+  "sma/mupix_pair_xy_light",
+  "sma/mupix_pair_yyp",
+  "sma/mupix_pair_yyp_heavy",
+  "sma/mupix_pair_yyp_light",
   "sma/mupix_row_chip",
   "sma/mupix_s1_match",
   "sma/mupix_tot_L1",
@@ -7857,6 +8220,17 @@
   "sma/mupix_hits_chip": 2,
   "sma/mupix_hits_xy_L1": 2,
   "sma/mupix_hits_xy_L2": 2,
+  "sma/mupix_pair_dt": 1,
+  "sma/mupix_pair_partners": 1,
+  "sma/mupix_pair_xxp": 2,
+  "sma/mupix_pair_xxp_heavy": 2,
+  "sma/mupix_pair_xxp_light": 2,
+  "sma/mupix_pair_xy": 2,
+  "sma/mupix_pair_xy_heavy": 2,
+  "sma/mupix_pair_xy_light": 2,
+  "sma/mupix_pair_yyp": 2,
+  "sma/mupix_pair_yyp_heavy": 2,
+  "sma/mupix_pair_yyp_light": 2,
   "sma/mupix_row_chip": 2,
   "sma/mupix_s1_match": 1,
   "sma/mupix_tot_L1": 1,
@@ -8470,6 +8844,36 @@
     "max_s1": 250
    },
    "unplaced_chips": []
+  },
+  "pairs": {
+   "enabled": true,
+   "off_reason": null,
+   "resets": 0,
+   "n_l1": 0,
+   "n_pairs": 0,
+   "paired_frac": null,
+   "mean_partners": null,
+   "light_frac": null,
+   "heavy_frac": null,
+   "window_ns": 64,
+   "max_l1": 1000,
+   "cuts": {
+    "tot_light_max": 9,
+    "tot_heavy_min": 13,
+    "tot_ns": 256
+   },
+   "stage": {
+    "x_mm": 0.0,
+    "y_mm": 0.0,
+    "source": "none",
+    "applied": true,
+    "shift_mm": [
+     0.0,
+     0.0
+    ],
+    "note": "no stage reading yet: (0, 0) mm used"
+   },
+   "mupix_only_frames": 0
   },
   "roles": {
    "s1": 1,
@@ -9286,6 +9690,36 @@
     "max_s1": 250
    },
    "unplaced_chips": []
+  },
+  "pairs": {
+   "enabled": true,
+   "off_reason": null,
+   "resets": 0,
+   "n_l1": 11280,
+   "n_pairs": 3368,
+   "paired_frac": 0.2986,
+   "mean_partners": 1.273,
+   "light_frac": 0.4323,
+   "heavy_frac": 0.1544,
+   "window_ns": 64,
+   "max_l1": 1000,
+   "cuts": {
+    "tot_light_max": 9,
+    "tot_heavy_min": 13,
+    "tot_ns": 256
+   },
+   "stage": {
+    "x_mm": 0.0,
+    "y_mm": 0.0,
+    "source": "none",
+    "applied": true,
+    "shift_mm": [
+     0.0,
+     0.0
+    ],
+    "note": "no stage reading yet: (0, 0) mm used"
+   },
+   "mupix_only_frames": 0
   },
   "roles": {
    "s1": 1,

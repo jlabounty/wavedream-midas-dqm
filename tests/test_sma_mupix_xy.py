@@ -463,7 +463,8 @@ def test_the_analyzer_hands_the_plugin_its_odb_reader_every_settings_poll():
 
 
 @pytest.mark.parametrize("settings", [
-    {"MuPix": {"XY": {"enable": False}}},
+    # Pairs off too: they also read the stage (test_sma_mupix_pairs covers XY off, pairs on).
+    {"MuPix": {"XY": {"enable": False}, "Pairs": {"enable": False}}},
     {"MuPix": {"max pixel hits per frame": 0}},           # the MuPix analysis off altogether
 ])
 def test_xy_off_books_and_fills_nothing(settings):
@@ -518,8 +519,9 @@ def test_no_xy_key_is_in_the_shape_fingerprint():
 
 
 def _sma_counts(p):
+    # The pair maps share the ToT cuts and the stage switch (test_sma_mupix_pairs).
     return {n: (p.store.get(n).entries, p.store.get(n).counts.copy()) for n in p.store.names()
-            if not n.startswith(("sma/mupix_track_", "sma/mupix_hits_xy_"))}
+            if not n.startswith(("sma/mupix_track_", "sma/mupix_hits_xy_", "sma/mupix_pair_"))}
 
 
 def _xy_entries(p):

@@ -99,6 +99,11 @@ class Entry:
 # Keys are also space-free and free of regex metacharacters: the key is both
 # "?cmd=custom&page=<key>" and the argument to mhttpd_init('<key>'), and the
 # sidenav highlight does current_page.search(item) -- an *unescaped* regex.
+# Without metacharacters that search is a substring test (mhttpd.js tries the
+# key and its lower case), so no menu key may be a substring of another, with
+# or without a --prefix: the old key "SMA" was highlighted on SMAEvents too,
+# which is why it is SMAPlots now. tests/test_manifest.py checks every pair,
+# bare and with "WD".
 # Only what exists and works is listed. A page added to the menu before it
 # does anything is worse than no page: an operator who opens it and finds it
 # broken stops trusting the whole set. Later stages append here.
@@ -117,7 +122,9 @@ ENTRIES: tuple[Entry, ...] = (
     Entry("SMAPlots", "sma.html", True, "SMA plots, flags and trends (needs the SMA analyzer)"),
     Entry("SMAEvents", "sma-events.html", True,
           "SMA S1-seeded events and whole-frame raster (needs the SMA analyzer)"),
-    Entry("dqm-sma.js", "js/dqm-sma.js", False, "SMA plots page"),
+    Entry("MuPixPlots", "mupix.html", True,
+          "MuPix phase space, unseeded pairs and diagnostics (needs the SMA analyzer)"),
+    Entry("dqm-sma.js", "js/dqm-sma.js", False, "SMA plots page (and the MuPix page)"),
     Entry("dqm-sma-events.js", "js/dqm-sma-events.js", False, "SMA event display page"),
     Entry("dqm-smaframe.js", "js/dqm-smaframe.js", False, "SMA frame (smaf) decoder"),
     Entry("dqm-heatmap.js", "js/dqm-heatmap.js", False, "2D histograms drawn as an image"),

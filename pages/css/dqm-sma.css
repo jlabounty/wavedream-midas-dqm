@@ -30,7 +30,9 @@ table.dqm-sma-table th { white-space: nowrap; }
    <button>s without .mbutton, and every property midas.css or the browser sets
    on a button is set here, so neither can make them look like buttons again. */
 .dqm-sma-toolbar { margin: 6px 0 4px 0; }
-.dqm-sma-tablist { display: flex; flex-wrap: nowrap; align-items: flex-end; gap: 2px;
+/* position: relative keeps the phone layout's hidden full labels (absolute,
+   .dqm-sma-tabfull below) inside the strip's scroll box, not widening the page. */
+.dqm-sma-tablist { position: relative; display: flex; flex-wrap: nowrap; align-items: flex-end; gap: 2px;
                    margin: 4px 0 12px 0; padding: 0 6px; max-width: 100%;
                    overflow-x: auto; overflow-y: hidden; scrollbar-width: thin;
                    background: linear-gradient(to top, #a8a8a8 1px, transparent 1px); }
@@ -191,6 +193,11 @@ table.dqm-sma-table th { white-space: nowrap; }
 .dqm-grid > .dqm-sma-row > div.dqm-sma-square > .dqm-plot { aspect-ratio: auto; min-height: 240px;
   height: calc((100cqw - (var(--dqm-sma-cols) - 1) * var(--dqm-sma-gap)) / var(--dqm-sma-cols) - 60px); }
 .dqm-grid > div.dqm-sma-square > .dqm-plot { width: 460px; height: 400px; max-width: 100%; }
+/* Any other plot outside a row (the 560 px 1D plots, the pairs tab's dt and
+   partners among them) narrows to a phone's width instead of running off it;
+   mplot and DQMHeatmap size their canvas from the box, and mplot draws a 1 px
+   border outside it. */
+.dqm-grid > div.dqm-sma-plotwrap > .dqm-plot { max-width: calc(100% - 2px); }
 @media (max-width: 900px) { .dqm-sma-row3 { --dqm-sma-cols: 1; } }
 @media (max-width: 640px) { .dqm-sma-row2 { --dqm-sma-cols: 1; } }
 

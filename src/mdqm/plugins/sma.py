@@ -97,6 +97,16 @@ frame bt2026-v4, +x beam-left, plus the XY table's shift; see ``sma_mupix_xy``):
 ``mupix_track_tot``     tracks: max pixel ToT of the L1 cluster x of the L2 cluster, 32 x 32
 ``mupix_track_state``   per judged S1 hit: 0 no L1, 1 no L2, 2 ambiguous, 3 track
 
+MuPix pairs, unseeded (good frames, ``/DQM/SMA/MuPix/Pairs``; booked only with ``enable``;
+the nearline monitor's ``MakePairs``, see ``sma_mupix_pairs``; same frame and axes as x/y):
+
+``mupix_pair_xy[_light|_heavy]``    L1 pixel position of each L1-L2 pair (all, light, heavy)
+``mupix_pair_xxp[...]``, ``mupix_pair_yyp[...]``  x vs x', y vs y' (mrad), 130 x 77
+``mupix_pair_dt``       t(L2) - t(L1) (the nearline's sign) of every L2 pixel within
+                        +-100 ns of a sampled L1 pixel, 8 ns bins (one tick) centred on
+                        the ticks
+``mupix_pair_partners`` L2 pixels in the pair window per sampled L1 pixel, 0-10 + overflow
+
 With ``NIM/merge`` on (off by default), the counters (S1 included) are the
 merged hits wherever counter times are used: ``dt_S*``, ``pattern``,
 ``s1_coinc``, ``s1_partner_hits``, ``s1_spacing_us``, the RF and delayed
@@ -121,6 +131,7 @@ import numpy as np
 
 from mdqm.dqm import framing
 from mdqm.dqm.hist import Axis, Hist1D, Hist2D
+from mdqm.plugins import sma_mupix_pairs as PR
 from mdqm.plugins import sma_mupix_xy as X
 from mdqm.plugins import sma_nim as N
 from mdqm.plugins import sma_words as W
@@ -276,6 +287,25 @@ SETTINGS_DEFAULTS: dict[str, object] = {
             #: subset of the MuPix sample above (0 = all of it). The cost is
             #: ~0.1 ms + ~1 us per row on a dense frame. A CPU knob: no plot resets.
             "max S1 per frame": X.XY_MAX_S1,
+        },
+        #: Unseeded L1-L2 pixel pairs, the nearline monitor's rule (MakePairs):
+        #: each L1 pixel takes the nearest-in-time L2 pixel within +-window
+        #: (raw times, both edges inclusive, ties to the earlier), no S1, no
+        #: clustering. Uses XY's ToT cuts (on both pixels), its stage switch
+        #: and the chip lists' placement. Filled on good frames and on
+        #: MuPix-only ones (pixels, no trigger words). Editing enable or the
+        #: window, or the XY ToT cuts, resets only the pair maps (sma_mupix_pairs).
+        "Pairs": {
+            #: n: no pair histograms are booked or filled.
+            "enable": True,
+            #: The half window in whole ns (0-1000; above 100 the dt plot
+            #: cannot show its edges). The nearline's is 40 on time-walk
+            #: corrected times; 64 gives its pair count on raw times.
+            "window ns": PR.WINDOW_NS,
+            #: L1 pixels paired per frame, an evenly spread subset of the
+            #: frame's (1-20000). The fill costs ~0.3-0.4 ms a dense frame at
+            #: 1000, ~0.5 ms at 2000. A CPU knob: no plot resets.
+            "max L1 per frame": PR.MAX_L1,
         },
     },
     #: The NIM copies of the counters (since run 1015) and how they are paired
@@ -485,6 +515,7 @@ class Config:
     seed_ring_bytes: int = 24 << 20
     mupix: W.MuPixCuts = field(default_factory=W.MuPixCuts)
     xy: X.XYSettings = field(default_factory=X.XYSettings)
+    pairs: PR.PairSettings = field(default_factory=PR.PairSettings)
     nim: NimSettings = field(default_factory=NimSettings)
     binning: dict = field(default_factory=dict)
     check: dict = field(default_factory=dict)
@@ -708,6 +739,30 @@ def parse_settings(settings: dict | None) -> Config:
         placement=X.placement(slots1, slots2) if not bad_lists else X.placement((), ()),
         off_reason=off_reason)
 
+    PS = "MuPix/Pairs"
+    pr_max_l1 = get(PS, "max L1 per frame", int)
+    if not 1 <= pr_max_l1 <= PR.MAX_L1_LIMIT:
+        clamped = min(max(pr_max_l1, 1), PR.MAX_L1_LIMIT)
+        errors.append(f"MuPix/Pairs/max L1 per frame={pr_max_l1}: a cap within 1-"
+                      f"{PR.MAX_L1_LIMIT} (0 is not 'all'); using {clamped}")
+        pr_max_l1 = clamped
+    pr_enable = get(PS, "enable", _as_bool)
+    pr_window = get(PS, "window ns", int, lambda v: 0 <= v <= PR.WINDOW_LIMIT_NS)
+    if pr_window > PR.DT_HALF_NS:
+        errors.append(f"MuPix/Pairs/window ns={pr_window}: wider than the +-{PR.DT_HALF_NS} ns "
+                      "of mupix_pair_dt, which cannot show its edges; used as set")
+    pr_off = None
+    if not mupix.enabled:
+        pr_off = off_reason
+    elif bad_lists:
+        pr_off = bad_lists
+        if pr_enable:
+            errors.append(f"MuPix/Pairs: {bad_lists}; MuPix pairs are off")
+    pairs = PR.PairSettings(
+        enable=pr_enable,
+        window_ns=pr_window, max_l1=pr_max_l1, tot_light_max=light, tot_heavy_min=heavy,
+        apply_stage=xy.apply_stage, placement=xy.placement, off_reason=pr_off)
+
     nim = _parse_nim(s, roles, get, opt_chan, errors)
 
     S = "Self check"
@@ -730,7 +785,8 @@ def parse_settings(settings: dict | None) -> Config:
                                 lambda v: 0 <= v <= 1024) * (1 << 20)),
         max_gap_ns=int(get(C, "max gap s", float, pos) * 1e9),
         max_overlap_ns=int(get(C, "max overlap ms", float, lambda v: v >= 0) * 1e6),
-        mupix=mupix, xy=xy, nim=nim, binning=binning, check=check, errors=errors)
+        mupix=mupix, xy=xy, pairs=pairs, nim=nim, binning=binning, check=check,
+        errors=errors)
 
 
 def _as_bool(v) -> bool:
@@ -886,15 +942,16 @@ def shape_fingerprint(settings: dict) -> str:
 
     Labels are left out on purpose -- renaming a channel must never reset an
     afternoon of plots. The self-check and sampling settings change no plot,
-    nor do NIM's CPU knobs (`NIM_CPU_KEYS`). ``MuPix/XY`` is left out too: its
-    keys reset only the x/y maps (`SmaPlugin.apply_settings`), and the XY
-    table's position is no setting at all (`SmaPlugin.poll_odb`).
+    nor do NIM's CPU knobs (`NIM_CPU_KEYS`). ``MuPix/XY`` and ``MuPix/Pairs``
+    are left out too: their keys reset only the x/y or the pair maps
+    (`SmaPlugin.apply_settings`), and the XY table's position is no setting at
+    all (`SmaPlugin.poll_odb`).
     """
     s = _merge(SETTINGS_DEFAULTS, settings)
     roles = {k: v for k, v in s["Channel roles"].items() if k != "labels"}
     # NIM's CPU knobs change how much is filled, not what a plot means.
     nim = {k: v for k, v in s["NIM"].items() if k not in NIM_CPU_KEYS}
-    mupix = {k: v for k, v in s["MuPix"].items() if k != "XY"}
+    mupix = {k: v for k, v in s["MuPix"].items() if k not in ("XY", "Pairs")}
     return json.dumps({"shift": s["Coarse shift"], "roles": roles, "Cuts": s["Cuts"],
                        "Binning": s["Binning"], "MuPix": mupix, "NIM": nim},
                       sort_keys=True,
@@ -1160,7 +1217,8 @@ class _Second:
                  "stale_words", "n_s1", "n_s1_kept", "eff", "rf_valid", "rf_vetoed", "scan",
                  "shift_counts", "shift_n", "mp_frames", "mp_pix", "mp_examined", "mp_skipped",
                  "mp_n", "mp_in", "mp_side", "mp_chip", "mp_rows", "mp_unsorted", "nim",
-                 "xy_state", "xy_light", "xy_heavy", "xy_ctrk")
+                 "xy_state", "xy_light", "xy_heavy", "xy_ctrk", "pr_l1", "pr_paired",
+                 "pr_partners", "pr_light", "pr_heavy", "pr_ctrk", "pr_mponly")
 
     def __init__(self, t: int, epoch: int, n_counters: int, scan: tuple):
         self.t = t
@@ -1202,6 +1260,14 @@ class _Second:
         #: (xy_ctrk, their denominator: restarts with a ToT-cut edit).
         self.xy_state = np.zeros(len(X.STATE_NAMES), dtype=np.int64)
         self.xy_light = self.xy_heavy = self.xy_ctrk = 0
+        #: MuPix pairs: L1 pixels sampled, of them paired, the L2 candidates of
+        #: the paired ones (summed), and the pairs of the light and heavy ToT
+        #: classes with their denominator (restarts with a ToT-cut edit).
+        self.pr_l1 = self.pr_paired = self.pr_partners = 0
+        self.pr_light = self.pr_heavy = self.pr_ctrk = 0
+        #: MuPix-only frames (pixels, no trigger words: class "empty") whose
+        #: MuPix part was analysed (occupancy, ToT, pairs).
+        self.pr_mponly = 0
 
     def nim_eff(self) -> list | None:
         """Pair efficiency paired / (paired + TOT-only) per counter (S1 first),
@@ -1473,6 +1539,8 @@ class SmaPlugin:
         self._stage: tuple = (0.0, 0.0, "none", "no stage reading yet: (0, 0) mm used")
         #: x/y map resets by MuPix/XY edits (no rebuild; see apply_settings).
         self.xy_resets = 0
+        #: pair map resets by MuPix/Pairs (or XY ToT-cut) edits (no rebuild).
+        self.pair_resets = 0
         self._build()
 
     # -- settings --------------------------------------------------------------
@@ -1494,8 +1562,17 @@ class SmaPlugin:
         heavy maps (``mupix_track_tot``, which the cuts are read from, keeps
         filling). The x/y summary counters restart with them; nothing else
         does, and the epoch stays.
+
+        ``MuPix/Pairs`` edits never rebuild either, and reset only the pair
+        maps the same way: any Pairs key (and ``apply stage shift`` or a
+        chip-list change that only moves the pixels) re-books all eleven, the
+        XY ToT cuts only the six light and heavy maps, with the ``pairs``
+        summary counters that belong to them. ``max L1 per frame`` is a CPU
+        knob and resets nothing. ``resets`` counts only re-books while the
+        pairs are on.
         """
         old = self.cfg.xy
+        old_pr = self.cfg.pairs
         self.cfg = parse_settings(settings)
         if rebuild:
             for name in self.store.names():
@@ -1514,6 +1591,21 @@ class SmaPlugin:
             self._build_xy(classes_only=True)
             self._reset_xy_counters(classes_only=True)
             self.xy_resets += 1
+        pr = self.cfg.pairs
+        if pr.reset_key() != old_pr.reset_key():
+            self._build_pairs()
+            self._reset_pair_counters(classes_only=False)
+            self.pair_resets += int(pr.active)
+        elif (pr.tot_light_max, pr.tot_heavy_min) != (old_pr.tot_light_max, old_pr.tot_heavy_min):
+            self._build_pairs(classes_only=True)
+            self._reset_pair_counters(classes_only=True)
+            self.pair_resets += int(pr.active)
+
+    def _reset_pair_counters(self, classes_only: bool) -> None:
+        for sec in {id(x): x for x in (*self._seconds, self._cur) if x is not None}.values():
+            sec.pr_light = sec.pr_heavy = sec.pr_ctrk = 0
+            if not classes_only:
+                sec.pr_l1 = sec.pr_paired = sec.pr_partners = 0
 
     def _reset_xy_counters(self, classes_only: bool) -> None:
         for sec in {id(x): x for x in (*self._seconds, self._cur) if x is not None}.values():
@@ -1529,7 +1621,7 @@ class SmaPlugin:
         Called by the analyzer on every settings poll (every 2 s) with
         ``client.odb_get``. Not a setting (`shape_fingerprint` never sees it):
         a moving stage resets no plot, the frames after the poll take the new
-        shift. Only read while MuPix x/y is on with ``apply stage shift``; a
+        shift. Only read while MuPix x/y or the pairs are on with ``apply stage shift``; a
         missing or unreadable key (a standalone rig, an old ODB) gives (0, 0)
         with a note in the summary, never an error. The table's own readback
         period comes on top of the 2 s: frames up to a few seconds after a
@@ -1541,7 +1633,7 @@ class SmaPlugin:
         """
         try:
             xy = self.cfg.xy
-            if not (xy.active and xy.apply_stage):
+            if not ((xy.active or self.cfg.pairs.active) and xy.apply_stage):
                 return
             try:
                 v = odb_get(X.STAGE_PATH)
@@ -1769,6 +1861,7 @@ class SmaPlugin:
                                        f"Row occupancy per chip (rows >= {W.PIXEL_ROWS} are not on "
                                        "the sensor)")
         self._build_xy()
+        self._build_pairs()
 
     #: The x/y maps of each class (``_build_xy``); the ToT cuts re-book only these.
     _XY_CLASS_KEYS = tuple(f"{k}{c}" for c in ("_light", "_heavy") for k in ("xy", "xxp", "yyp"))
@@ -1834,6 +1927,62 @@ class SmaPlugin:
                 f"Sampled S1 hits by MuPix track state ({xy.box} x {xy.box} pixel cluster "
                 "square; entries = S1 hits judged)", dtype=np.uint32)
         h["xy"] = out
+
+    #: The pair maps of each class (``_build_pairs``); the ToT cuts re-book only these.
+    _PAIR_CLASS_KEYS = _XY_CLASS_KEYS
+
+    def _build_pairs(self, classes_only: bool = False) -> None:
+        """MuPix pairs (MuPix/Pairs; see _fill_pairs): booked only while the pairs are active.
+
+        Removes and re-books the pair maps (only the light and heavy ones with
+        ``classes_only``), as `_build_xy` does for x/y. The maps have the x/y
+        maps' axes, so the two tabs compare bin by bin; ``mupix_pair_dt`` is in
+        8 ns bins (one tick: the raw times are whole ticks) centred on the
+        ticks over +-100 ns, ``mupix_pair_partners`` 0-10 with an overflow.
+        All uint32, widened to uint64 before a bin could wrap (`_widen`).
+        """
+        cfg, h = self.cfg, self.h
+        pr, m = cfg.pairs, cfg.mupix
+        old = h.get("pairs") or {}
+        drop = self._PAIR_CLASS_KEYS if classes_only else tuple(old)
+        for k in drop:
+            if k in old:
+                self.store.remove(old[k].name)
+        if not pr.active:
+            h["pairs"] = None
+            return
+        out = {k: v for k, v in old.items() if k not in drop}
+        g = f"{X.GEOMETRY_TAG}, +x beam-left"
+        pos = lambda u: Axis(X.POS_BINS, X.POS_LO_MM, X.POS_HI_MM, f"{u} (mm)")  # noqa: E731
+        slope = lambda u: Axis(X.SLOPE_BINS, -X.SLOPE_HALF_MRAD, X.SLOPE_HALF_MRAD,  # noqa: E731
+                               f"{u} (mrad)")
+        h2 = lambda *a: self._h2(*a, dtype=np.uint32)  # noqa: E731
+        win = f"nearest L2 pixel within +-{pr.window_ns} ns"
+        cls = {"": "all pairs",
+               "_light": f"light: pixel ToT <= {pr.tot_light_max} in L1 and L2",
+               "_heavy": f"heavy: pixel ToT >= {pr.tot_heavy_min} in L1 and L2"}
+        for suf, what in cls.items():
+            if classes_only and not suf:
+                continue
+            out[f"xy{suf}"] = h2(f"mupix_pair_xy{suf}", pos("x"), pos("y"),
+                                 f"MuPix L1-L2 pixel pairs ({win}, unseeded) at L1, {what} ({g})")
+            out[f"xxp{suf}"] = h2(f"mupix_pair_xxp{suf}", pos("x"), slope("x'"),
+                                  f"MuPix L1-L2 pixel pairs x / x' at L1, {what} ({g})")
+            out[f"yyp{suf}"] = h2(f"mupix_pair_yyp{suf}", pos("y"), slope("y'"),
+                                  f"MuPix L1-L2 pixel pairs y / y' at L1, {what} ({g})")
+        if not classes_only:
+            half, bw = PR.DT_HALF_NS, PR.DT_BIN_NS
+            nb = 2 * (half // bw) + 1                   # odd: bins centred on the ticks
+            out["dt"] = self._h1(
+                "mupix_pair_dt", Axis(nb, -0.5 * nb * bw, 0.5 * nb * bw, "t(L2) - t(L1) (ns)"),
+                f"MuPix L2 minus L1 pixel time, every L2 pixel within +-{half} ns of a sampled "
+                f"L1 pixel (raw times; the pair window is +-{pr.window_ns} ns)", dtype=np.uint32)
+            out["partners"] = self._h1(
+                "mupix_pair_partners",
+                Axis(PR.PARTNER_MAX + 1, -0.5, PR.PARTNER_MAX + 0.5, "L2 pixels in the window"),
+                f"L2 pixels within +-{pr.window_ns} ns per sampled L1 pixel (0 = unpaired; "
+                f"> {PR.PARTNER_MAX} in the overflow)", dtype=np.uint32)
+        h["pairs"] = out
 
     # -- per event -------------------------------------------------------------
 
@@ -1961,6 +2110,13 @@ class SmaPlugin:
         elif cls == "empty":
             self.frames_empty += 1
             sec.empty += 1
+            if fr.px is not None and fr.px.n:
+                # MuPix-only (pixels, no trigger words): its MuPix part needs no
+                # SMA time -- occupancy, ToT and the unseeded pairs, on the
+                # pixels' own relative times. Still an "empty" frame everywhere
+                # else; nothing S1-seeded is filled.
+                sec.pr_mponly += 1
+                self._fill_mupix(fr, np.zeros(0, dtype=np.int64), sec)
         elif cls == "suspect":
             self.frames_suspect += 1
             sec.suspect += 1
@@ -2403,7 +2559,8 @@ class SmaPlugin:
         spread (sma_words.even_sample): which have an L1 / L2 hit in the in-time window
         and in the sideband (only S1 hits whose windows lie in the pixel data
         are judged, sma_words.mupix_match), and every t(pixel) - t(S1) pair in
-        the histogram range (bounded by MuPixCuts.max_pairs).
+        the histogram range (bounded by MuPixCuts.max_pairs). The unseeded
+        L1-L2 pairs (`_fill_pairs`) need no S1 and are filled first.
         """
         px = fr.px
         if px is None:
@@ -2432,6 +2589,7 @@ class SmaPlugin:
                 c = np.zeros(34, dtype=np.int64)
                 c[1:33] = tot[32 * p: 32 * p + 32]
                 h["mupix_tot"][p].add_counts(c, entries=int(c.sum()))
+            self._fill_pairs(px, sec)
         t_s1 = np.asarray(t_s1, dtype=np.int64)
         if not t_s1.size or not px.n:
             return
@@ -2510,6 +2668,66 @@ class SmaPlugin:
                 _add_flat(hx[f"{k}_heavy"], f[heavy])
         # ToT 0..31 on a 32-bin axis from -0.5: bin index = ToT + 1, never out of range.
         _add_flat(hx["tot"], (t2.astype(np.intp) + 1) * (hx["tot"].x.n + 2) + t1 + 1)
+
+    def _fill_pairs(self, px: W.Pixels, sec: _Second) -> None:
+        """Unseeded MuPix L1-L2 pairs of a good frame (sma_mupix_pairs.l1l2_pairs).
+
+        At most MuPix/Pairs/max L1 per frame L1 pixels, evenly spread over the
+        frame's candidates (on the sensor, on a placed L1 chip), each paired
+        with the nearest L2 pixel within +-window ns. When the per-frame pixel
+        cap skipped the earliest words, L1 pixels within reach of the first
+        examined one are left out (their partners may be among the skipped).
+        Every sampled L1 pixel fills ``mupix_pair_partners``; every L2
+        candidate within +-100 ns of one fills ``mupix_pair_dt`` with t(L2) -
+        t(L1) (at most DT_PER_L1 per sampled L1 pixel); the pairs fill the maps
+        at the L1 pixel with the stage shift added, light / heavy by both
+        pixel ToTs. Called for good frames and for MuPix-only ones (no trigger
+        words; see process).
+        """
+        hp = self.h.get("pairs")
+        if hp is None:
+            return
+        pr = self.cfg.pairs
+        t_min = px.first + max(pr.window_ns, PR.DT_HALF_NS) if px.n_skipped else None
+        res = PR.l1l2_pairs(px, pr.window_ns, pr.max_l1, pr.placement, self._xy_shift(), t_min,
+                            dt_half=PR.DT_HALF_NS)
+        n = res.n
+        if not n:
+            return
+        paired = res.paired
+        npr = int(np.count_nonzero(paired))
+        sec.pr_l1 += n
+        sec.pr_paired += npr
+        # Small 1D histograms: one bincount each over bin indices (never out of
+        # range here): partners 0..PARTNER_MAX at bins 1..PARTNER_MAX + 1, more
+        # in the overflow; dt within +-DT_HALF_NS, every candidate on the axis.
+        _bincount_1d(hp["partners"], np.minimum(res.n_partners, PR.PARTNER_MAX + 1) + 1)
+        dt = res.cand_dt
+        if dt.size:
+            hd = hp["dt"]
+            _bincount_1d(hd, (dt - int(hd.x.lo)) // PR.DT_BIN_NS + 1)
+        if not npr:
+            return
+        sec.pr_partners += int(res.n_partners[paired].sum())
+        pax = hp["xy"].x
+        nxp = pax.n + 2
+        sax = hp["xxp"].y
+        ix, iy = _bin_of(res.x1[paired], pax), _bin_of(res.y1[paired], pax)
+        flat = {"xy": iy * nxp + ix, "xxp": _bin_of(res.xp[paired], sax) * nxp + ix,
+                "yyp": _bin_of(res.yp[paired], sax) * nxp + iy}
+        t1, t2 = res.tot1[paired], res.tot2[paired]
+        light = (t1 <= pr.tot_light_max) & (t2 <= pr.tot_light_max)
+        heavy = (t1 >= pr.tot_heavy_min) & (t2 >= pr.tot_heavy_min)
+        nl, nh = int(np.count_nonzero(light)), int(np.count_nonzero(heavy))
+        sec.pr_light += nl
+        sec.pr_heavy += nh
+        sec.pr_ctrk += npr
+        for k, f in flat.items():
+            _add_flat(hp[k], f)
+            if nl:
+                _add_flat(hp[f"{k}_light"], f[light])
+            if nh:
+                _add_flat(hp[f"{k}_heavy"], f[heavy])
 
     def _mupix_widths(self) -> tuple[float, float]:
         m = self.cfg.mupix
@@ -2789,6 +3007,7 @@ class SmaPlugin:
             "timestamp_faults": self._timestamp_faults(hits, mism, shift["verdict"]),
             "mupix": self._mupix_summary(secs, now),
             "xy": self._xy_summary(secs),
+            "pairs": self._pairs_summary(secs),
             #: The channel map, so the pages need not guess roles from labels;
             #: "nim" follows "counters" (-1 = no NIM copy).
             "roles": {"s1": cfg.roles.s1, "counters": list(cfg.roles.counters),
@@ -2994,8 +3213,6 @@ class SmaPlugin:
         light = sum(x.xy_light for x in secs)
         heavy = sum(x.xy_heavy for x in secs)
         ctrk = sum(x.xy_ctrk for x in secs)
-        sx, sy, src, note = self._stage
-        dx, dy = self._xy_shift()
         return {
             "enabled": bool(xy.active),
             "off_reason": (None if xy.active else xy.off_reason if xy.enable
@@ -3010,14 +3227,60 @@ class SmaPlugin:
                           "no_l2": _ratio(state[X.NO_L2], n, 4)},
             "light_frac": _ratio(light, ctrk, 4),
             "heavy_frac": _ratio(heavy, ctrk, 4),
-            "stage": {"x_mm": _num(sx, 6), "y_mm": _num(sy, 6), "source": src,
-                      "applied": bool(xy.apply_stage),
-                      "shift_mm": [_num(dx, 6) or 0.0, _num(dy, 6) or 0.0],
-                      "note": note if xy.apply_stage else None},
+            "stage": self._stage_summary(),
             "cuts": {"cluster_box_px": xy.box, "tot_light_max": xy.tot_light_max,
                      "tot_heavy_min": xy.tot_heavy_min, "tot_ns": m.tot_ns,
                      "window_ns": list(m.window_ns), "max_s1": xy.max_s1},
             "unplaced_chips": list(xy.placement.unplaced),
+        }
+
+    def _stage_summary(self) -> dict:
+        """The XY table as used for every MuPix position (``xy.stage``, ``pairs.stage``)."""
+        sx, sy, src, note = self._stage
+        dx, dy = self._xy_shift()
+        applied = self.cfg.xy.apply_stage
+        return {"x_mm": _num(sx, 6), "y_mm": _num(sy, 6), "source": src,
+                "applied": bool(applied),
+                "shift_mm": [_num(dx, 6) or 0.0, _num(dy, 6) or 0.0],
+                "note": note if applied else None}
+
+    def _pairs_summary(self, secs: list) -> dict:
+        """The unseeded MuPix pairs part of sma::summary, over the summary window.
+
+        ``n_l1``: L1 pixels sampled (at most Pairs/max L1 per frame a frame);
+        ``n_pairs`` of them paired (an L2 pixel within the window),
+        ``paired_frac`` = n_pairs / n_l1; ``mean_partners``: L2 pixels in the
+        window per PAIRED L1 pixel (1 = no ambiguity; the unpaired ones are in
+        ``paired_frac``); ``light_frac``, ``heavy_frac``: of the pairs classed
+        since the last ToT-cut edit (None right after one). ``window_ns``,
+        ``max_l1``, ``cuts`` (the XY ToT cuts on both pixels), ``stage`` (as
+        ``xy.stage``), ``enabled``, ``off_reason`` (why not with Pairs/enable
+        = y), ``resets`` (pair map resets by Pairs or ToT-cut edits while on),
+        ``mupix_only_frames`` (frames with pixels and no trigger words, counted
+        as "empty" in ``frames``, whose MuPix part was analysed).
+        """
+        pr, m = self.cfg.pairs, self.cfg.mupix
+        n = sum(x.pr_l1 for x in secs)
+        paired = sum(x.pr_paired for x in secs)
+        partners = sum(x.pr_partners for x in secs)
+        light = sum(x.pr_light for x in secs)
+        heavy = sum(x.pr_heavy for x in secs)
+        ctrk = sum(x.pr_ctrk for x in secs)
+        return {
+            "enabled": bool(pr.active),
+            "off_reason": (None if pr.active else pr.off_reason if pr.enable
+                           else "MuPix/Pairs/enable = n"),
+            "resets": self.pair_resets,
+            "n_l1": n, "n_pairs": paired,
+            "paired_frac": _ratio(paired, n, 4),
+            "mean_partners": _ratio(partners, paired, 4),
+            "light_frac": _ratio(light, ctrk, 4),
+            "heavy_frac": _ratio(heavy, ctrk, 4),
+            "window_ns": pr.window_ns, "max_l1": pr.max_l1,
+            "cuts": {"tot_light_max": pr.tot_light_max, "tot_heavy_min": pr.tot_heavy_min,
+                     "tot_ns": m.tot_ns},
+            "stage": self._stage_summary(),
+            "mupix_only_frames": sum(x.pr_mponly for x in secs),
         }
 
     def _flags(self, s: dict, now: float, run_active) -> list[dict]:
@@ -3869,7 +4132,8 @@ def _merge_seconds(secs: list[_Second]) -> _Second:
         for a in ("frames", "offered", "stale", "empty", "suspect", "span_ns", "cover_ns",
                   "delta_ns", "live_ns", "n_s1", "n_s1_kept", "rf_valid", "rf_vetoed",
                   "oversize", "mp_frames", "mp_pix", "mp_examined", "mp_skipped", "mp_n",
-                  "mp_rows", "mp_unsorted", "xy_light", "xy_heavy", "xy_ctrk"):
+                  "mp_rows", "mp_unsorted", "xy_light", "xy_heavy", "xy_ctrk", "pr_l1",
+                  "pr_paired", "pr_partners", "pr_light", "pr_heavy", "pr_ctrk", "pr_mponly"):
             setattr(out, a, getattr(out, a) + getattr(s, a))
         out.xy_state += s.xy_state
         out.hits += s.hits
@@ -3966,6 +4230,17 @@ def _add_flat(h: Hist2D, flat) -> None:
         h.entries += int(flat.size)
     else:
         h.add_counts(np.bincount(flat, minlength=h.counts.size).reshape(h.counts.shape))
+
+
+def _bincount_1d(h: Hist1D, idx) -> None:
+    """Add full bin indices (0 underflow .. n+1 overflow, in range) to a small 1D
+    histogram in one bincount, widening a uint32 one first (`_widen`)."""
+    idx = np.asarray(idx, dtype=np.intp).ravel()
+    if not idx.size:
+        return
+    _widen(h, idx.size)
+    h.counts += np.bincount(idx, minlength=h.counts.size).astype(h.counts.dtype, copy=False)
+    h.entries += int(idx.size)
 
 
 def _widen(h, n: int) -> None:

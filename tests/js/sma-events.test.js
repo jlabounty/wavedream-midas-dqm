@@ -156,7 +156,7 @@ test("the tab strip is a tablist: aria-selected follows the tab, arrows move it"
   key("ArrowRight");
   await settle(page);
   assert.deepStrictEqual(sel(), ["false", "true"]);
-  assert.strictEqual(El.focused, tab("raster"));
+  assert.ok(El.focused === tab("raster"), "the raster tab has the focus");
   assert.strictEqual(byId(page, "dqm-smaev-pane-seeded").style.display, "none");
   let asks = frameCalls(page, mark);
   assert.ok(asks.length > 0 && asks.every((a) => a.view !== "seeded"),
@@ -884,7 +884,7 @@ test("a rejected clipboard falls back too, and a refused execCommand shows the t
   assert.ok(/Ctrl-C/.test(pop.textContent));
   assert.strictEqual(btn.textContent, "Copy tag", "not claimed as copied");
   pop.byTag("button")[0].onclick();
-  assert.strictEqual(byId(page, "dqm-smaev-popup"), null, "Close removes it");
+  assert.ok(byId(page, "dqm-smaev-popup") === null, "Close removes it");
 });
 
 test("Download raw event saves the sma::raw bytes as sma_run<run>_serial<serial>.mid", async () => {
@@ -1002,7 +1002,8 @@ test("Copy seed words copies the tag, the S1 word, the window's range and every 
   assert.strictEqual(btn.textContent, "Copied ✓");
   // The button is not rebuilt by a redraw, so a click that spans one still lands.
   await settle(page);
-  assert.strictEqual(byId(page, "dqm-smaev-seeds").byClass("dqm-sma-seed")[1].byClass("dqm-smaev-copyseed")[0], btn);
+  assert.ok(byId(page, "dqm-smaev-seeds").byClass("dqm-sma-seed")[1].byClass("dqm-smaev-copyseed")[0] === btn,
+    "the same copy button");
 });
 
 test("a click on the live raster freezes, fetches the words once, then tags the hit", async () => {
@@ -1256,7 +1257,7 @@ test("the list survives a tab switch, and a seeded tag is marked (and untagged) 
   byId(page, "dqm-smaev-tab-raster").onclick();
   await settle(page, 3);
   assert.strictEqual(taggedRows(page).length, 1, "kept across the switch");
-  assert.notStrictEqual(byId(page, "dqm-smaev-tagged").parent, byId(page, "dqm-smaev-pane-seeded"),
+  assert.ok(byId(page, "dqm-smaev-tagged").parent !== byId(page, "dqm-smaev-pane-seeded"),
     "the list is outside the panes, so it shows on both tabs");
   const canvas = byId(page, "dqm-smaev-raster");
   assert.deepStrictEqual(markerTexts(canvas), [], "the live raster has no words to find the hit by");
@@ -1947,7 +1948,7 @@ test("no current channel: the seeded lanes have none, S3 is ch 7", async () => {
   assert.ok(!labels.some((l) => /^current/.test(l)), labels.join(","));
   const pat = [1, 2, 3, 4, 5].map((k) => byId(page, `dqm-smaev-pattext-${k}`).textContent);
   assert.deepStrictEqual(pat, ["S1", "S2", "S3", "S4", "S5"]);
-  assert.strictEqual(byId(page, "dqm-smaev-pat-6"), null);
+  assert.ok(byId(page, "dqm-smaev-pat-6") === null, "no dqm-smaev-pat-6");
 });
 
 test("the pattern selector has one box per counter of the roles", async () => {
@@ -1959,7 +1960,7 @@ test("the pattern selector has one box per counter of the roles", async () => {
   assert.strictEqual(row.byClass("dqm-smaev-pat").length, 3, "S1..S3");
   assert.deepStrictEqual([1, 2, 3].map((k) => byId(page, `dqm-smaev-pattext-${k}`).textContent),
                          ["S1", "S2", "S3"]);
-  assert.strictEqual(byId(page, "dqm-smaev-pat-4"), null);
+  assert.ok(byId(page, "dqm-smaev-pat-4") === null, "no dqm-smaev-pat-4");
   // A stored choice for a counter that no longer exists is not sent.
   for (const a of frameCalls(page)) assert.deepStrictEqual(a.pattern, { 2: "present" });
   assert.strictEqual(byId(page, "dqm-smaev-pat-2").value, "present");
@@ -1971,7 +1972,7 @@ test("no summary and no frame: no counters are guessed", async () => {
     "sma::frame": () => { throw new Error("analyzer down"); },
   });
   assert.strictEqual(byId(page, "dqm-smaev-patternrow").byClass("dqm-smaev-pat").length, 0);
-  assert.strictEqual(byId(page, "dqm-smaev-pat-1"), null);
+  assert.ok(byId(page, "dqm-smaev-pat-1") === null, "no dqm-smaev-pat-1");
   assert.strictEqual(byId(page, "dqm-smaev-hidecurlab").style.display, "none");
   // Then a frame arrives: its labels are the roles.
   const later = await boot({ "sma::summary": () => { throw new Error("no summary"); } });

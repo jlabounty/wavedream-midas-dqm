@@ -14,7 +14,8 @@ fills histograms and a summary, and answers the two custom pages in mhttpd:
 
 | Page (side menu) | What it shows |
 |---|---|
-| **SMAPlots** | status chips, flags, a per-channel table, and six tabs of plots: Health, ToT / corruption, Timing, RF / delayed, MuPix, Trends (last 10 min) |
+| **SMAPlots** | status chips, flags, a per-channel table, and tabs of plots: Health, ToT / corruption, Timing, RF / delayed, MuPix phase space, MuPix pairs (unseeded), MuPix diagnostics, NIM / TOT, Trends (last 10 min) |
+| **MuPixPlots** | the three MuPix tabs of SMAPlots on a page of their own, with the status chips and the MuPix flags (see [The MuPixPlots page](#the-mupixplots-page)) |
 | **SMAEvents** | the latest frame: *S1-seeded events* (every channel and both MuPix planes around the latest S1 hits) and *Whole-frame raster* (time vs channel for the whole frame, the MuPix planes as two more rows) |
 
 The same bank also carries the MuPix pixel words (bit 63 clear, about 7300 of
@@ -65,9 +66,9 @@ The MIDAS python package must be importable (`$MIDASSYS/python` on `PYTHONPATH`)
 mdqm-register-pages --experiment <EXPT>
 ```
 
-This writes the `/Custom/SMAPlots` and `/Custom/SMAEvents` keys (and the
-WaveDREAM pages) with absolute paths to this checkout
-(`src/mdqm/install/manifest.py:117-119`). It is safe to run on every start; it
+This writes the `/Custom/SMAPlots`, `/Custom/SMAEvents` and `/Custom/MuPixPlots`
+keys (and the WaveDREAM pages) with absolute paths to this checkout
+(`src/mdqm/install/manifest.py:122-126`). It is safe to run on every start; it
 removes keys of its own that are no longer in the list (for example the old
 `/Custom/SMA`). Options (`src/mdqm/install/register_pages.py:207-220`):
 `--list`, `--dry-run`, `--check` (every key still points at a readable file),
@@ -199,8 +200,8 @@ accumulated plots.
 
 ### 4. Open the pages
 
-In the experiment's mhttpd, pick **SMAPlots** or **SMAEvents** in the side menu
-(`?cmd=custom&page=SMAPlots`). The first chip should say
+In the experiment's mhttpd, pick **SMAPlots**, **SMAEvents** or **MuPixPlots** in
+the side menu (`?cmd=custom&page=SMAPlots`). The first chip should say
 **sma_analyzer connected**. With no run and no data the pages stay empty; that
 is not an error.
 
@@ -370,6 +371,18 @@ vetoed fraction.
   as rows of all / light / heavy, `mupix_track_tot` and `mupix_track_state`.
   The rows stack one plot per line on a phone. See [MuPix
   x/y](#mupix-xy-positions-and-s1-seeded-tracks).
+* **MuPix pairs (unseeded)** ("MuPix pairs" on a phone): every sampled L1
+  pixel paired with the nearest-in-time L2 pixel, with or without an S1 hit,
+  as the nearline pairs them. A one-line note (the paired fraction of the
+  sampled L1 pixels, the mean partners, the window, the cap of L1 pixels per
+  frame, the light/heavy shares with the ToT cuts, the stage shift, and the
+  reminder that the counts are *pixel pairs, not particles*; "pairs off:" and
+  the reason when they are off), a "log z for the pair maps" switch (off by
+  default), x/y, x/x', y/y' as rows of all / light / heavy on the axes of the
+  phase-space tab, so the two tabs compare directly, then the L2 - L1 dt with
+  the pairing window outlined green and the number of L2 partners per L1 pixel.
+  The definition is in the *MuPix pairs* subsection under
+  [MuPix](#mupix-the-pixel-words-in-the-sma-frames).
 * **MuPix diagnostics**: above the plots, the share of S1 hits with an L1, an L2 and an
   L1+L2 pixel hit in time, in the sideband, and with the accidentals taken out
   (over the last 60 s), and the time-sync chip. Plots: t(pixel) - t(S1) per
@@ -393,6 +406,58 @@ Controls: log y / log z, update rate (1 Hz, 0.5 Hz, 0.2 Hz, paused), **Clear**
 and count; they have no zoom or menu buttons, and under/overflow is not drawn (the
 footnote gives its count when non-zero). A plot scrolled out of view stops updating
 and catches up within a second of scrolling back.
+
+## The MuPixPlots page
+
+`/Custom/MuPixPlots` (`pages/mupix.html`) is the SMAPlots page cut down to
+MuPix, for a shifter who watches only the phase space. It runs the same script
+(`pages/js/dqm-sma.js`); `<body data-view="mupix">` picks its entry in `VIEWS`
+there, which keeps:
+
+* the three MuPix tabs, **MuPix phase space** (opened first), **MuPix pairs
+  (unseeded)** and **MuPix diagnostics**, exactly as on SMAPlots;
+* the status chips, the sampling note, the toolbar, and the red banners (a
+  wrong coarse shift or a broken time base spoils the S1-seeded maps too);
+* only the flags that concern MuPix: the `mupix_*` flags, and `settings`,
+  `no_frames`, `all_stale` and `no_seeds`, which leave the MuPix plots wrong
+  or empty. A line under them counts the other flags ("2 other flags on the
+  SMA plots page"), so nothing is hidden silently.
+
+It has no per-channel table, no NIM / TOT tab and no trends. It needs the SMA
+analyzer, like SMAPlots. It remembers its tab, scales and update rate under
+its own browser key (`dqm-sma-mupix-settings`), so SMAPlots and MuPixPlots
+open side by side do not change each other's tab. **Clear** on either page
+clears every SMA histogram.
+
+**Registering it on pinky.** `mdqm-register-pages` adds the key with the
+others (step 2 above). On pinky the wrapper `register-custom-pages.sh` failed
+because it loaded the `standalone` profile, whose venv lacks `midas` on its
+path. This works:
+
+```bash
+cd ~/software/wavedream-frontends/wavedream-midas-dqm
+export PYTHONPATH=src:/home/pinky/packages/midas/python MIDASSYS=/home/pinky/packages/midas \
+       MIDAS_EXPTAB=/home/pinky/online/exptab
+PY=/home/pinky/software/wdscalers-venv/bin/python
+$PY -m mdqm.install.register_pages --experiment bt2026 --prefix WD --dry-run   # what it would write
+$PY -m mdqm.install.register_pages --experiment bt2026 --prefix WD             # write it
+$PY -m mdqm.install.register_pages --experiment bt2026 --prefix WD --check     # every key readable
+```
+
+Besides adding the keys, the write also removes `/Custom` keys of its own that
+are no longer in its list (pointing into this checkout), and creates
+`/DQM/Scalars` with its defaults if it is absent. It opens a MIDAS client on
+pinky like any `odbedit`: run it while the DAQ is up and healthy, and look at
+the Programs page afterwards (a client opened from the host can trigger
+MIDAS's clean-up of client entries it believes dead).
+
+The menu entry is then **WDMuPixPlots**, next to WDSMAPlots and WDSMAEvents.
+`WDS_PROFILE=pinky scripts/register-custom-pages.sh` in wavedream-scalar-readout
+may do the same if that profile carries `bt2026`, `WD` and the midas path;
+check it on pinky first. No menu key is a substring of another, with or
+without the prefix (`tests/test_manifest.py`): mhttpd highlights a menu entry
+whose key it finds inside the current page's name, so a key like that would
+light two entries up at once.
 
 ## The SMAEvents page
 
@@ -798,6 +863,142 @@ pixel words; synthetic 52000 words with 12800 pixel words) at 250 S1 hits,
 0.5-0.6 ms at 500. `XY/max S1 per frame` (1-2000; it is always a cap) changes
 the cost without resetting a plot.
 
+### MuPix pairs (unseeded): the nearline's L1-L2 coincidences
+
+Besides the S1-seeded tracks, the analyzer pairs MuPix pixels the way the
+nearline `PIPSMMuPixMonitor` does, with no S1 at all
+(`src/mdqm/plugins/sma_mupix_pairs.py`). These fill the **MuPix pairs
+(unseeded)** tab. Settings are under `/DQM/SMA/MuPix/Pairs`; `enable` = n books
+and fills none of it.
+
+**Which frames.** Good SMA frames, and also **MuPix-only frames**: frames with
+pixel words but no SMA trigger words (SMA counters off, a Sr-90 source scan,
+trigger words lost). A MuPix-only frame is still counted as *empty* in the
+frame counts and the frame-class plot, and it goes through the same sampling
+and CPU budget as every other frame. Its MuPix part is analysed: the pairs,
+plus the occupancy and ToT plots of the MuPix diagnostics tab. Nothing
+S1-seeded is filled (no in-time fractions, no S1-seeded x/y). The pairing
+needs only the pixels' relative times, which unwrap around their own median
+there. `pairs.mupix_only_frames` counts these frames over the summary window.
+Stale and suspect frames stay out.
+
+**The rule** is `MakePairs` of reco_testbeam (`PIPSMMuPixCore.hh:131-165`, the
+window from `WindowRange` at `:92`). Each L1 pixel takes the L2 pixel nearest
+in time within +-64 ns (`window ns`), both edges included. The nearline uses
++-40 ns, but on time-walk corrected times; on the DQM's raw times 64 ns gives
+the nearline's pair count (see the table below). A tie goes to the
+earlier L2 pixel, and of two L2 pixels with the same time stamp, to the one
+that came first in the readout. Nothing is consumed: one L2 pixel can partner
+several L1 pixels, as in the nearline. There is no clustering, so a
+two-pixel cluster in L1 gives two pairs. **The entries are pixel pairs, not
+particles.** The candidates are the pixels the reco decoder keeps: rows >= 250
+are dropped (the decoder drops them, `PITMidasMusip.cpp:1853`), and so are
+pixels on a chip with no place in the chip lists. Each pair fills the L1 pixel
+position and the slopes x' = 1000 (x2 - x1) / 30 mm, the same as the monitor
+(`PIPSMMuPixMonitor.cpp:1049`). The positions are in the frame of the x/y maps,
+with the XY table's shift and `MuPix/XY/apply stage shift`. The light and heavy
+classes use the XY cuts (`MuPix/XY/tot light max`, `tot heavy min`) on the
+two pixel ToTs: *light* when both are <= 9, *heavy* when both are >= 13.
+
+**The sample.** At most `max L1 per frame` (1000) L1 pixels per frame are
+paired, spread evenly over the frame's candidates in time order. When the
+per-frame pixel cap (`MuPix/max pixel hits per frame`) skipped the earliest
+words, L1 pixels within 100 ns of the first examined pixel are left out:
+their partners may be among the skipped words.
+
+**How this differs from the nearline maps:**
+
+* **Raw times.** The nearline pairs on time-walk corrected times; the DQM uses
+  the raw pixel time stamps (8 ns ticks), like the rest of the DQM. On raw times
+  the L2 - L1 spread is wider and lopsided (see the comparison below), which is
+  why the DQM's default window is 64 ns rather than 40.
+* **The L1 sample** (1000 per frame by default) instead of every L1 pixel.
+* **No hot-pixel mask.** The nearline's mask table is empty for these runs, so
+  this makes no difference today. A pair needs a hit in the other plane within
+  the window, which suppresses single-chip bursts and hot pixels anyway.
+
+**How this differs from the S1-seeded maps** on the phase-space tab: no S1 hit
+is needed, every L1 pixel counts (a muon that stops before S1, a particle
+outside the S1 window), and there is no cluster square. The axes are the same,
+so the two tabs compare bin by bin.
+
+**What an edit resets: only the pair maps.** No `MuPix/Pairs` key rebuilds the
+other plots or starts a new summary epoch. `enable`, `window ns` and
+`MuPix/XY/apply stage shift` reset (or book, or remove) all eleven pair
+histograms. The XY ToT cuts reset only the six light and heavy maps (of x/y
+and of the pairs). `max L1 per frame` is a CPU knob and resets nothing, like
+`XY/max S1 per frame`. The `pairs` summary counters restart with their maps;
+`resets` counts only resets made while the pairs are on. A `window ns` above
+100 is used as set, with a `settings` note: the dt plot cannot show its edges.
+
+| Plot | What it shows |
+|---|---|
+| `mupix_pair_xy` (`_light`, `_heavy`) | L1 pixel position of each pair |
+| `mupix_pair_xxp`, `mupix_pair_yyp` (and light, heavy) | x vs x', y vs y' of the pairs, on the axes of the S1-seeded maps |
+| `mupix_pair_dt` | t(L2) - t(L1), the nearline `dt`'s sign, of every L2 pixel within +-100 ns of a sampled L1 pixel (not only the chosen partner), in 8 ns bins (one MuPix tick) centred on the ticks: the window is judged from this. At most 4 entries per sampled L1 pixel and frame: in a noise burst or a dense spill an even subset of the sampled L1 pixels fills it, which keeps the shape and bounds the cost |
+| `mupix_pair_partners` | L2 pixels in the window per sampled L1 pixel: 0 = unpaired, 1 = no ambiguity, more than 10 in the overflow |
+
+All eleven are uint32 and switch to uint64 before a bin could wrap, like the
+x/y maps; together they are 0.44 MB. A refresh of the pairs tab with all nine
+maps on screen moves up to about 0.46 MB through mhttpd, the same as the
+phase-space tab (only visible plots are fetched). The summary's `pairs` block
+(60 s window) has:
+
+* `n_l1`: the L1 pixels sampled;
+* `n_pairs` and `paired_frac`: those with a partner;
+* `mean_partners`: L2 pixels in the window per *paired* L1 pixel;
+* `light_frac` and `heavy_frac`: shares of the pairs;
+* `window_ns`, `max_l1`, `cuts` and `stage` (the same shape as `xy.stage`);
+* `enabled`, `off_reason` and `resets`;
+* `mupix_only_frames`: the MuPix-only frames analysed (see above).
+
+**Compared on run 1008 subrun 0** (stage at 0; `mdqm-sma-file` with the old
+roles against the `release-1003` hists file;
+`scratch/sma-mupix-pairs/nearline-cmp/compare_pairs.py`), the nearline's
+`track_xy_expanded` / `xxp_central` / `yyp_central`:
+
+| | pairs | x mean | x RMS | y mean | y RMS | x' mean | x' RMS | y' mean | y' RMS | x/x' slope |
+|---|---|---|---|---|---|---|---|---|---|---|
+| nearline (+-40 ns, time-walk corrected) | 655k | -1.89 mm | 8.91 mm | -1.32 mm | 8.59 mm | -0.37 mrad | 24.52 mrad | -5.63 mrad | 15.75 mrad | 1.418 mrad/mm |
+| DQM, defaults (+-64 ns, 1000 L1 per frame) | 175k | -1.77 | 8.94 | -1.44 | 8.65 | -0.28 | 24.58 | -5.39 | 17.24 | 1.419 |
+| DQM, every L1 pixel, +-64 ns | 646k | -1.78 | 8.94 | -1.44 | 8.64 | -0.29 | 24.64 | -5.39 | 17.23 | 1.416 |
+| DQM, +-40 ns, 500 L1 per frame | 75k | -1.73 | 8.99 | -1.66 | 8.72 | -0.50 | 24.78 | -5.40 | 17.25 | 1.411 |
+| DQM, every L1 pixel, +-40 ns | 554k | -1.72 | 8.98 | -1.64 | 8.74 | -0.44 | 24.75 | -5.38 | 17.30 | 1.418 |
+
+At the defaults the positions agree within 0.12 mm and the x' distribution
+within 0.1 mrad (at +-40 ns: 0.35 mm and 0.3 mrad).
+The y' core agrees: the RMS inside +-40 mrad is 14.75 against 14.68 mrad. The y'
+RMS is larger because of a tail: 0.9 % of the DQM pairs have |y'| > 60 mrad,
+against 0.34 % in the nearline. These are wrong partners picked on raw times.
+
+**Is +-40 ns enough on raw times? Not quite.** The raw t(L2) - t(L1) peaks at
++8 ns with an RMS of 26 ns. It has a long tail towards positive values (L2
+late; about 5 % beyond +50 to +58 ns, one 8 ns bin). The time-walk corrected
+nearline peak is centred (RMS 20 ns). So +-40 ns keeps about 89 % of the real coincidences on raw times,
+against 96 % in the nearline. The paired fraction of the L1 pixels grows with
+the window, and the accidental pairs stay small (from L2 shifted by 2 us):
+
+| window | +-24 | +-32 | +-40 | +-48 | +-56 | +-64 | +-72 | +-80 | +-96 |
+|---|---|---|---|---|---|---|---|---|---|
+| paired | 56.5 % | 66.0 % | 73.3 % | 78.6 % | 82.6 % | 85.5 % | 87.7 % | 89.3 % | 91.4 % |
+| accidental | 0.7 % | 0.9 % | 1.1 % | 1.2 % | 1.4 % | 1.6 % | 1.8 % | 2.0 % | 2.3 % |
+
+The nearline pairs 87 % of its L1 pixels (655k of 752k) at +-40 ns. The DQM
+gets close to that count at +-64 ns (646k pairs), which is therefore the
+default. Set `window ns` to 40 for the nearline's number on raw times (fewer
+pairs); the `mupix_pair_dt` plot shows the spread on every run.
+
+**Cost** (`scratch/sma-mupix-pairs/bench_pairs.py`, one core, three repeats;
+time inside the fill in the analyzer loop; run 1008, about 3700 L1 candidates
+a frame, and synthetic frames with 12800 pixel words): 0.32-0.39 ms per frame
+at the default 1000 L1 pixels, 0.25-0.29 ms at 500, 0.47-0.57 ms at 2000,
+0.6-1.2 ms with every L1 pixel. The numbers vary with the laptop's load. Most
+of it is a fixed cost per frame. Measured hot (the same frame repeated), the
+fill takes about 0.25 ms at 1000. A noise burst does not raise it: with 20000
+pixels packed into 2 us the fill stays at about 0.31 ms
+(`scratch/sma-mupix-pairs/review/burst_bench.py`; 2.2 ms before the dt cap).
+`max L1 per frame` (1-20000) is the knob and resets no plot.
+
 ## NIM copies of the counters (TOT + NIM)
 
 Since run 1015 each scintillator counter reaches the SMA twice: its TOT
@@ -977,7 +1178,7 @@ after any change to the NIM cables, thresholds or delays.
 
 The analyzer re-reads the tree every 2 s (`analyzer.py:231-233`); edits take
 effect without a restart. Changing the coarse shift, channel roles (except
-labels), anything under Cuts, Binning, MuPix (except `MuPix/XY`) or NIM (except its two CPU knobs) **rebuilds the histograms and zeroes
+labels), anything under Cuts, Binning, MuPix (except `MuPix/XY` and `MuPix/Pairs`) or NIM (except its two CPU knobs) **rebuilds the histograms and zeroes
 them** (`SmaPlugin.apply_settings`) and posts a MIDAS message. Labels, Self check
 and Sampling never reset a plot. Defaults: `SETTINGS_DEFAULTS` in `sma.py`.
 
@@ -1051,9 +1252,12 @@ histograms.
 | `MuPix/max S1 per frame` | 500 | S1 hits per frame matched against the pixels (evenly spread); 0 = all | yes |
 | `MuPix/XY/enable` | y | MuPix x/y histograms (see [MuPix x/y](#mupix-xy-positions-and-s1-seeded-tracks)); n = none booked or filled | the x/y maps only |
 | `MuPix/XY/cluster box px` | 3 | a plane is accepted when its in-window pixels lie on one chip in this square (1-64) | the x/y maps only |
-| `MuPix/XY/tot light max`, `tot heavy min` | 9, 13 | track ToT classes (both planes' max pixel ToT, 0-31); light max must be below heavy min. PROVISIONAL | the light/heavy maps only |
-| `MuPix/XY/apply stage shift` | y | add (-x, +y) of `/Equipment/XYTable/Variables/Measured` (re-read every 2 s; 0 when absent) to every position | the x/y maps only |
+| `MuPix/XY/tot light max`, `tot heavy min` | 9, 13 | track ToT classes (both planes' max pixel ToT, 0-31), also the pair classes (both pixels' ToT); light max must be below heavy min. PROVISIONAL | the light/heavy maps only (x/y and pairs) |
+| `MuPix/XY/apply stage shift` | y | add (-x, +y) of `/Equipment/XYTable/Variables/Measured` (re-read every 2 s; 0 when absent) to every position, x/y and pairs | the x/y and pair maps only |
 | `MuPix/XY/max S1 per frame` | 250 | S1 hits per frame given to the track finder, from the MuPix sample; 1-2000 (outside: clamped, with a `settings` note; 0 is not "all"). A CPU knob | **no** |
+| `MuPix/Pairs/enable` | y | unseeded L1-L2 pixel pairs (see [MuPix pairs](#mupix-pairs-unseeded-the-nearlines-l1-l2-coincidences)); n = none booked or filled | the pair maps only |
+| `MuPix/Pairs/window ns` | 64 | half window of the pairing, whole ns, both edges included (0-1000; above 100 a `settings` note, the dt plot cannot show the edges); the nearline's is 40 on time-walk corrected times, 64 matches its pair count on raw times | the pair maps only |
+| `MuPix/Pairs/max L1 per frame` | 1000 | L1 pixels paired per frame, spread evenly; 1-20000 (outside: clamped, with a `settings` note; 0 is not "all"). A CPU knob | **no** |
 | `NIM/channels` | [3, 9, 10, 11, 12] | NIM copy of each counter (per `Channel roles/counters` entry); -1 = none, [-1] alone = no NIM at all. A NIM channel that is also S1, a counter, the RF, `current` or `delayed` turns NIM off (a `settings` flag); a repeated one drops that entry | yes |
 | `NIM/offset ns` | [0, 0, 0, 0, 0] | per counter, t'_NIM = t - offset in whole ns (a fraction is rounded, with a `settings` note); set from the `nim_dt` peak | yes |
 | `NIM/lag nominal ns` | [0, 0, 0, 0, 0] | per counter, the NIM copy's expected fine - fine(S1) (cable delay, flight); the lag vote is "faulted" beyond `lag tolerance ns` of it | yes |
@@ -1253,6 +1457,7 @@ Outputs in the output directory:
 | `summary.png` | one-page overview |
 | `nim.png` | the TOT + NIM page, when a counter has a NIM copy |
 | `mupix_xy.png` | the MuPix x/y page (hit maps, ToT map, tracks all / light / heavy), when `MuPix/XY/enable` = y |
+| `mupix_pairs.png` | the unseeded pairs page (L2 - L1 dt with the window, partners per L1 pixel, pairs all / light / heavy), when `MuPix/Pairs/enable` = y |
 
 A text summary goes to the terminal: frame classes, live fraction, shift check,
 rates, mismatch per channel, efficiencies, the MuPix in-time fractions, flags.

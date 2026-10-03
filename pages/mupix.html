@@ -2,22 +2,27 @@
 <html class="mcss" lang="en">
 <head>
   <meta charset="UTF-8">
-  <title>SMA events</title>
+  <title>MuPix</title>
 
   <link rel="stylesheet" href="midas.css">
   <script src="controls.js"></script>
   <script src="midas.js"></script>
   <script src="mhttpd.js"></script>
+  <script src="mplot.js"></script>
 
+  <!-- The SMAPlots page's own script and styles: data-view="mupix" below keeps
+       only the MuPix tabs (phase space, pairs, diagnostics), the status chips,
+       the banners and the MuPix flags (VIEWS in dqm-sma.js). Keep the ?v=
+       strings in step with sma.html. -->
   <link rel="stylesheet" href="dqm.css?v=8">
   <link rel="stylesheet" href="dqm-sma.css?v=13">
   <script src="dqm-common.js?v=8"></script>
   <script src="dqm-brpc.js?v=13"></script>
-  <script src="dqm-smaframe.js?v=5"></script>
-  <script src="dqm-sma-events.js?v=14"></script>
+  <script src="dqm-heatmap.js?v=1"></script>
+  <script src="dqm-sma.js?v=12"></script>
 </head>
 
-<body class="mcss">
+<body class="mcss" data-view="mupix">
   <div id="mheader"></div>
   <div id="msidenav"></div>
   <div id="mmain">
