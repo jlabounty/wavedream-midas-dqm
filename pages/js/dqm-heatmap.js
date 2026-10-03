@@ -15,9 +15,10 @@
 // when the layout changes (size, pixel ratio, ranges, titles, z scale). An
 // update whose bins are the same as last time draws nothing at all.
 //
-// The colours are mplot's (hue 240 -> 0 from the bottom of the z scale to the
-// top, bins below 0.5 white), so the page keeps its look. Under- and overflow
-// bins are not drawn; the page states their content in the footnote.
+// The colours are viridis (DQM.VIRIDIS, dqm-common.js) from the bottom of the z
+// scale to the top, not mplot's hue rainbow, which colour-blind shifters cannot
+// read; bins below 0.5 stay white. Under- and overflow bins are not drawn; the
+// page states their content in the footnote.
 //
 
 (function (root) {
@@ -29,24 +30,17 @@ const LABEL = "#404040";
 const ZERO = [255, 255, 255, 255];        // bins below 0.5 (mplot's zeroColor "white")
 const NAN = [128, 128, 128, 255];
 
-/** RGB of hsl(h, 100 %, 50 %), h in degrees. */
-function hslRgb(h) {
-  const f = (n) => {
-    const k = (n + h / 30) % 12;
-    return 0.5 - 0.5 * Math.max(-1, Math.min(k - 3, 9 - k, 1));
-  };
-  return [f(0), f(8), f(4)].map((x) => Math.round(x * 255));
-}
+const DQM = root.DQM || require("./dqm-common.js");
 
 /**
- * The colour table: 256 RGBA entries, index 0 the bottom of the z scale (blue,
- * hue 240), 255 the top (red, hue 0) -- mplot's floor((1 - v) * 240).
+ * The colour table: 256 RGBA entries, index 0 the bottom of the z scale (dark
+ * purple), 255 the top (yellow) -- viridis.
  */
 function makeLut() {
   const lut = new Uint8ClampedArray(256 * 4);
   for (let k = 0; k < 256; k++) {
-    const [r, g, b] = hslRgb(Math.floor((1 - k / 255) * 240));
-    lut[4 * k] = r; lut[4 * k + 1] = g; lut[4 * k + 2] = b; lut[4 * k + 3] = 255;
+    lut.set(DQM.VIRIDIS.subarray(3 * k, 3 * k + 3), 4 * k);
+    lut[4 * k + 3] = 255;
   }
   return lut;
 }

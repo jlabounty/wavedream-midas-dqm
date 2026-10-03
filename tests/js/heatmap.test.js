@@ -38,16 +38,18 @@ function hist(nx, ny, f, flow = 0, edges = [[0, nx], [0, ny]]) {
 }
 
 const rgba = (px, nx, col, row) => Array.from(px.slice((row * nx + col) * 4, (row * nx + col) * 4 + 4));
-const RED = [255, 0, 0, 255], BLUE = [0, 0, 255, 255], GREEN = [0, 255, 0, 255], WHITE = [255, 255, 255, 255];
+// viridis: dark purple at the bottom of the z scale, yellow at the top.
+const TOP = [253, 231, 37, 255], BOTTOM = [68, 1, 84, 255], WHITE = [255, 255, 255, 255];
 
-test("the colour table runs from blue (bottom) through green to red (top), as mplot's hues", () => {
+test("the colour table is viridis: dark purple (bottom) through teal to yellow (top)", () => {
   const L = H.LUT;
-  assert.deepStrictEqual(Array.from(L.slice(0, 4)), BLUE);
-  assert.deepStrictEqual(Array.from(L.slice(255 * 4, 256 * 4)), RED);
-  // v = 0.5 -> floor(0.5 * 240) = hue 120, pure green
-  const mid = Math.round(127.5);
-  const [r, g, b] = Array.from(L.slice(mid * 4, mid * 4 + 3));
-  assert.ok(g === 255 && r < 10 && b < 10, `${r},${g},${b}`);
+  assert.deepStrictEqual(Array.from(L.slice(0, 4)), BOTTOM);
+  assert.deepStrictEqual(Array.from(L.slice(255 * 4, 256 * 4)), TOP);
+  // matplotlib's viridis(128) = #21918c
+  assert.deepStrictEqual(Array.from(L.slice(128 * 4, 128 * 4 + 4)), [33, 145, 140, 255]);
+  // brightness rises monotonically, so the scale also reads in greyscale
+  const lum = (k) => 0.2126 * L[4 * k] + 0.7152 * L[4 * k + 1] + 0.0722 * L[4 * k + 2];
+  for (let k = 8; k < 256; k += 8) assert.ok(lum(k) > lum(k - 8), `luminance at ${k}`);
 });
 
 test("bins map to pixels with y up, and under/overflow are neither drawn nor scaled", () => {
@@ -61,10 +63,10 @@ test("bins map to pixels with y up, and under/overflow are neither drawn nor sca
   const px = H.fillPixels(new Uint8ClampedArray(3 * 2 * 4), h.data, 3, 2, s);
   assert.strictEqual(px.length, 24, "one pixel per in-range bin");
   // Bin (2, 1) = 6 is the maximum: top row (pixel row 0), right column.
-  assert.deepStrictEqual(rgba(px, 3, 2, 0), RED);
+  assert.deepStrictEqual(rgba(px, 3, 2, 0), TOP);
   // Bin (0, 0) = 1 is the bottom-left pixel, near the bottom of the scale.
   const bl = rgba(px, 3, 0, 1);
-  assert.ok(bl[2] > 200 && bl[0] === 0, `bottom-left ${bl}`);
+  assert.ok(bl[0] < 80 && bl[1] < 80 && bl[2] > bl[1], `bottom-left ${bl}`);
 });
 
 test("log z: 0.5 is the bottom, the largest bin the top, empty bins white", () => {
@@ -73,14 +75,14 @@ test("log z: 0.5 is the bottom, the largest bin the top, empty bins white", () =
   assert.deepStrictEqual([s.min, s.max], [0.5, 10000]);
   const px = H.fillPixels(new Uint8ClampedArray(16), h.data, 4, 1, s);
   assert.deepStrictEqual(rgba(px, 4, 0, 0), WHITE, "an empty bin");
-  assert.deepStrictEqual(rgba(px, 4, 3, 0), RED);
-  // log10(100/0.5) / log10(10000/0.5) = 0.535 of the way up: green-ish, hue ~111.
+  assert.deepStrictEqual(rgba(px, 4, 3, 0), TOP);
+  // log10(100/0.5) / log10(10000/0.5) = 0.535 of the way up: viridis teal.
   const [r, g, b] = rgba(px, 4, 2, 0);
-  assert.ok(g === 255 && b === 0 && r > 0 && r < 80, `${r},${g},${b}`);
-  // The same bins on a linear scale: 100 of 10000 is nearly the bottom (blue).
+  assert.ok(r < 60 && g > 130 && b > 120, `${r},${g},${b}`);
+  // The same bins on a linear scale: 100 of 10000 is nearly the bottom (dark purple).
   const lin = H.fillPixels(new Uint8ClampedArray(16), h.data, 4, 1, H.zScale(h.data, 4, 1, false));
   const c = rgba(lin, 4, 2, 0);
-  assert.ok(c[2] === 255 && c[0] === 0, `linear ${c}`);
+  assert.ok(c[0] < 80 && c[1] < 20 && c[2] > 70, `linear ${c}`);
 });
 
 test("ticks: 1-2-5 steps inside the range, log decades", () => {

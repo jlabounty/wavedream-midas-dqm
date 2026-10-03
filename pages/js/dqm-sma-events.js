@@ -548,10 +548,16 @@ function rawOf(frame, i) {
   return p && p.rawWord ? p.rawWord[i - frame.nHits] : undefined;
 }
 
-/** A pixel ToT colour, 0..31: its own scale (cyan-blue short, orange long), not the SMA one. */
+/**
+ * Where the hit colours stop on viridis. Its last tenth is pale yellow, which
+ * all but disappears as a 1.5 px bar on the white and #f4f4f4 lanes, so the
+ * largest ToT ends on yellow-green instead.
+ */
+const HIT_VIRIDIS_TOP = 0.85;
+
+/** A pixel ToT colour, 0..31: viridis over the MuPix range (its own legend ramp). */
 function pixColour(tot) {
-  const v = Math.min(1, tot / 31);
-  return `hsl(${Math.round(200 - v * 170)}, 75%, ${Math.round(55 - v * 15)}%)`;
+  return DQM.viridis(Math.min(1, tot / 31) * HIT_VIRIDIS_TOP);
 }
 
 // ---------------------------------------------------------------------------
@@ -1209,10 +1215,10 @@ function renderRaster(frame) {
   renderHints("raster");
 }
 
+/** An SMA ToT colour: viridis over codes 0..249; >= 250 (corrupt) magenta. */
 function totColour(tot) {
   if (tot >= 250) return "#c0c";
-  const v = Math.min(1, tot / 249);
-  return `hsl(${Math.round((1 - v) * 240)}, 90%, 45%)`;
+  return DQM.viridis(Math.min(1, tot / 249) * HIT_VIRIDIS_TOP);
 }
 
 /**
