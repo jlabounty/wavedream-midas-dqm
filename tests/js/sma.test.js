@@ -1219,17 +1219,21 @@ test("the trends tab has the TOT + NIM pair efficiency per counter", async () =>
 // numbers it checks and does not follow the plugin's defaults or the fixture:
 // the 2D maps are drawn from a fixture 2D histogram, dt / partners from a 1D one.
 
-const PAIR_ORDER = ["mupix_pair_xy", "mupix_pair_xy_light", "mupix_pair_xy_heavy",
+const PAIR_ORDER = ["mupix_pair_hits_xy_L1", "mupix_pair_hits_xy_L2",
+  "mupix_pair_xy", "mupix_pair_xy_light", "mupix_pair_xy_heavy",
   "mupix_pair_xxp", "mupix_pair_xxp_light", "mupix_pair_xxp_heavy",
   "mupix_pair_yyp", "mupix_pair_yyp_light", "mupix_pair_yyp_heavy",
   "mupix_pair_dt", "mupix_pair_partners"];
 const PAIR_2D = PAIR_ORDER.filter((n) => !/_(dt|partners)$/.test(n));
+const PAIR_PLANES = PAIR_2D.filter((n) => /_hits_xy_L\d$/.test(n));
+const PAIR_MAPS = PAIR_2D.filter((n) => !PAIR_PLANES.includes(n));
 
 function pairsSummary(pairs) {
   const s = clone(FX.summary);
   s.pairs = Object.assign({
     enabled: true, n_l1: 41234, paired_frac: 0.6321, mean_partners: 1.4166,
     light_frac: 0.401, heavy_frac: 0.1203, window_ns: 40, max_l1: 2000,
+    hits: { n_l1: 52345, n_l2: 51234 }, max_hits: 2000,
     cuts: clone(FX.summary.xy.cuts),
     stage: { x_mm: 1.5, y_mm: -2, source: "odb", applied: true, shift_mm: [-1.5, -2], note: null },
     off_reason: null,
@@ -1272,15 +1276,18 @@ test("MuPix pairs: its own tab between phase space and diagnostics, short label 
                          ["mupixxy", "mupixpair", "mupix"]);
 });
 
-test("MuPix pairs: the pair plots alone, all / light / heavy rows, then dt and partners", async () => {
+test("MuPix pairs: L1 alone | L2 alone, then all / light / heavy rows, then dt and partners", async () => {
   const page = await pairsTab();
   const grid = pairGrid(page);
   assert.deepStrictEqual(titleNames(grid), PAIR_ORDER);
   assert.ok(grid.children[0] === byId(page, "dqm-sma-pairhead"), "the note heads the tab");
   const rows = grid.byClass("dqm-sma-row");
-  assert.deepStrictEqual(rows.map((r) => r.attrs["data-row"]), ["pairxy", "pairxxp", "pairyyp"]);
-  assert.ok(rows.every((r) => r.className === "dqm-sma-row dqm-sma-row3"));
-  assert.deepStrictEqual(titleNames(rows[1]), ["mupix_pair_xxp", "mupix_pair_xxp_light", "mupix_pair_xxp_heavy"]);
+  assert.deepStrictEqual(rows.map((r) => r.attrs["data-row"]), ["pairhits", "pairxy", "pairxxp", "pairyyp"]);
+  assert.ok(grid.children[1] === rows[0], "the plane row comes right after the note");
+  assert.strictEqual(rows[0].className, "dqm-sma-row dqm-sma-row2");
+  assert.deepStrictEqual(titleNames(rows[0]), ["mupix_pair_hits_xy_L1", "mupix_pair_hits_xy_L2"]);
+  assert.ok(rows.slice(1).every((r) => r.className === "dqm-sma-row dqm-sma-row3"));
+  assert.deepStrictEqual(titleNames(rows[2]), ["mupix_pair_xxp", "mupix_pair_xxp_light", "mupix_pair_xxp_heavy"]);
   for (const n of ["mupix_pair_dt", "mupix_pair_partners"]) {
     const w = grid.byClass("dqm-sma-plotwrap").find((x) => new RegExp(`\\[${n}\\]$`).test(x.children[0].textContent));
     assert.ok(w.parent === grid, `${n} is not in a row`);
@@ -1300,7 +1307,10 @@ test("MuPix pairs: maps linear z by default with their own switch; dt shows the 
   const page = await pairsTab();
   const plot = (n) => pairGrid(page).byClass("dqm-sma-plotwrap")
     .find((w) => new RegExp(`\\[${n}\\]$`).test(w.children[0].textContent)).children[1];
-  for (const n of PAIR_2D) assert.strictEqual(plot(n).heatmap.logZ, false, n);
+  for (const n of PAIR_MAPS) assert.strictEqual(plot(n).heatmap.logZ, false, n);
+  // The single-plane maps follow the toolbar's log z (on by default), as the
+  // phase-space tab's hit maps do; the pairs switch does not move them.
+  for (const n of PAIR_PLANES) assert.strictEqual(plot(n).heatmap.logZ, true, n);
   const dt = plot("mupix_pair_dt").mpg;
   assert.deepStrictEqual(dt.param.plot.map((q) => q.label), ["mupix_pair_dt", "pairing window"]);
   assert.deepStrictEqual(dt.data[1].x, [-40, -40, 40, 40], "±window_ns outlined");
@@ -1311,6 +1321,13 @@ test("MuPix pairs: maps linear z by default with their own switch; dt shows the 
   box.onchange.call(box);
   await settle(page);
   assert.strictEqual(plot("mupix_pair_xy_heavy").heatmap.logZ, true);
+  box.checked = false;
+  box.onchange.call(box);
+  await settle(page);
+  for (const n of PAIR_PLANES) assert.strictEqual(plot(n).heatmap.logZ, true, n);
+  box.checked = true;
+  box.onchange.call(box);
+  await settle(page);
   const stored = JSON.parse(globalThis.localStorage._d["dqm-sma-settings"]);
   assert.strictEqual(stored.pairLogZ, true, "remembered");
   assert.strictEqual(stored.xyLogZ, false, "the phase-space switch is a separate one");
@@ -1321,7 +1338,9 @@ test("the MuPix pairs note: fraction, partners, window, cap, cuts, stage, the pi
   const t = pairNote(page);
   const c = FX.summary.xy.cuts;
   assert.strictEqual(t, "MuPix pairs: 63.2 % of 41,234 L1 pixels paired · mean partners 1.42 · " +
-    "window ±40 ns · at most 2,000 L1 pixels per frame · light 40.1 %, heavy 12.0 % of the pairs " +
+    "window ±40 ns · at most 2,000 L1 pixels per frame · " +
+    "L1 / L2 alone: 52,345 / 51,234 pixels (at most 2,000 a plane per frame) · " +
+    "light 40.1 %, heavy 12.0 % of the pairs " +
     `(light: both pixels' ToT ≤ ${c.tot_light_max} (×${c.tot_ns} ns) · heavy: ≥ ${c.tot_heavy_min}) · ` +
     "stage shift x −1.50, y −2.00 mm (XY table) · pixel pairs, not particles");
   const hint = byId(page, "dqm-sma-pairnote").byClass("dqm-sma-xy-muted")[0];

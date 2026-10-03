@@ -267,11 +267,12 @@ def test_a_dense_frame_is_fast_enough():
 
 PAIR_MAPS = tuple(f"mupix_pair_{k}{c}" for k in ("xy", "xxp", "yyp")
                   for c in ("", "_light", "_heavy"))
-PAIR_HISTS = (*PAIR_MAPS, "mupix_pair_dt", "mupix_pair_partners")
+PLANE_MAPS = ("mupix_pair_hits_xy_L1", "mupix_pair_hits_xy_L2")
+PAIR_HISTS = (*PAIR_MAPS, *PLANE_MAPS, "mupix_pair_dt", "mupix_pair_partners")
 SUMMARY_KEYS = {"enabled", "off_reason", "resets", "mupix_only_frames", "n_l1", "n_pairs",
                 "paired_frac",
                 "mean_partners", "light_frac", "heavy_frac", "window_ns", "max_l1", "cuts",
-                "stage"}
+                "stage", "hits", "max_hits"}
 
 
 def _pair_names(p):
@@ -291,6 +292,11 @@ def test_the_plugin_books_the_pair_histograms_on_the_xy_axes():
     for k in ("xy", "xxp", "yyp"):
         a, b = h(f"mupix_pair_{k}"), h(f"mupix_track_{k}")
         assert (a.x, a.y) == (b.x, b.y), k
+    for pl in ("L1", "L2"):
+        a, b = h(f"mupix_pair_hits_xy_{pl}"), h(f"mupix_hits_xy_{pl}")
+        assert (a.x, a.y) == (b.x, b.y), pl
+        assert a.x.n == a.y.n == 130 and abs((a.x.hi - a.x.lo) / a.x.n - 0.64) < 1e-9
+        assert f"{pl} alone" in a.title and f"at most {PR.MAX_HITS} a frame" in a.title
     for n in PAIR_HISTS:
         assert h(n).counts.dtype == np.uint32, n
     dt = h("mupix_pair_dt").x
@@ -299,7 +305,8 @@ def test_the_plugin_books_the_pair_histograms_on_the_xy_axes():
     assert (centres % 8 == 0).all() and 40 in centres and -40 in centres
     pa = h("mupix_pair_partners").x
     assert (pa.n, pa.lo, pa.hi) == (11, -0.5, 10.5)
-    assert sum(h(n).counts.nbytes for n in PAIR_HISTS) < 0.5e6
+    # Eleven pair plots ~0.46 MB, the two single-plane maps 2 x 70 kB.
+    assert sum(h(n).counts.nbytes for n in PAIR_HISTS) < 0.65e6
 
 
 def test_a_frame_with_known_pairs_fills_every_pair_plot():
@@ -400,32 +407,41 @@ def test_xy_off_with_pairs_on_books_only_the_pairs_and_reads_the_stage():
     ({"max L1 per frame": -5}, "using 1"),
     ({"max L1 per frame": 50000}, "using 20000"),
     ({"max L1 per frame": "lots"}, "max L1 per frame"),
+    ({"max hits per frame": 0}, "max hits per frame=0"),
+    ({"max hits per frame": -5}, "max hits per frame=-5"),
+    ({"max hits per frame": 50000}, "max hits per frame=50000"),
+    ({"max hits per frame": "lots"}, "max hits per frame"),
 ])
 def test_bad_pair_settings_fall_back_and_are_reported(tree, err):
     cfg = P.parse_settings({"MuPix": {"Pairs": tree}})
     assert any(e.startswith("MuPix/Pairs/") and err in e for e in cfg.errors), cfg.errors
     assert 0 <= cfg.pairs.window_ns <= PR.WINDOW_LIMIT_NS
     assert 1 <= cfg.pairs.max_l1 <= PR.MAX_L1_LIMIT
+    assert 1 <= cfg.pairs.max_hits <= PR.MAX_HITS_LIMIT
     if "window" in err:
         assert cfg.pairs.window_ns == PR.WINDOW_NS
 
 
 def test_good_pair_settings_parse():
     cfg = P.parse_settings({"MuPix": {"Pairs": {"enable": "n", "window ns": 64,
-                                                "max L1 per frame": 20000},
+                                                "max L1 per frame": 20000,
+                                                "max hits per frame": 20000},
                                       "XY": {"tot light max": 3, "tot heavy min": 10,
                                              "apply stage shift": False}}})
     assert not cfg.errors
     pr = cfg.pairs
-    assert (pr.enable, pr.window_ns, pr.max_l1, pr.tot_light_max, pr.tot_heavy_min,
-            pr.apply_stage) == (False, 64, 20000, 3, 10, False)
+    assert (pr.enable, pr.window_ns, pr.max_l1, pr.max_hits, pr.tot_light_max, pr.tot_heavy_min,
+            pr.apply_stage) == (False, 64, 20000, 20000, 3, 10, False)
     d = P.parse_settings({}).pairs
-    assert (d.enable, d.window_ns, d.max_l1, d.active) == (True, PR.WINDOW_NS, PR.MAX_L1, True)
+    assert (d.enable, d.window_ns, d.max_l1, d.max_hits, d.active) == (
+        True, PR.WINDOW_NS, PR.MAX_L1, PR.MAX_HITS, True)
+    assert P.parse_settings({"MuPix": {"Pairs": {"max hits per frame": 1}}}).pairs.max_hits == 1
 
 
 def test_no_pair_key_is_in_the_shape_fingerprint():
     base = P.shape_fingerprint({})
-    for k, v in (("enable", False), ("window ns", 64), ("max L1 per frame", 9)):
+    for k, v in (("enable", False), ("window ns", 64), ("max L1 per frame", 9),
+                 ("max hits per frame", 9)):
         assert P.shape_fingerprint({"MuPix": {"Pairs": {k: v}}}) == base, k
 
 
@@ -442,6 +458,8 @@ def _pair_entries(p):
 @pytest.mark.parametrize("edit, reset", [
     ({"Pairs": {"window ns": 32}}, "all"),
     ({"Pairs": {"max L1 per frame": 100}}, "none"),        # a CPU knob, as XY's
+    ({"Pairs": {"max hits per frame": 100}}, "none"),      # likewise
+    ({"Pairs": {"enable": True, "window ns": 64}}, "none"),  # the defaults: no change
     ({"XY": {"apply stage shift": False}}, "all"),
     ({"XY": {"tot light max": 5, "tot heavy min": 9}}, "classes"),
     ({"XY": {"cluster box px": 4, "max S1 per frame": 100}}, "none"),
@@ -455,6 +473,7 @@ def test_a_pair_edit_resets_only_the_pair_maps(edit, reset):
     s0 = p.summary()
     epoch, rebuilds = p.epoch, p.rebuilds
     assert pr0["mupix_pair_xy"] == 40 and pr0["mupix_pair_xy_heavy"] == 40
+    assert pr0["mupix_pair_hits_xy_L1"] == 40 == pr0["mupix_pair_hits_xy_L2"]
     new = {"XY": {**base["MuPix"]["XY"], **edit.get("XY", {})}, "Pairs": edit.get("Pairs", {})}
     settings = old_layout({"MuPix": new})
     p.apply_settings(settings, rebuild=p.shape_fingerprint(settings) != p.shape_fingerprint(
@@ -473,6 +492,8 @@ def test_a_pair_edit_resets_only_the_pair_maps(edit, reset):
         assert e == (0 if zeroed else pr0[k]), k
     s1 = p.summary()["pairs"]
     assert (s1["n_l1"] == 0) == (reset == "all")
+    # The single-plane maps and their counters reset with the full set only.
+    assert s1["hits"] == ({"n_l1": 0, "n_l2": 0} if reset == "all" else s0["pairs"]["hits"])
     assert s1["resets"] == (0 if reset == "none" else 1)
     if reset == "classes":
         assert "ToT >= 9" in p.store.get("sma/mupix_pair_xy_heavy").title
@@ -504,6 +525,11 @@ def test_the_pair_histograms_widen_before_a_bin_could_wrap():
     m.entries = int(np.iinfo(np.uint32).max)
     P._widen(m, 1)
     assert m.counts.dtype == np.uint64
+    hm = p.store.get("sma/mupix_pair_hits_xy_L1")
+    assert hm.counts.dtype == np.uint32
+    hm.entries = int(np.iinfo(np.uint32).max) - 1
+    _feed(p, frame_words(n=40), run=1)
+    assert hm.counts.dtype == np.uint64 and hm.entries == int(np.iinfo(np.uint32).max) + 39
 
 
 def test_the_cap_and_the_skipped_pixels():
@@ -524,6 +550,9 @@ def test_the_summary_block_keys():
     s = p.summary()["pairs"]
     assert set(s) == SUMMARY_KEYS
     assert set(s["cuts"]) == {"tot_light_max", "tot_heavy_min", "tot_ns"}
+    assert set(s["hits"]) == {"n_l1", "n_l2"} and s["max_hits"] == PR.MAX_HITS
+    assert s["hits"]["n_l1"] == p.store.get("sma/mupix_pair_hits_xy_L1").entries > 0
+    assert s["hits"]["n_l2"] == p.store.get("sma/mupix_pair_hits_xy_L2").entries > 0
     assert set(s["stage"]) == {"x_mm", "y_mm", "source", "applied", "shift_mm", "note"}
     assert (s["enabled"], s["off_reason"], s["resets"]) == (True, None, 0)
     assert (s["window_ns"], s["max_l1"]) == (PR.WINDOW_NS, PR.MAX_L1)
@@ -569,6 +598,93 @@ def test_mupix_only_frames_fill_the_pairs_and_stay_empty_frames():
     p = _plugin()
     _feed(p, np.array([W.FILLER] * 4, dtype=np.uint64), run=1)
     assert p.summary()["pairs"]["mupix_only_frames"] == 0
+
+
+def _plane_frame():
+    """Pixel words only: 30 L1 pixels on chip 1 (10, 20), 20 L2 pixels on chip 5
+    (30, 40) far from them in time (no pairs), 5 rows >= 250 on chip 1 and 5 hits on
+    a chip without a plane (9): none of the last ten is a candidate."""
+    hits = [(T0 + 10_000 * k, 1, 12, 10, 20) for k in range(30)]
+    hits += [(T0 + 10_000 * k + 5_000, 5, 9, 30, 40) for k in range(20)]
+    hits += [(T0 + 10_000 * k + 2_000, 1, 7, 10, W.PIXEL_ROWS + k) for k in range(5)]
+    hits += [(T0 + 10_000 * k + 3_000, 9, 7, 10, 20) for k in range(5)]
+    return pixels(sorted(hits))
+
+
+def test_the_single_plane_maps_take_every_candidate_of_each_plane():
+    # A MuPix-only frame (no trigger words), and no pairs at all: the plane maps fill anyway.
+    p = _plugin()
+    p.poll_odb(lambda path: [3.0, -1.0])                # stage shift (-3, -1) mm
+    _feed(p, _plane_frame(), run=1)
+    h1, h2 = (p.store.get(f"sma/{n}") for n in PLANE_MAPS)
+    assert (h1.entries, h2.entries) == (30, 20)
+    x1, y1 = (float(v) for v in PL.xy(1, 10, 20))
+    x2, y2 = (float(v) for v in PL.xy(5, 30, 40))
+    assert _bin(h1, x1 - 3.0, y1 - 1.0) == 30 and _bin(h2, x2 - 3.0, y2 - 1.0) == 20
+    s = p.summary()["pairs"]
+    assert s["hits"] == {"n_l1": 30, "n_l2": 20} and s["mupix_only_frames"] == 1
+    assert s["n_l1"] == 30 and s["n_pairs"] == 0
+    assert p.store.get("sma/mupix_pair_xy").entries == 0
+    # The in-time hit maps of the phase-space tab are S1-gated: nothing here.
+    assert p.store.get("sma/mupix_hits_xy_L1").entries == 0
+
+
+def test_the_single_plane_cap_is_an_even_sample_per_plane():
+    p = _plugin({"MuPix": {"Pairs": {"max hits per frame": 10}}})
+    _feed(p, _plane_frame(), run=1)
+    assert [p.store.get(f"sma/{n}").entries for n in PLANE_MAPS] == [10, 10]
+    assert p.summary()["pairs"]["hits"] == {"n_l1": 10, "n_l2": 10}
+    assert p.summary()["pairs"]["max_hits"] == 10
+    # plane_sample: W.even_sample over each plane's candidates, in time order.
+    hits = [(T0 + 1000 * k, 1, 5, k, 20) for k in range(100)]
+    hits += [(T0 + 1000 * k + 500, 6, 5, k, 30) for k in range(3)]
+    px = W.prepare_pixels(pixels(hits))
+    idx, n = PR.plane_sample(PR.plane_candidates(px, PL), 7)
+    assert list(n) == [7, 3]
+    assert list(px.col[idx[:7]]) == list(W.even_sample(100, 7))
+    assert list(px.chip[idx[7:]]) == [6, 6, 6]
+
+
+def test_the_bin_tables_bin_every_pixel_as_its_position_does():
+    """The (chip, col) / (chip, row) tables give the bin of PL.xy + shift, bit for bit."""
+    rng = np.random.default_rng(5)
+    hits = [(T0 + 100 * k, int(rng.integers(0, 8)), 5, int(rng.integers(0, 256)),
+             int(rng.integers(0, 250))) for k in range(3000)]
+    px = W.prepare_pixels(pixels(sorted(hits)))
+    p = _plugin()
+    ax = p.store.get("sma/mupix_pair_hits_xy_L1").x
+    for shift in ((0.0, 0.0), (-3.25, 1.7), (-40.0, 40.0)):
+        bx, by = p._plane_bins(PL, shift, ax)
+        x, y = PL.xy(px.chip, px.col, px.row)
+        assert np.array_equal(bx[px.chip, px.col], P._bin_of(x + shift[0], ax))
+        assert np.array_equal(by[px.chip, px.row], P._bin_of(y + shift[1], ax))
+    # Cached: the same tables while nothing changes, new ones when the shift moves.
+    a = p._plane_bins(PL, (1.0, 2.0), ax)
+    assert p._plane_bins(PL, (1.0, 2.0), ax)[0] is a[0]
+    assert p._plane_bins(PL, (1.5, 2.0), ax)[0] is not a[0]
+
+
+def test_the_single_plane_maps_cost_little():
+    """A 20000-pixel frame at the default cap (asserted loosely; measured ~0.03 ms)."""
+    import time
+
+    rng = np.random.default_rng(3)
+    px = _px(sorted(_random_hits(rng, 20000, 30_000_000, chips=8, bad_rows=True)))
+    p = _plugin()
+    hp = p.h["pairs"]
+    cands = PR.plane_candidates(px, PL)
+    best = 1.0
+    for _ in range(20):
+        t0 = time.perf_counter()
+        idx, nh = PR.plane_sample(cands, PR.MAX_HITS)
+        bx, by = p._plane_bins(PL, (0.0, 0.0), hp["hits_L1"].x)
+        chip = px.chip[idx]
+        flat = by[chip, px.row[idx]] * 132 + bx[chip, px.col[idx]]
+        P._add_flat(hp["hits_L1"], flat[:nh[0]])
+        P._add_flat(hp["hits_L2"], flat[nh[0]:])
+        best = min(best, time.perf_counter() - t0)
+    assert list(nh) == [PR.MAX_HITS, PR.MAX_HITS]
+    assert best < 2e-3, best
 
 
 def test_a_window_wider_than_the_dt_axis_is_noted():

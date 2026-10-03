@@ -106,6 +106,9 @@ the nearline monitor's ``MakePairs``, see ``sma_mupix_pairs``; same frame and ax
                         +-100 ns of a sampled L1 pixel, 8 ns bins (one tick) centred on
                         the ticks
 ``mupix_pair_partners`` L2 pixels in the pair window per sampled L1 pixel, 0-10 + overflow
+``mupix_pair_hits_xy_L1``, ``_L2``  each plane alone: every candidate pixel (on the sensor, on a
+                        placed chip), at most ``max hits per frame`` a plane and frame
+                        (even sample), unseeded, 130 x 130 as x/y
 
 With ``NIM/merge`` on (off by default), the counters (S1 included) are the
 merged hits wherever counter times are used: ``dt_S*``, ``pattern``,
@@ -306,6 +309,10 @@ SETTINGS_DEFAULTS: dict[str, object] = {
             #: frame's (1-20000). The fill costs ~0.3-0.4 ms a dense frame at
             #: 1000, ~0.5 ms at 2000. A CPU knob: no plot resets.
             "max L1 per frame": PR.MAX_L1,
+            #: Pixels per plane and frame on the single-plane maps
+            #: (mupix_pair_hits_xy_L1/L2), an evenly spread subset of the
+            #: plane's (1-20000). ~0.06 ms a frame at 2000. A CPU knob: no plot resets.
+            "max hits per frame": PR.MAX_HITS,
         },
     },
     #: The NIM copies of the counters (since run 1015) and how they are paired
@@ -746,6 +753,12 @@ def parse_settings(settings: dict | None) -> Config:
         errors.append(f"MuPix/Pairs/max L1 per frame={pr_max_l1}: a cap within 1-"
                       f"{PR.MAX_L1_LIMIT} (0 is not 'all'); using {clamped}")
         pr_max_l1 = clamped
+    pr_max_hits = get(PS, "max hits per frame", int)
+    if not 1 <= pr_max_hits <= PR.MAX_HITS_LIMIT:
+        clamped = min(max(pr_max_hits, 1), PR.MAX_HITS_LIMIT)
+        errors.append(f"MuPix/Pairs/max hits per frame={pr_max_hits}: a cap within 1-"
+                      f"{PR.MAX_HITS_LIMIT} (0 is not 'all'); using {clamped}")
+        pr_max_hits = clamped
     pr_enable = get(PS, "enable", _as_bool)
     pr_window = get(PS, "window ns", int, lambda v: 0 <= v <= PR.WINDOW_LIMIT_NS)
     if pr_window > PR.DT_HALF_NS:
@@ -760,7 +773,7 @@ def parse_settings(settings: dict | None) -> Config:
             errors.append(f"MuPix/Pairs: {bad_lists}; MuPix pairs are off")
     pairs = PR.PairSettings(
         enable=pr_enable,
-        window_ns=pr_window, max_l1=pr_max_l1, tot_light_max=light, tot_heavy_min=heavy,
+        window_ns=pr_window, max_l1=pr_max_l1, max_hits=pr_max_hits, tot_light_max=light, tot_heavy_min=heavy,
         apply_stage=xy.apply_stage, placement=xy.placement, off_reason=pr_off)
 
     nim = _parse_nim(s, roles, get, opt_chan, errors)
@@ -1218,7 +1231,8 @@ class _Second:
                  "shift_counts", "shift_n", "mp_frames", "mp_pix", "mp_examined", "mp_skipped",
                  "mp_n", "mp_in", "mp_side", "mp_chip", "mp_rows", "mp_unsorted", "nim",
                  "xy_state", "xy_light", "xy_heavy", "xy_ctrk", "pr_l1", "pr_paired",
-                 "pr_partners", "pr_light", "pr_heavy", "pr_ctrk", "pr_mponly")
+                 "pr_partners", "pr_light", "pr_heavy", "pr_ctrk", "pr_mponly", "pr_h1",
+                 "pr_h2")
 
     def __init__(self, t: int, epoch: int, n_counters: int, scan: tuple):
         self.t = t
@@ -1265,6 +1279,8 @@ class _Second:
         #: classes with their denominator (restarts with a ToT-cut edit).
         self.pr_l1 = self.pr_paired = self.pr_partners = 0
         self.pr_light = self.pr_heavy = self.pr_ctrk = 0
+        #: Pixels on the single-plane maps (the sample) of L1 and of L2.
+        self.pr_h1 = self.pr_h2 = 0
         #: MuPix-only frames (pixels, no trigger words: class "empty") whose
         #: MuPix part was analysed (occupancy, ToT, pairs).
         self.pr_mponly = 0
@@ -1541,6 +1557,8 @@ class SmaPlugin:
         self.xy_resets = 0
         #: pair map resets by MuPix/Pairs (or XY ToT-cut) edits (no rebuild).
         self.pair_resets = 0
+        #: The single-plane maps' bin tables (`_plane_bins`): (placement, key, bx, by).
+        self._plane_lut = None
         self._build()
 
     # -- settings --------------------------------------------------------------
@@ -1565,10 +1583,11 @@ class SmaPlugin:
 
         ``MuPix/Pairs`` edits never rebuild either, and reset only the pair
         maps the same way: any Pairs key (and ``apply stage shift`` or a
-        chip-list change that only moves the pixels) re-books all eleven, the
-        XY ToT cuts only the six light and heavy maps, with the ``pairs``
-        summary counters that belong to them. ``max L1 per frame`` is a CPU
-        knob and resets nothing. ``resets`` counts only re-books while the
+        chip-list change that only moves the pixels) re-books all thirteen
+        (the two single-plane maps included), the XY ToT cuts only the six
+        light and heavy maps, with the ``pairs`` summary counters that belong
+        to them. ``max L1 per frame`` and ``max hits per frame`` are CPU knobs
+        and reset nothing. ``resets`` counts only re-books while the
         pairs are on.
         """
         old = self.cfg.xy
@@ -1606,6 +1625,7 @@ class SmaPlugin:
             sec.pr_light = sec.pr_heavy = sec.pr_ctrk = 0
             if not classes_only:
                 sec.pr_l1 = sec.pr_paired = sec.pr_partners = 0
+                sec.pr_h1 = sec.pr_h2 = 0
 
     def _reset_xy_counters(self, classes_only: bool) -> None:
         for sec in {id(x): x for x in (*self._seconds, self._cur) if x is not None}.values():
@@ -1939,6 +1959,8 @@ class SmaPlugin:
         maps' axes, so the two tabs compare bin by bin; ``mupix_pair_dt`` is in
         8 ns bins (one tick: the raw times are whole ticks) centred on the
         ticks over +-100 ns, ``mupix_pair_partners`` 0-10 with an overflow.
+        ``mupix_pair_hits_xy_L1`` / ``_L2``: each plane alone, on the x/y axes
+        (re-booked with the full set, never by a ToT-cut edit).
         All uint32, widened to uint64 before a bin could wrap (`_widen`).
         """
         cfg, h = self.cfg, self.h
@@ -1971,6 +1993,12 @@ class SmaPlugin:
             out[f"yyp{suf}"] = h2(f"mupix_pair_yyp{suf}", pos("y"), slope("y'"),
                                   f"MuPix L1-L2 pixel pairs y / y' at L1, {what} ({g})")
         if not classes_only:
+            for p in (W.PLANE_L1, W.PLANE_L2):
+                nm = W.PLANE_NAMES[p]
+                out[f"hits_{nm}"] = h2(
+                    f"mupix_pair_hits_xy_{nm}", pos("x"), pos("y"),
+                    f"MuPix {nm} alone: every pixel on the sensor, unseeded (at most "
+                    f"{pr.max_hits} a frame, evenly spread; {g})")
             half, bw = PR.DT_HALF_NS, PR.DT_BIN_NS
             nb = 2 * (half // bw) + 1                   # odd: bins centred on the ticks
             out["dt"] = self._h1(
@@ -2681,16 +2709,33 @@ class SmaPlugin:
         candidate within +-100 ns of one fills ``mupix_pair_dt`` with t(L2) -
         t(L1) (at most DT_PER_L1 per sampled L1 pixel); the pairs fill the maps
         at the L1 pixel with the stage shift added, light / heavy by both
-        pixel ToTs. Called for good frames and for MuPix-only ones (no trigger
-        words; see process).
+        pixel ToTs. The single-plane maps take an even sample of at most
+        max hits per frame candidates of each plane, paired or not. Called for
+        good frames and for MuPix-only ones (no trigger words; see process).
         """
         hp = self.h.get("pairs")
         if hp is None:
             return
         pr = self.cfg.pairs
+        shift = self._xy_shift()
+        cands = PR.plane_candidates(px, pr.placement)
+        # Each plane alone: at most max_hits candidates a plane, both planes'
+        # flat bin indices in one pass, from bin tables per (chip, col) and
+        # (chip, row) -- no float work per pixel.
+        idx, nh = PR.plane_sample(cands, pr.max_hits)
+        if idx.size:
+            hl1 = hp["hits_L1"]
+            bx, by = self._plane_bins(pr.placement, shift, hl1.x)
+            chip = px.chip[idx]
+            flat = by[chip, px.row[idx]] * (hl1.x.n + 2) + bx[chip, px.col[idx]]
+            n1 = int(nh[0])
+            _add_flat(hl1, flat[:n1])
+            _add_flat(hp["hits_L2"], flat[n1:])
+            sec.pr_h1 += n1
+            sec.pr_h2 += int(nh[1])
         t_min = px.first + max(pr.window_ns, PR.DT_HALF_NS) if px.n_skipped else None
-        res = PR.l1l2_pairs(px, pr.window_ns, pr.max_l1, pr.placement, self._xy_shift(), t_min,
-                            dt_half=PR.DT_HALF_NS)
+        res = PR.l1l2_pairs(px, pr.window_ns, pr.max_l1, pr.placement, shift, t_min,
+                            dt_half=PR.DT_HALF_NS, cands=cands)
         n = res.n
         if not n:
             return
@@ -2728,6 +2773,18 @@ class SmaPlugin:
                 _add_flat(hp[f"{k}_light"], f[light])
             if nh:
                 _add_flat(hp[f"{k}_heavy"], f[heavy])
+
+    def _plane_bins(self, pl, shift, ax: Axis) -> tuple[np.ndarray, np.ndarray]:
+        """Full bin indices on ``ax`` of every (chip, column) and (chip, row): the
+        single-plane maps' tables (`sma_mupix_pairs.position_luts`, binned as
+        `_bin_of` bins a pixel). Rebuilt only when the placement, the shift or
+        the axis changes (~0.1 ms; the shift moves at most once a poll)."""
+        key = (float(shift[0]), float(shift[1]), ax.n, ax.lo, ax.hi)
+        c = self._plane_lut
+        if c is None or c[0] is not pl or c[1] != key:
+            xs, ys = PR.position_luts(pl, shift)
+            c = self._plane_lut = (pl, key, _bin_of(xs, ax), _bin_of(ys, ax))
+        return c[2], c[3]
 
     def _mupix_widths(self) -> tuple[float, float]:
         m = self.cfg.mupix
@@ -3253,7 +3310,9 @@ class SmaPlugin:
         window per PAIRED L1 pixel (1 = no ambiguity; the unpaired ones are in
         ``paired_frac``); ``light_frac``, ``heavy_frac``: of the pairs classed
         since the last ToT-cut edit (None right after one). ``window_ns``,
-        ``max_l1``, ``cuts`` (the XY ToT cuts on both pixels), ``stage`` (as
+        ``max_l1``, ``hits`` (``n_l1``, ``n_l2``: pixels on the single-plane
+        maps, the sample), ``max_hits`` (their cap per plane and frame),
+        ``cuts`` (the XY ToT cuts on both pixels), ``stage`` (as
         ``xy.stage``), ``enabled``, ``off_reason`` (why not with Pairs/enable
         = y), ``resets`` (pair map resets by Pairs or ToT-cut edits while on),
         ``mupix_only_frames`` (frames with pixels and no trigger words, counted
@@ -3277,6 +3336,8 @@ class SmaPlugin:
             "light_frac": _ratio(light, ctrk, 4),
             "heavy_frac": _ratio(heavy, ctrk, 4),
             "window_ns": pr.window_ns, "max_l1": pr.max_l1,
+            "hits": {"n_l1": sum(x.pr_h1 for x in secs), "n_l2": sum(x.pr_h2 for x in secs)},
+            "max_hits": pr.max_hits,
             "cuts": {"tot_light_max": pr.tot_light_max, "tot_heavy_min": pr.tot_heavy_min,
                      "tot_ns": m.tot_ns},
             "stage": self._stage_summary(),
@@ -4133,7 +4194,8 @@ def _merge_seconds(secs: list[_Second]) -> _Second:
                   "delta_ns", "live_ns", "n_s1", "n_s1_kept", "rf_valid", "rf_vetoed",
                   "oversize", "mp_frames", "mp_pix", "mp_examined", "mp_skipped", "mp_n",
                   "mp_rows", "mp_unsorted", "xy_light", "xy_heavy", "xy_ctrk", "pr_l1",
-                  "pr_paired", "pr_partners", "pr_light", "pr_heavy", "pr_ctrk", "pr_mponly"):
+                  "pr_paired", "pr_partners", "pr_light", "pr_heavy", "pr_ctrk", "pr_mponly",
+                  "pr_h1", "pr_h2"):
             setattr(out, a, getattr(out, a) + getattr(s, a))
         out.xy_state += s.xy_state
         out.hits += s.hits

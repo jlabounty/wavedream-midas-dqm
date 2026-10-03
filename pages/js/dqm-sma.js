@@ -23,6 +23,7 @@
 //      "MuPix pairs (unseeded)": every L1 pixel paired with the nearest-in-time
 //      L2 pixel within the window, with or without an S1 hit, as the nearline
 //      pairs them: a note (paired fraction, partners, window, cap, cuts, stage),
+//      a row "L1 alone | L2 alone" (every pixel of each plane, unseeded), then
 //      x/y, x/x', y/y' as rows of all / light / heavy, the L2 - L1 dt with the
 //      window outlined, and the partners per L1 pixel.
 //      The NIM / TOT tab (since run 1015 each counter has a NIM copy, "S1L"
@@ -125,9 +126,10 @@ const ORDER = {
             /^mupix_track_xxp$/, /^mupix_track_xxp_light$/, /^mupix_track_xxp_heavy$/,
             /^mupix_track_yyp$/, /^mupix_track_yyp_light$/, /^mupix_track_yyp_heavy$/,
             /^mupix_track_tot$/, /^mupix_track_state$/, /^mupix_hits_xy_/, /^mupix_track_/],
-  // MuPix pairs: all / light / heavy for x/y, x/x', y/y', then the L2 - L1 dt
-  // and the partners per L1 pixel. Checked before the diagnostics' /^mupix_/.
-  mupixpair: [/^mupix_pair_xy$/, /^mupix_pair_xy_light$/, /^mupix_pair_xy_heavy$/,
+  // MuPix pairs: each plane alone (L1 | L2), then all / light / heavy for x/y,
+  // x/x', y/y', then the L2 - L1 dt and the partners per L1 pixel. Checked
+  // before the diagnostics' /^mupix_/.
+  mupixpair: [/^mupix_pair_hits_xy_L1$/, /^mupix_pair_hits_xy_L2$/, /^mupix_pair_xy$/, /^mupix_pair_xy_light$/, /^mupix_pair_xy_heavy$/,
               /^mupix_pair_xxp$/, /^mupix_pair_xxp_light$/, /^mupix_pair_xxp_heavy$/,
               /^mupix_pair_yyp$/, /^mupix_pair_yyp_light$/, /^mupix_pair_yyp_heavy$/,
               /^mupix_pair_dt$/, /^mupix_pair_partners$/, /^mupix_pair_/],
@@ -174,6 +176,7 @@ const PAIR_DT = "sma/mupix_pair_dt";
 function rowOf(name) {
   const s = shortName(name);
   if (/^mupix_hits_xy_L\d$/.test(s)) return { key: "xyhits", cols: 2, square: true };
+  if (/^mupix_pair_hits_xy_L\d$/.test(s)) return { key: "pairhits", cols: 2, square: true };
   const m = /^mupix_track_(xy|xxp|yyp)(_light|_heavy)?$/.exec(s);
   if (m) return { key: `xy${m[1]}`, cols: 3, square: true };
   const q = /^mupix_pair_(xy|xxp|yyp)(_light|_heavy)?$/.exec(s);
@@ -1430,6 +1433,12 @@ function pairNoteParts(pr) {
               "L2 pixels within the window per paired L1 pixel: 1 is no ambiguity " +
               "(every sampled L1 pixel is in mupix_pair_partners)"]);
   parts.push([`window ${win} · at most ${num(pr.max_l1)} L1 pixels per frame`, ""]);
+  if (pr.hits) {
+    const cap = pr.max_hits ? ` (at most ${num(pr.max_hits)} a plane per frame)` : "";
+    parts.push([`L1 / L2 alone: ${num(pr.hits.n_l1)} / ${num(pr.hits.n_l2)} pixels${cap}`, "",
+                "The top row: every pixel of each plane on the sensor, paired or not, with no S1 " +
+                "(an even sample per frame); the phase-space tab's hit maps are S1-gated"]);
+  }
   const unit = c.tot_ns ? ` (×${c.tot_ns} ns)` : "";
   parts.push([`light ${pct(pr.light_frac, 1)}, heavy ${pct(pr.heavy_frac, 1)} of the pairs ` +
               `(light: both pixels' ToT ≤ ${c.tot_light_max}${unit} · heavy: ≥ ${c.tot_heavy_min})`, ""]);

@@ -74,6 +74,14 @@ DT_BIN_NS = W.PIXEL_TICK_NS
 DT_PER_L1 = 4
 #: ``mupix_pair_partners``: 0..PARTNER_MAX, more in the overflow bin.
 PARTNER_MAX = 10
+#: ``mupix_pair_hits_xy_L1`` / ``_L2`` (each plane alone, unseeded): pixels per
+#: plane and frame, at most (``Pairs/max hits per frame``), an even sample of
+#: the plane's candidates, within 1..MAX_HITS_LIMIT. A run-1008 frame has
+#: ~3700 candidates a plane (dense synthetic ~6400), so 2000 is about every
+#: second pixel there. The fill costs ~0.06 ms a frame at 2000 on one core
+#: (~0.08 ms at 20000 on run 1008, ~0.13 ms on dense frames).
+MAX_HITS = 2000
+MAX_HITS_LIMIT = W.MAX_PIXELS
 
 
 @dataclass
@@ -84,6 +92,8 @@ class PairSettings:
     enable: bool = True
     window_ns: int = WINDOW_NS
     max_l1: int = MAX_L1
+    #: Pixels per plane and frame on the single-plane maps (a CPU knob, no reset).
+    max_hits: int = MAX_HITS
     tot_light_max: int = X.TOT_LIGHT_MAX
     tot_heavy_min: int = X.TOT_HEAVY_MIN
     apply_stage: bool = True
@@ -98,7 +108,7 @@ class PairSettings:
     def reset_key(self) -> tuple:
         """What, when it changes, resets every pair map (the ToT cuts reset only the classes)."""
         p = self.placement
-        # max_l1 is a CPU knob, as XY's "max S1 per frame": no reset.
+        # max_l1 and max_hits are CPU knobs, as XY's "max S1 per frame": no reset.
         return (self.active, self.window_ns, self.apply_stage,
                 p.quadrant.tobytes(), p.plane.tobytes())
 
@@ -185,10 +195,47 @@ def candidates(px: W.Pixels, pl: X.Placement, plane: int) -> np.ndarray:
     return idx if good.all() else idx[good]
 
 
+def plane_candidates(px: W.Pixels, pl: X.Placement) -> tuple[np.ndarray, np.ndarray]:
+    """`candidates` of L1 and of L2, computed once for the pairing and the plane maps."""
+    return candidates(px, pl, W.PLANE_L1), candidates(px, pl, W.PLANE_L2)
+
+
+def plane_sample(cands, max_hits=MAX_HITS) -> tuple[np.ndarray, np.ndarray]:
+    """Each plane alone, unseeded: an even sample of at most ``max_hits`` candidates a plane.
+
+    ``cands``: `plane_candidates`. Returns ``(idx, n)``: indices into the
+    `Pixels`, the sampled L1 pixels first (in time order, `W.even_sample`),
+    then the L2 ones; ``n`` = (L1, L2) sampled, so ``idx[:n[0]]`` is L1.
+    """
+    out = []
+    for c in cands:
+        if c.size > max_hits:
+            c = c[W.even_sample(c.size, int(max_hits))]
+        out.append(c)
+    return np.concatenate(out), np.array([out[0].size, out[1].size], dtype=np.intp)
+
+
+def position_luts(pl: X.Placement, shift=(0.0, 0.0)) -> tuple[np.ndarray, np.ndarray]:
+    """``(xs, ys)``: x in mm of every (chip, column) and y of every (chip, row), shift added.
+
+    Shape (N_CHIP_IDS, 256) each, exactly ``Placement.xy`` plus the shift (the
+    same float operations in the same order), so binning a table entry gives
+    the bin of the pixel itself; columns and rows are 8-bit. A chip without a
+    place has 0 + 0 * col (its pixels are never candidates).
+    """
+    c = np.arange(W.N_CHIP_IDS)[:, None]
+    v = np.arange(256, dtype=np.float64)[None, :]
+    xs = pl.x0[c] + pl.sx[c] * v
+    ys = pl.y0[c] + pl.sy[c] * v
+    xs += float(shift[0])
+    ys += float(shift[1])
+    return xs, ys
+
+
 def l1l2_pairs(px: W.Pixels | None, window_ns=WINDOW_NS, max_l1=MAX_L1,
                pl: X.Placement | None = None, shift=(0.0, 0.0),
                t_min: int | None = None, dt_half: int | None = None,
-               max_dt: int | None = None) -> L1L2Pairs:
+               max_dt: int | None = None, cands=None) -> L1L2Pairs:
     """Pair each sampled L1 pixel with its nearest-in-time L2 pixel (`L1L2Pairs`).
 
     ``window_ns``: the half window, whole ns, both edges inclusive;
@@ -201,12 +248,13 @@ def l1l2_pairs(px: W.Pixels | None, window_ns=WINDOW_NS, max_l1=MAX_L1,
     ``dt_half``: also collect `L1L2Pairs.cand_dt`, every t(L2) - t(L1) within
     +-dt_half (inclusive) in the same search, at most ``max_dt`` of them
     (default DT_PER_L1 per sampled L1 pixel; an evenly spread subset of the
-    sampled L1 pixels beyond that, `_window_dt`).
+    sampled L1 pixels beyond that, `_window_dt`). ``cands``: `plane_candidates`
+    of ``px`` and ``pl`` when the caller has them already.
     """
     if px is None or px.n == 0:
         return _empty()
     pl = pl or X.placement()
-    i1 = candidates(px, pl, W.PLANE_L1)
+    i1, i2c = cands if cands is not None else plane_candidates(px, pl)
     if t_min is not None and i1.size:
         i1 = i1[int(np.searchsorted(px.t[i1], int(t_min), side="left")):]
     n_l1 = int(i1.size)
@@ -215,7 +263,6 @@ def l1l2_pairs(px: W.Pixels | None, window_ns=WINDOW_NS, max_l1=MAX_L1,
     if n_l1 > max_l1:
         i1 = i1[W.even_sample(n_l1, int(max_l1))]
     m = int(i1.size)
-    i2c = candidates(px, pl, W.PLANE_L2)
     t1 = px.t[i1]
     t2 = px.t[i2c]
     n2 = int(t2.size)

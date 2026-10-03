@@ -380,7 +380,9 @@ vetoed fraction.
   frame, the light/heavy shares with the ToT cuts, the stage shift, and the
   reminder that the counts are *pixel pairs, not particles*; "pairs off:" and
   the reason when they are off), a "log z for the pair maps" switch (off by
-  default), x/y, x/x', y/y' as rows of all / light / heavy on the axes of the
+  default), a row **L1 alone | L2 alone** (every pixel of each plane, unseeded;
+  they follow the toolbar's log z, as the phase-space hit maps do), then
+  x/y, x/x', y/y' as rows of all / light / heavy on the axes of the
   phase-space tab, so the two tabs compare directly, then the L2 - L1 dt with
   the pairing window outlined green and the number of L2 partners per L1 pixel.
   The definition is in the *MuPix pairs* subsection under
@@ -945,6 +947,18 @@ their partners may be among the skipped words.
   this makes no difference today. A pair needs a hit in the other plane within
   the window, which suppresses single-chip bursts and hot pixels anyway.
 
+**Each plane alone.** The top row of the tab, `mupix_pair_hits_xy_L1` and
+`mupix_pair_hits_xy_L2`, shows every candidate pixel of one plane (the same
+candidates as the pairing: on the sensor, on a placed chip), paired or not,
+with no S1. It is in the same frame as the other maps (placement, stage
+shift, 130 x 0.64 mm). At most `max hits per frame` (2000) pixels of each
+plane per frame fill it, an even sample in time order; a run-1008 frame has
+about 3700 candidates a plane. These are not the phase-space tab's
+`mupix_hits_xy_L1` / `_L2`: those take only pixels in time with a sampled S1
+hit. A hot pixel, a noisy chip or a beam spot that misses one plane shows here
+first. No per-plane ToT plot is added: `mupix_tot_L1` / `_L2` on the
+diagnostics tab already histogram every examined pixel's ToT per plane.
+
 **How this differs from the S1-seeded maps** on the phase-space tab: no S1 hit
 is needed, every L1 pixel counts (a muon that stops before S1, a particle
 outside the S1 window), and there is no cluster square. The axes are the same,
@@ -952,9 +966,10 @@ so the two tabs compare bin by bin.
 
 **What an edit resets: only the pair maps.** No `MuPix/Pairs` key rebuilds the
 other plots or starts a new summary epoch. `enable`, `window ns` and
-`MuPix/XY/apply stage shift` reset (or book, or remove) all eleven pair
-histograms. The XY ToT cuts reset only the six light and heavy maps (of x/y
-and of the pairs). `max L1 per frame` is a CPU knob and resets nothing, like
+`MuPix/XY/apply stage shift` reset (or book, or remove) all thirteen pair
+histograms, the two single-plane maps included. The XY ToT cuts reset only the
+six light and heavy maps (of x/y and of the pairs). `max L1 per frame` and
+`max hits per frame` are CPU knobs and reset nothing, like
 `XY/max S1 per frame`. The `pairs` summary counters restart with their maps;
 `resets` counts only resets made while the pairs are on. A `window ns` above
 100 is used as set, with a `settings` note: the dt plot cannot show its edges.
@@ -965,17 +980,20 @@ and of the pairs). `max L1 per frame` is a CPU knob and resets nothing, like
 | `mupix_pair_xxp`, `mupix_pair_yyp` (and light, heavy) | x vs x', y vs y' of the pairs, on the axes of the S1-seeded maps |
 | `mupix_pair_dt` | t(L2) - t(L1), the nearline `dt`'s sign, of every L2 pixel within +-100 ns of a sampled L1 pixel (not only the chosen partner), in 8 ns bins (one MuPix tick) centred on the ticks: the window is judged from this. At most 4 entries per sampled L1 pixel and frame: in a noise burst or a dense spill an even subset of the sampled L1 pixels fills it, which keeps the shape and bounds the cost |
 | `mupix_pair_partners` | L2 pixels in the window per sampled L1 pixel: 0 = unpaired, 1 = no ambiguity, more than 10 in the overflow |
+| `mupix_pair_hits_xy_L1`, `mupix_pair_hits_xy_L2` | each plane alone: every candidate pixel (at most `max hits per frame` a plane and frame, evenly spread), unseeded, on the x/y axes |
 
-All eleven are uint32 and switch to uint64 before a bin could wrap, like the
-x/y maps; together they are 0.44 MB. A refresh of the pairs tab with all nine
-maps on screen moves up to about 0.46 MB through mhttpd, the same as the
-phase-space tab (only visible plots are fetched). The summary's `pairs` block
+All thirteen are uint32 and switch to uint64 before a bin could wrap, like the
+x/y maps; together they are 0.57 MB (the two single-plane maps 0.13 MB). A
+refresh of the pairs tab with all eleven maps on screen moves up to about
+0.6 MB through mhttpd (only visible plots are fetched). The summary's `pairs` block
 (60 s window) has:
 
 * `n_l1`: the L1 pixels sampled;
 * `n_pairs` and `paired_frac`: those with a partner;
 * `mean_partners`: L2 pixels in the window per *paired* L1 pixel;
 * `light_frac` and `heavy_frac`: shares of the pairs;
+* `hits`: `n_l1` and `n_l2`, the pixels on the single-plane maps (the sample),
+  and `max_hits`, their cap per plane and frame;
 * `window_ns`, `max_l1`, `cuts` and `stage` (the same shape as `xy.stage`);
 * `enabled`, `off_reason` and `resets`;
 * `mupix_only_frames`: the MuPix-only frames analysed (see above).
@@ -1026,6 +1044,15 @@ fill takes about 0.25 ms at 1000. A noise burst does not raise it: with 20000
 pixels packed into 2 us the fill stays at about 0.31 ms
 (`scratch/sma-mupix-pairs/review/burst_bench.py`; 2.2 ms before the dt cap).
 `max L1 per frame` (1-20000) is the knob and resets no plot.
+
+The single-plane maps add about 0.06 ms per frame at the default 2000 pixels
+a plane, on run-1008 frames and on dense synthetic ones alike (one core, best
+of 30 per frame; `scratch/sma-mupix-pairs/bench_planes.py`). With 20000 a
+plane they add 0.08 ms on run 1008 and 0.13 ms on dense frames. The
+candidates are computed once for the pairing and the maps, and the bins come
+from per-chip tables of column and row (rebuilt when the stage shift moves),
+so there is no float work per pixel. `max hits per frame` (1-20000) is the
+knob and resets no plot.
 
 ## NIM copies of the counters (TOT + NIM)
 
@@ -1286,6 +1313,7 @@ histograms.
 | `MuPix/Pairs/enable` | y | unseeded L1-L2 pixel pairs (see [MuPix pairs](#mupix-pairs-unseeded-the-nearlines-l1-l2-coincidences)); n = none booked or filled | the pair maps only |
 | `MuPix/Pairs/window ns` | 64 | half window of the pairing, whole ns, both edges included (0-1000; above 100 a `settings` note, the dt plot cannot show the edges); the nearline's is 40 on time-walk corrected times, 64 matches its pair count on raw times | the pair maps only |
 | `MuPix/Pairs/max L1 per frame` | 1000 | L1 pixels paired per frame, spread evenly; 1-20000 (outside: clamped, with a `settings` note; 0 is not "all"). A CPU knob | **no** |
+| `MuPix/Pairs/max hits per frame` | 2000 | pixels per plane and frame on the single-plane maps (`mupix_pair_hits_xy_L1` / `_L2`), spread evenly; 1-20000 (outside: clamped, with a `settings` note; 0 is not "all"). A CPU knob | **no** |
 | `NIM/channels` | [3, 9, 10, 11, 12] | NIM copy of each counter (per `Channel roles/counters` entry); -1 = none, [-1] alone = no NIM at all. A NIM channel that is also S1, a counter, the RF, `current` or `delayed` turns NIM off (a `settings` flag); a repeated one drops that entry | yes |
 | `NIM/offset ns` | [0, 0, 0, 0, 0] | per counter, t'_NIM = t - offset in whole ns (a fraction is rounded, with a `settings` note); set from the `nim_dt` peak | yes |
 | `NIM/lag nominal ns` | [0, 0, 0, 0, 0] | per counter, the NIM copy's expected fine - fine(S1) (cable delay, flight); the lag vote is "faulted" beyond `lag tolerance ns` of it | yes |
