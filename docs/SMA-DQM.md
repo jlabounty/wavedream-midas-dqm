@@ -70,7 +70,9 @@ This writes the `/Custom/SMAPlots`, `/Custom/SMAEvents` and `/Custom/MuPixPlots`
 keys (and the WaveDREAM pages) with absolute paths to this checkout
 (`src/mdqm/install/manifest.py:122-126`). It is safe to run on every start; it
 removes keys of its own that are no longer in the list (for example the old
-`/Custom/SMA`). Options (`src/mdqm/install/register_pages.py:207-220`):
+`/Custom/SMA`): only keys whose value is an absolute path into this checkout
+(or into a moved copy of it) count as its own (`_is_ours`,
+`src/mdqm/install/register_pages.py:142-176`). Options (`src/mdqm/install/register_pages.py:239-252`):
 `--list`, `--dry-run`, `--check` (every key still points at a readable file),
 `--remove`, `--prefix` (to avoid a name clash in a shared experiment).
 
@@ -445,11 +447,37 @@ $PY -m mdqm.install.register_pages --experiment bt2026 --prefix WD --check     #
 ```
 
 Besides adding the keys, the write also removes `/Custom` keys of its own that
-are no longer in its list (pointing into this checkout), and creates
+are no longer in its list (absolute paths into this checkout), and creates
 `/DQM/Scalars` with its defaults if it is absent. It opens a MIDAS client on
 pinky like any `odbedit`: run it while the DAQ is up and healthy, and look at
 the Programs page afterwards (a client opened from the host can trigger
 MIDAS's clean-up of client entries it believes dead).
+
+**Warning: before commit "Never prune /Custom keys that are not ours" the
+prune deleted other groups' keys.** It took any key with a *relative* value
+for its own when run from the checkout root. On 2026-10-03 the command above
+removed six of MuSiP's keys. Their values are relative paths, which mhttpd
+resolves against `/Custom/Path`. If an older checkout was ever run, check that
+they are there, and restore any that are missing. odbedit runs only the
+**last** `-c` of a command line, so use one `-c` per call:
+
+```bash
+odbedit -e bt2026 -c 'create STRING "/Custom/lvds"'
+odbedit -e bt2026 -c 'set "/Custom/lvds" lvds.html'
+odbedit -e bt2026 -c 'create STRING "/Custom/Quads"'
+odbedit -e bt2026 -c 'set "/Custom/Quads" Quads/quad_basics.html'
+odbedit -e bt2026 -c 'create STRING "/Custom/MuTRiG"'
+odbedit -e bt2026 -c 'set "/Custom/MuTRiG" Mutrig/TimingScint.html'
+odbedit -e bt2026 -c 'create STRING "/Custom/DQM"'
+odbedit -e bt2026 -c 'set "/Custom/DQM" onlineDQM.html'
+odbedit -e bt2026 -c 'create STRING "/Custom/Quads_new"'
+odbedit -e bt2026 -c 'set "/Custom/Quads_new" Quads/quads_svgBased.html'
+odbedit -e bt2026 -c 'create STRING "/Custom/Scintillators SMA board"'
+odbedit -e bt2026 -c 'set "/Custom/Scintillators SMA board" Quads/sma_svgBased.html'
+```
+
+Always run `--dry-run` first and read every `- ... stale, ours` line: each is a
+key it will delete.
 
 The menu entry is then **WDMuPixPlots**, next to WDSMAPlots and WDSMAEvents.
 `WDS_PROFILE=pinky scripts/register-custom-pages.sh` in wavedream-scalar-readout

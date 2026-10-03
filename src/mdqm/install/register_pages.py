@@ -31,7 +31,7 @@ import os
 import sys
 from pathlib import Path
 
-from mdqm.install.manifest import CONFIG_ROOT, check_entry, check_key, pages
+from mdqm.install.manifest import CONFIG_ROOT, ENTRIES, PAGES_DIR, check_entry, check_key, pages
 
 EXIT_OK = 0
 EXIT_REFUSED = 1
@@ -77,7 +77,8 @@ def register(client, entries, pages_dir: Path, replace: bool, dry_run: bool) -> 
             # theirs with one of ours, and the first anyone would know is that
             # their page stopped loading.
             _fail(
-                f"{full} already exists and points outside {pages_dir}:\n"
+                f"{full} already exists and is not ours (a relative value, or "
+                f"an absolute one outside {pages_dir}):\n"
                 f"    existing: {existing}\n"
                 f"    ours:     {target}\n"
                 f"    Use --prefix to pick a different name, or --replace if you "
@@ -102,9 +103,10 @@ def prune(client, entries, pages_dir: Path, dry_run: bool) -> int:
     still point at real files, so they still work, and the side menu grows a
     duplicate of every page. Renaming should not litter.
 
-    Only keys whose value points into our checkout are considered, so another
-    tenant's entries are never touched, and only those absent from the manifest
-    we just wrote -- so this cannot remove what it has just registered.
+    Only keys whose value is an absolute path into our checkout (see
+    ``_is_ours``) are considered, so another tenant's entries are never
+    touched, and only those absent from the manifest we just wrote -- so this
+    cannot remove what it has just registered.
     """
     wanted = {odb_name for odb_name, _p, _e in entries}
     removed = 0
@@ -118,6 +120,9 @@ def prune(client, entries, pages_dir: Path, dry_run: bool) -> int:
             continue
         if key in wanted or key == "Path":
             continue
+        # Relative values (MuSiP's lvds.html, Quads/..., resolved by mhttpd
+        # against /Custom/Path) and absolute ones outside our checkout are
+        # somebody else's; _is_ours() says no to both.
         if not _is_ours(value, pages_dir):
             continue
         if dry_run:
@@ -129,19 +134,46 @@ def prune(client, entries, pages_dir: Path, dry_run: bool) -> int:
     return removed
 
 
-def _is_ours(value: str, pages_dir: Path) -> bool:
-    """True if an existing value points into any checkout of this repo.
+#: Directory name of this repository. A value under ``.../<this>/pages/`` that
+#: names one of our manifest files is recognised even after the checkout moved.
+REPO_DIR_NAME = "wavedream-midas-dqm"
 
-    Matching on the ``pages/`` directory name rather than the full path is what
-    lets a *moved* checkout heal itself: the value is stale, but it is still
-    recognisably ours to rewrite.
+
+def _is_ours(value: str, pages_dir: Path) -> bool:
+    """True only if ``value`` is an absolute path to one of our files.
+
+    A key is ours when its value is **absolute** and either
+
+    * lies inside ``pages_dir`` (the real ``pages/`` directory), or
+    * ends in ``<...>/wavedream-midas-dqm/pages/<a manifest entry path>``:
+      the same file in a checkout that has since moved, which is what lets a
+      moved checkout heal itself.
+
+    A **relative** value is never ours. mhttpd resolves it against
+    ``/Custom/Path``, which belongs to whoever runs the experiment (MuSiP on
+    pinky); we only ever write absolute values. Resolving a relative value with
+    ``Path.resolve()`` would anchor it to the *current working directory*, and
+    that is how ``lvds.html`` once counted as ours and was pruned. The ``Path``
+    key itself is never ours either (callers skip it by name).
     """
+    if not isinstance(value, str) or not value.startswith("/"):
+        return False
+    path = Path(value)
+    pages_dir = Path(pages_dir)
     try:
-        Path(value).resolve().relative_to(pages_dir)
+        path.resolve().relative_to(pages_dir.resolve())
         return True
-    except ValueError:
+    except (ValueError, OSError):
         pass
-    return "/pages/" in value and value.endswith((".html", ".js", ".css"))
+    parts = path.parts
+    repo_names = {REPO_DIR_NAME, pages_dir.resolve().parent.name}
+    for entry in ENTRIES:
+        tail = Path(entry.path).parts
+        n = len(tail)
+        if (len(parts) >= n + 3 and parts[-n:] == tail and parts[-n - 1] == "pages"
+                and parts[-n - 2] in repo_names):
+            return True
+    return False
 
 
 def unregister(client, entries, pages_dir: Path, dry_run: bool) -> int:
@@ -222,7 +254,10 @@ def main(argv: list[str] | None = None) -> int:
 
     pages_dir = Path(args.pages_dir).resolve() if args.pages_dir else None
     entries = pages(pages_dir)
-    pages_dir = pages_dir or entries[0][1].parents[1]
+    # The real pages/ directory. (It once was entries[0][1].parents[1], which is
+    # the repo *root*: entries[0] is pages/scalars.html. With that, and run
+    # from the root, relative values of other groups counted as ours.)
+    pages_dir = pages_dir or PAGES_DIR.resolve()
 
     # Apply the prefix to menu entries only. Assets are fetched by the literal
     # name the HTML asks for, so prefixing them would break every <script src>.
