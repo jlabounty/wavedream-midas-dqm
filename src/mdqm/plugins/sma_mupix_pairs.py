@@ -94,6 +94,7 @@ class PairSettings:
     max_l1: int = MAX_L1
     #: Pixels per plane and frame on the single-plane maps (a CPU knob, no reset).
     max_hits: int = MAX_HITS
+    tot_light_min: int = X.TOT_LIGHT_MIN
     tot_light_max: int = X.TOT_LIGHT_MAX
     tot_heavy_min: int = X.TOT_HEAVY_MIN
     apply_stage: bool = True
@@ -154,11 +155,12 @@ class L1L2Pairs:
     def paired(self) -> np.ndarray:
         return self.i2 >= 0
 
-    def classes(self, light_max: int, heavy_min: int) -> tuple[np.ndarray, np.ndarray]:
+    def classes(self, light_min: int, light_max: int,
+                heavy_min: int) -> tuple[np.ndarray, np.ndarray]:
         """``(light, heavy)`` masks over the sampled L1 pixels: pairs whose two pixel
-        ToTs are both <= light_max, or both >= heavy_min."""
+        ToTs are both within [light_min, light_max], or both >= heavy_min."""
         p = self.paired
-        return (p & (self.tot1 <= light_max) & (self.tot2 <= light_max),
+        return (p & X.light_class(self.tot1, self.tot2, light_min, light_max),
                 p & (self.tot1 >= heavy_min) & (self.tot2 >= heavy_min))
 
     def candidate_dt(self, half_ns=DT_HALF_NS, max_entries=None) -> np.ndarray:

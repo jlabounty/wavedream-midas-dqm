@@ -863,8 +863,9 @@ test("the MuPix x/y note: fractions, ToT cuts, stage, geometry", async () => {
   const t = xyNote(page);
   assert.ok(t.startsWith("MuPix x/y: tracks 61.4 % of 2,211 S1 hits judged, ambiguous 24.8 %"), t);
   const c = FX.summary.xy.cuts;
-  assert.ok(t.includes(`light 1.4 %, heavy 29.2 % of the tracks (light: both planes' max ToT ≤ ` +
-                       `${c.tot_light_max} (×${c.tot_ns} ns) · heavy: ≥ ${c.tot_heavy_min})`), t);
+  assert.ok(t.includes(`light 1.4 %, heavy 29.2 % of the tracks (light: both planes' max ToT ` +
+                       `${c.tot_light_min}–${c.tot_light_max} (×${c.tot_ns} ns) · ` +
+                       `heavy: ≥ ${c.tot_heavy_min})`), t);
   assert.ok(t.includes("stage shift x −1.50, y −2.00 mm (XY table)"), t);
   assert.ok(t.includes("bt2026-v4, +x beam-left"), t);
   // The chips as drawn (x to the right = beam-left), names of the quadrants on hover.
@@ -903,6 +904,15 @@ test("the MuPix x/y note: a failed stage read is a warning with the reason; file
   s.xy.stage = { x_mm: 2, y_mm: 1, source: "file", applied: true, shift_mm: [-2, 1], note: null };
   page = await mupixTab(s);
   assert.ok(xyNote(page).includes("stage shift x −2.00, y +1.00 mm (the file's begin-of-run ODB)"), xyNote(page));
+});
+
+test("the MuPix x/y note: an analyzer without a light min shows the light max alone", async () => {
+  const s = clone(FX.summary);
+  delete s.xy.cuts.tot_light_min;
+  const page = await mupixTab(s);
+  const c = s.xy.cuts;
+  assert.ok(xyNote(page).includes(`(light: both planes' max ToT ≤ ${c.tot_light_max} (×${c.tot_ns} ns)`),
+            xyNote(page));
 });
 
 test("the MuPix x/y note: XY off says why", async () => {
@@ -1341,7 +1351,8 @@ test("the MuPix pairs note: fraction, partners, window, cap, cuts, stage, the pi
     "window ±40 ns · at most 2,000 L1 pixels per frame · " +
     "L1 / L2 alone: 52,345 / 51,234 pixels (at most 2,000 a plane per frame) · " +
     "light 40.1 %, heavy 12.0 % of the pairs " +
-    `(light: both pixels' ToT ≤ ${c.tot_light_max} (×${c.tot_ns} ns) · heavy: ≥ ${c.tot_heavy_min}) · ` +
+    `(light: both pixels' ToT ${c.tot_light_min}–${c.tot_light_max} (×${c.tot_ns} ns) · ` +
+    `heavy: ≥ ${c.tot_heavy_min}) · ` +
     "stage shift x −1.50, y −2.00 mm (XY table) · pixel pairs, not particles");
   const hint = byId(page, "dqm-sma-pairnote").byClass("dqm-sma-xy-muted")[0];
   assert.strictEqual(hint.textContent, "pixel pairs, not particles");

@@ -231,18 +231,21 @@ def test_the_state_order_and_the_unjudged_rows():
     assert (empty.state == X.NOT_JUDGED).all() and empty.state_counts().sum() == 0
 
 
-@pytest.mark.parametrize("tot1, tot2, light, heavy", [
-    (5, 5, True, False), (0, 5, True, False), (6, 5, False, False), (5, 6, False, False),
-    (9, 9, False, True), (31, 9, False, True), (8, 9, False, False), (9, 8, False, False),
-    (5, 9, False, False),
+@pytest.mark.parametrize("lo, tot1, tot2, light, heavy", [
+    (0, 5, 5, True, False), (0, 0, 5, True, False), (0, 6, 5, False, False),
+    (0, 5, 6, False, False), (0, 9, 9, False, True), (0, 31, 9, False, True),
+    (0, 8, 9, False, False), (0, 9, 8, False, False), (0, 5, 9, False, False),
+    # The light min: both planes must reach it, the edge is included.
+    (3, 3, 5, True, False), (3, 5, 3, True, False), (3, 2, 5, False, False),
+    (3, 5, 2, False, False), (3, 0, 0, False, False), (5, 5, 5, True, False),
 ])
-def test_the_tot_classes_at_the_threshold_edges(tot1, tot2, light, heavy):
+def test_the_tot_classes_at_the_threshold_edges(lo, tot1, tot2, light, heavy):
     # The plane ToT is the largest of its cluster's pixels.
     hits = (_cluster(T0, 1, [(10, 20)], tot=tot1) + _cluster(T0, 1, [(11, 20)], tot=0)
             + _cluster(T0, 5, [(10, 20)], tot=tot2))
     tr = X.s1_tracks(np.array([T0]), _px(hits), pl=PL)
     assert (tr.tot1[0], tr.tot2[0]) == (tot1, tot2)
-    lt, hv = tr.classes(5, 9)
+    lt, hv = tr.classes(lo, 5, 9)
     assert (bool(lt[0]), bool(hv[0])) == (light, heavy)
 
 
@@ -479,7 +482,10 @@ def test_xy_off_books_and_fills_nothing(settings):
 @pytest.mark.parametrize("tree, err", [
     ({"cluster box px": 0}, "cluster box px"),
     ({"cluster box px": 65}, "cluster box px"),
-    ({"tot light max": 9, "tot heavy min": 9}, "must be below"),
+    ({"tot light max": 9, "tot heavy min": 9}, "< tot heavy min"),
+    ({"tot light min": 6, "tot light max": 5}, "<= tot light max"),
+    ({"tot light min": -1}, "tot light min"),
+    ({"tot light min": 32}, "tot light min"),
     ({"tot heavy min": 32}, "tot heavy min"),
     ({"tot light max": -1}, "tot light max"),
     ({"enable": "maybe"}, "enable"),
@@ -492,19 +498,22 @@ def test_bad_xy_settings_fall_back_and_are_reported(tree, err):
     cfg = P.parse_settings({"MuPix": {"XY": tree}})
     assert any(e.startswith("MuPix/XY/") and err in e for e in cfg.errors), cfg.errors
     d = X.XYSettings()
-    assert cfg.xy.tot_light_max < cfg.xy.tot_heavy_min
+    assert cfg.xy.tot_light_min <= cfg.xy.tot_light_max < cfg.xy.tot_heavy_min
     assert 1 <= cfg.xy.box <= X.MAX_BOX_PX
-    if "tot" in err or "below" in err:
-        assert (cfg.xy.tot_light_max, cfg.xy.tot_heavy_min) == (d.tot_light_max, d.tot_heavy_min)
+    if "tot" in err:
+        assert X.tot_cuts(cfg.xy) == X.tot_cuts(d) == (3, 9, 13)
+        assert X.tot_cuts(cfg.pairs) == X.tot_cuts(d)
 
 
 def test_good_xy_settings_parse():
     cfg = P.parse_settings({"MuPix": {"XY": {"enable": "n", "cluster box px": 5,
-                                             "tot light max": 3, "tot heavy min": 10,
+                                             "tot light min": 3, "tot light max": 3,
+                                             "tot heavy min": 10,
                                              "apply stage shift": 0, "max S1 per frame": 7}}})
     assert not cfg.errors
-    assert (cfg.xy.enable, cfg.xy.box, cfg.xy.tot_light_max, cfg.xy.tot_heavy_min,
-            cfg.xy.apply_stage, cfg.xy.max_s1) == (False, 5, 3, 10, False, 7)
+    assert (cfg.xy.enable, cfg.xy.box, cfg.xy.tot_light_min, cfg.xy.tot_light_max,
+            cfg.xy.tot_heavy_min, cfg.xy.apply_stage, cfg.xy.max_s1) == (False, 5, 3, 3, 10, False, 7)
+    assert X.tot_cuts(cfg.pairs) == (3, 3, 10)
     # The placement follows the MuPix chip lists.
     cfg = P.parse_settings({"MuPix": {"L1 chips": [1, 2, 3, 4], "L2 chips": [5, 6, 7, 0]}})
     assert cfg.xy.placement.quadrant[0] == 3 and cfg.xy.placement.plane[0] == W.PLANE_L2
@@ -512,7 +521,7 @@ def test_good_xy_settings_parse():
 
 def test_no_xy_key_is_in_the_shape_fingerprint():
     base = P.shape_fingerprint({})
-    for k, v in (("enable", False), ("cluster box px", 4), ("tot light max", 4),
+    for k, v in (("enable", False), ("cluster box px", 4), ("tot light min", 1), ("tot light max", 4),
                  ("tot heavy min", 10), ("apply stage shift", False), ("max S1 per frame", 9)):
         assert P.shape_fingerprint({"MuPix": {"XY": {k: v}}}) == base, k
     assert P.shape_fingerprint({"MuPix": {"L1 chips": [1, 0, 2, 3]}}) != base
@@ -533,6 +542,7 @@ def _xy_entries(p):
     ({"cluster box px": 4}, "all"),
     ({"apply stage shift": False}, "all"),
     ({"tot light max": 5, "tot heavy min": 9}, "classes"),
+    ({"tot light min": 0}, "classes"),
     ({"max S1 per frame": 100}, "none"),
 ])
 def test_an_xy_edit_resets_only_the_xy_maps(edit, reset):
@@ -615,7 +625,7 @@ def test_the_summary_block_keys():
     assert [q["chip"] for q in xy["quadrants"]] == list(range(8))
     assert set(xy["fractions"]) == {"track", "ambiguous", "no_l1", "no_l2"}
     assert set(xy["stage"]) == {"x_mm", "y_mm", "source", "applied", "shift_mm", "note"}
-    assert set(xy["cuts"]) == {"cluster_box_px", "tot_light_max", "tot_heavy_min", "tot_ns",
+    assert set(xy["cuts"]) == {"cluster_box_px", "tot_light_min", "tot_light_max", "tot_heavy_min", "tot_ns",
                                "window_ns", "max_s1"}
     assert xy["geometry"] == "bt2026-v4" and xy["stage"]["source"] == "none"
     json.dumps(xy, allow_nan=False)

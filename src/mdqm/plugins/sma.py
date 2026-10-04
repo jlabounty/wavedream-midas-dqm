@@ -278,8 +278,10 @@ SETTINGS_DEFAULTS: dict[str, object] = {
             #: within a box x box pixel square (1-64); position = their mean.
             "cluster box px": X.CLUSTER_BOX_PX,
             #: Track ToT classes, from the largest pixel ToT of the L1 and the L2
-            #: cluster (ToT counts, 0-31): light = both <= this, heavy = both >=
-            #: "tot heavy min". PROVISIONAL: set them from mupix_track_tot.
+            #: cluster (ToT counts, 0-31): light = both within [tot light min,
+            #: tot light max], heavy = both >= "tot heavy min". PROVISIONAL: set
+            #: them from mupix_track_tot.
+            "tot light min": X.TOT_LIGHT_MIN,
             "tot light max": X.TOT_LIGHT_MAX,
             "tot heavy min": X.TOT_HEAVY_MIN,
             #: Add the XY table's position (-x, +y of
@@ -714,11 +716,12 @@ def parse_settings(settings: dict | None) -> Config:
 
     XY = "MuPix/XY"
     tot_code = lambda v: 0 <= v <= W.TS2_MASK  # noqa: E731
+    light_lo = get(XY, "tot light min", int, tot_code)
     light, heavy = get(XY, "tot light max", int, tot_code), get(XY, "tot heavy min", int, tot_code)
-    if light >= heavy:
-        errors.append(f"MuPix/XY/tot light max ({light}) must be below tot heavy min ({heavy}); "
-                      "using the defaults")
-        light, heavy = X.TOT_LIGHT_MAX, X.TOT_HEAVY_MIN
+    if not light_lo <= light < heavy:
+        errors.append(f"MuPix/XY/tot light min ({light_lo}) <= tot light max ({light}) "
+                      f"< tot heavy min ({heavy}) does not hold; using the defaults")
+        light_lo, light, heavy = X.TOT_LIGHT_MIN, X.TOT_LIGHT_MAX, X.TOT_HEAVY_MIN
     xy_max_s1 = get(XY, "max S1 per frame", int)
     if not 1 <= xy_max_s1 <= X.XY_MAX_S1_LIMIT:
         clamped = min(max(xy_max_s1, 1), X.XY_MAX_S1_LIMIT)
@@ -740,7 +743,7 @@ def parse_settings(settings: dict | None) -> Config:
     xy = X.XYSettings(
         enable=xy_enable,
         box=get(XY, "cluster box px", int, lambda v: 1 <= v <= X.MAX_BOX_PX),
-        tot_light_max=light, tot_heavy_min=heavy,
+        tot_light_min=light_lo, tot_light_max=light, tot_heavy_min=heavy,
         apply_stage=get(XY, "apply stage shift", _as_bool),
         max_s1=xy_max_s1,
         placement=X.placement(slots1, slots2) if not bad_lists else X.placement((), ()),
@@ -773,7 +776,8 @@ def parse_settings(settings: dict | None) -> Config:
             errors.append(f"MuPix/Pairs: {bad_lists}; MuPix pairs are off")
     pairs = PR.PairSettings(
         enable=pr_enable,
-        window_ns=pr_window, max_l1=pr_max_l1, max_hits=pr_max_hits, tot_light_max=light, tot_heavy_min=heavy,
+        window_ns=pr_window, max_l1=pr_max_l1, max_hits=pr_max_hits,
+        tot_light_min=light_lo, tot_light_max=light, tot_heavy_min=heavy,
         apply_stage=xy.apply_stage, placement=xy.placement, off_reason=pr_off)
 
     nim = _parse_nim(s, roles, get, opt_chan, errors)
@@ -1606,7 +1610,7 @@ class SmaPlugin:
             self._build_xy()
             self._reset_xy_counters(classes_only=False)
             self.xy_resets += 1
-        elif (new.tot_light_max, new.tot_heavy_min) != (old.tot_light_max, old.tot_heavy_min):
+        elif X.tot_cuts(new) != X.tot_cuts(old):
             self._build_xy(classes_only=True)
             self._reset_xy_counters(classes_only=True)
             self.xy_resets += 1
@@ -1615,7 +1619,7 @@ class SmaPlugin:
             self._build_pairs()
             self._reset_pair_counters(classes_only=False)
             self.pair_resets += int(pr.active)
-        elif (pr.tot_light_max, pr.tot_heavy_min) != (old_pr.tot_light_max, old_pr.tot_heavy_min):
+        elif X.tot_cuts(pr) != X.tot_cuts(old_pr):
             self._build_pairs(classes_only=True)
             self._reset_pair_counters(classes_only=True)
             self.pair_resets += int(pr.active)
@@ -1920,7 +1924,7 @@ class SmaPlugin:
         h2 = lambda *a: self._h2(*a, dtype=np.uint32)  # noqa: E731
         win = f"[{m.window_ns[0]}, {m.window_ns[1]}) ns"
         cls = {"": "all tracks",
-               "_light": f"light: max pixel ToT <= {xy.tot_light_max} in L1 and L2",
+               "_light": f"light: max pixel ToT in [{xy.tot_light_min}, {xy.tot_light_max}] in L1 and L2",
                "_heavy": f"heavy: max pixel ToT >= {xy.tot_heavy_min} in L1 and L2"}
         if not classes_only:
             for p in (W.PLANE_L1, W.PLANE_L2):
@@ -1981,7 +1985,7 @@ class SmaPlugin:
         h2 = lambda *a: self._h2(*a, dtype=np.uint32)  # noqa: E731
         win = f"nearest L2 pixel within +-{pr.window_ns} ns"
         cls = {"": "all pairs",
-               "_light": f"light: pixel ToT <= {pr.tot_light_max} in L1 and L2",
+               "_light": f"light: pixel ToT in [{pr.tot_light_min}, {pr.tot_light_max}] in L1 and L2",
                "_heavy": f"heavy: pixel ToT >= {pr.tot_heavy_min} in L1 and L2"}
         for suf, what in cls.items():
             if classes_only and not suf:
@@ -2682,7 +2686,7 @@ class SmaPlugin:
         flat = {"xy": iy * nxp + ix, "xxp": _bin_of(tr.xp[trk], sax) * nxp + ix,
                 "yyp": _bin_of(tr.yp[trk], sax) * nxp + iy}
         t1, t2 = tr.tot1[trk], tr.tot2[trk]
-        light = (t1 <= xy.tot_light_max) & (t2 <= xy.tot_light_max)
+        light = X.light_class(t1, t2, xy.tot_light_min, xy.tot_light_max)
         heavy = (t1 >= xy.tot_heavy_min) & (t2 >= xy.tot_heavy_min)
         nl, nh = int(np.count_nonzero(light)), int(np.count_nonzero(heavy))
         sec.xy_light += nl
@@ -2761,7 +2765,7 @@ class SmaPlugin:
         flat = {"xy": iy * nxp + ix, "xxp": _bin_of(res.xp[paired], sax) * nxp + ix,
                 "yyp": _bin_of(res.yp[paired], sax) * nxp + iy}
         t1, t2 = res.tot1[paired], res.tot2[paired]
-        light = (t1 <= pr.tot_light_max) & (t2 <= pr.tot_light_max)
+        light = X.light_class(t1, t2, pr.tot_light_min, pr.tot_light_max)
         heavy = (t1 >= pr.tot_heavy_min) & (t2 >= pr.tot_heavy_min)
         nl, nh = int(np.count_nonzero(light)), int(np.count_nonzero(heavy))
         sec.pr_light += nl
@@ -3285,7 +3289,8 @@ class SmaPlugin:
             "light_frac": _ratio(light, ctrk, 4),
             "heavy_frac": _ratio(heavy, ctrk, 4),
             "stage": self._stage_summary(),
-            "cuts": {"cluster_box_px": xy.box, "tot_light_max": xy.tot_light_max,
+            "cuts": {"cluster_box_px": xy.box, "tot_light_min": xy.tot_light_min,
+                     "tot_light_max": xy.tot_light_max,
                      "tot_heavy_min": xy.tot_heavy_min, "tot_ns": m.tot_ns,
                      "window_ns": list(m.window_ns), "max_s1": xy.max_s1},
             "unplaced_chips": list(xy.placement.unplaced),
@@ -3338,8 +3343,8 @@ class SmaPlugin:
             "window_ns": pr.window_ns, "max_l1": pr.max_l1,
             "hits": {"n_l1": sum(x.pr_h1 for x in secs), "n_l2": sum(x.pr_h2 for x in secs)},
             "max_hits": pr.max_hits,
-            "cuts": {"tot_light_max": pr.tot_light_max, "tot_heavy_min": pr.tot_heavy_min,
-                     "tot_ns": m.tot_ns},
+            "cuts": {"tot_light_min": pr.tot_light_min, "tot_light_max": pr.tot_light_max,
+                     "tot_heavy_min": pr.tot_heavy_min, "tot_ns": m.tot_ns},
             "stage": self._stage_summary(),
             "mupix_only_frames": sum(x.pr_mponly for x in secs),
         }

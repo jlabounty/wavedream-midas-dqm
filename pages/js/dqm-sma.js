@@ -1353,7 +1353,7 @@ function xyNoteParts(xy) {
   parts.push([`tracks ${pct(f.track, 1)} of ${num(xy.n_s1)} S1 hits judged, ambiguous ${pct(f.ambiguous, 1)}`, ""]);
   const unit = c.tot_ns ? ` (×${c.tot_ns} ns)` : "";
   parts.push([`light ${pct(xy.light_frac, 1)}, heavy ${pct(xy.heavy_frac, 1)} of the tracks ` +
-              `(light: both planes' max ToT ≤ ${c.tot_light_max}${unit} · heavy: ≥ ${c.tot_heavy_min})`, ""]);
+              `(light: both planes' max ToT ${lightCut(c)}${unit} · heavy: ≥ ${c.tot_heavy_min})`, ""]);
   parts.push(stagePart(st));
   parts.push([`${xy.geometry || "?"}, +x beam-left, seen looking upstream`, ""]);
   const qt = quadText(xy.quadrants || []);
@@ -1362,6 +1362,12 @@ function xyNoteParts(xy) {
   if (un.length) parts.push([`chips with no place: ${un.join(", ")}`, "warn"]);
   if (xy.resets) parts.push([`maps reset ${xy.resets}× by XY edits`, "muted"]);
   return parts;
+}
+
+/** The light ToT cut of a summary's cuts block; an older analyzer sends no light min. */
+function lightCut(c) {
+  return c.tot_light_min == null ? `≤ ${c.tot_light_max}`
+    : `${c.tot_light_min}–${c.tot_light_max}`;
 }
 
 /** The stage shift as a note part, [text, kind, title], from a summary's stage block. */
@@ -1441,7 +1447,7 @@ function pairNoteParts(pr) {
   }
   const unit = c.tot_ns ? ` (×${c.tot_ns} ns)` : "";
   parts.push([`light ${pct(pr.light_frac, 1)}, heavy ${pct(pr.heavy_frac, 1)} of the pairs ` +
-              `(light: both pixels' ToT ≤ ${c.tot_light_max}${unit} · heavy: ≥ ${c.tot_heavy_min})`, ""]);
+              `(light: both pixels' ToT ${lightCut(c)}${unit} · heavy: ≥ ${c.tot_heavy_min})`, ""]);
   parts.push(stagePart(pr.stage || {}));
   if (pr.resets) parts.push([`maps reset ${pr.resets}× by Pairs or ToT-cut edits`, "muted"]);
   parts.push(["pixel pairs, not particles", "muted",

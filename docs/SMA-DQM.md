@@ -823,9 +823,9 @@ difference is 2.667 mrad, one bin). `xy.n_s1` counts these S1 hits; it is not
 the same number as `mupix.n_s1` (the in-time fractions' S1 hits, whose sideband
 must also lie in the pixel data, and which are not capped at 250).
 
-**Light and heavy.** A track is *light* when both planes' ToT is <= `tot light
-max` (9) and *heavy* when both are >= `tot heavy min` (13), in 256 ns counts. The
-two defaults are PROVISIONAL starting values, to be tuned on beam: on run 1008
+**Light and heavy.** A track is *light* when both planes' ToT is between `tot
+light min` (3) and `tot light max` (9), both included, and *heavy* when both are
+>= `tot heavy min` (13), in 256 ns counts. The defaults are PROVISIONAL starting values, to be tuned on beam: on run 1008
 (S1-seeded, mostly muons and pions) the track ToT peaks at 6-8. Set the cuts
 from `mupix_track_tot` (L1 ToT vs L2 ToT): a real particle class is a blob on
 the diagonal.
@@ -927,8 +927,8 @@ pixels on a chip with no place in the chip lists. Each pair fills the L1 pixel
 position and the slopes x' = 1000 (x2 - x1) / 30 mm, the same as the monitor
 (`PIPSMMuPixMonitor.cpp:1049`). The positions are in the frame of the x/y maps,
 with the XY table's shift and `MuPix/XY/apply stage shift`. The light and heavy
-classes use the XY cuts (`MuPix/XY/tot light max`, `tot heavy min`) on the
-two pixel ToTs: *light* when both are <= 9, *heavy* when both are >= 13.
+classes use the XY cuts (`MuPix/XY/tot light min`, `tot light max`, `tot heavy min`)
+on the two pixel ToTs: *light* when both are in [3, 9], *heavy* when both are >= 13.
 
 **The sample.** At most `max L1 per frame` (1000) L1 pixels per frame are
 paired, spread evenly over the frame's candidates in time order. When the
@@ -1307,7 +1307,7 @@ histograms.
 | `MuPix/max S1 per frame` | 500 | S1 hits per frame matched against the pixels (evenly spread); 0 = all | yes |
 | `MuPix/XY/enable` | y | MuPix x/y histograms (see [MuPix x/y](#mupix-xy-positions-and-s1-seeded-tracks)); n = none booked or filled | the x/y maps only |
 | `MuPix/XY/cluster box px` | 3 | a plane is accepted when its in-window pixels lie on one chip in this square (1-64) | the x/y maps only |
-| `MuPix/XY/tot light max`, `tot heavy min` | 9, 13 | track ToT classes (both planes' max pixel ToT, 0-31), also the pair classes (both pixels' ToT); light max must be below heavy min. PROVISIONAL | the light/heavy maps only (x/y and pairs) |
+| `MuPix/XY/tot light min`, `tot light max`, `tot heavy min` | 3, 9, 13 | track ToT classes (both planes' max pixel ToT, 0-31), also the pair classes (both pixels' ToT): light = both in [light min, light max], heavy = both >= heavy min; needs light min <= light max < heavy min. PROVISIONAL | the light/heavy maps only (x/y and pairs) |
 | `MuPix/XY/apply stage shift` | y | add (-x, +y) of `/Equipment/XYTable/Variables/Measured` (re-read every 2 s; 0 when absent) to every position, x/y and pairs | the x/y and pair maps only |
 | `MuPix/XY/max S1 per frame` | 250 | S1 hits per frame given to the track finder, from the MuPix sample; 1-2000 (outside: clamped, with a `settings` note; 0 is not "all"). A CPU knob | **no** |
 | `MuPix/Pairs/enable` | y | unseeded L1-L2 pixel pairs (see [MuPix pairs](#mupix-pairs-unseeded-the-nearlines-l1-l2-coincidences)); n = none booked or filled | the pair maps only |

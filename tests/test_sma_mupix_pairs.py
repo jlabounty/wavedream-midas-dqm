@@ -340,21 +340,25 @@ def test_pairs_need_no_s1():
     assert p.store.get("sma/mupix_pair_xy").entries == 40
 
 
-@pytest.mark.parametrize("light, heavy, cls", [
-    (12, 13, "light"),        # ToT 12 and 9 both <= 12
-    (11, 12, None),           # 12 > 11: not light; 9 < 12: not heavy
-    (8, 9, "heavy"),          # both >= 9
-    (8, 10, None),
+@pytest.mark.parametrize("lo, light, heavy, cls", [
+    (3, 12, 13, "light"),     # ToT 12 and 9 both in [3, 12]
+    (9, 12, 13, "light"),     # the light min is inclusive
+    (10, 12, 13, None),       # 9 < 10: not light; not heavy either
+    (3, 11, 12, None),        # 12 > 11: not light; 9 < 12: not heavy
+    (3, 8, 9, "heavy"),       # both >= 9
+    (3, 8, 10, None),
 ])
-def test_the_tot_classes_at_the_edges(light, heavy, cls):
-    p = _plugin({"MuPix": {"XY": {"tot light max": light, "tot heavy min": heavy}}})
+def test_the_tot_classes_at_the_edges(lo, light, heavy, cls):
+    p = _plugin({"MuPix": {"XY": {"tot light min": lo, "tot light max": light,
+                                  "tot heavy min": heavy}}})
     _feed(p, frame_words(n=40), run=1)
     nl = p.store.get("sma/mupix_pair_xy_light").entries
     nh = p.store.get("sma/mupix_pair_xy_heavy").entries
     assert (nl, nh) == ((40, 0) if cls == "light" else (0, 40) if cls == "heavy" else (0, 0))
     s = p.summary()["pairs"]
     assert s["light_frac"] == nl / 40 and s["heavy_frac"] == nh / 40
-    assert s["cuts"] == {"tot_light_max": light, "tot_heavy_min": heavy, "tot_ns": 256}
+    assert s["cuts"] == {"tot_light_min": lo, "tot_light_max": light, "tot_heavy_min": heavy,
+                         "tot_ns": 256}
 
 
 def test_the_window_key_moves_the_edge():
@@ -462,6 +466,7 @@ def _pair_entries(p):
     ({"Pairs": {"enable": True, "window ns": 64}}, "none"),  # the defaults: no change
     ({"XY": {"apply stage shift": False}}, "all"),
     ({"XY": {"tot light max": 5, "tot heavy min": 9}}, "classes"),
+    ({"XY": {"tot light min": 0}}, "classes"),
     ({"XY": {"cluster box px": 4, "max S1 per frame": 100}}, "none"),
 ])
 def test_a_pair_edit_resets_only_the_pair_maps(edit, reset):
@@ -549,7 +554,7 @@ def test_the_summary_block_keys():
     _feed(p, R1008, run=1008)
     s = p.summary()["pairs"]
     assert set(s) == SUMMARY_KEYS
-    assert set(s["cuts"]) == {"tot_light_max", "tot_heavy_min", "tot_ns"}
+    assert set(s["cuts"]) == {"tot_light_min", "tot_light_max", "tot_heavy_min", "tot_ns"}
     assert set(s["hits"]) == {"n_l1", "n_l2"} and s["max_hits"] == PR.MAX_HITS
     assert s["hits"]["n_l1"] == p.store.get("sma/mupix_pair_hits_xy_L1").entries > 0
     assert s["hits"]["n_l2"] == p.store.get("sma/mupix_pair_hits_xy_L2").entries > 0

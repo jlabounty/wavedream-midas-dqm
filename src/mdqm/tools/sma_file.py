@@ -325,6 +325,12 @@ def _frac(x, digits=1) -> str:
     return "-" if x is None else f"{100 * x:.{digits}f}%"
 
 
+def _light(c: dict) -> str:
+    """The light cut of a summary's cuts block; older summaries have no light min."""
+    lo = c.get("tot_light_min")
+    return f"<= {c['tot_light_max']}" if lo is None else f"in [{lo}, {c['tot_light_max']}]"
+
+
 def _good(f: dict) -> int:
     return f["processed"] - f["stale"] - f["empty"] - f.get("suspect", 0)
 
@@ -691,7 +697,7 @@ def mupix_xy_line(xy: dict) -> str:
     return (f"MuPix x/y ({xy['geometry']}): {xy['n_s1']} S1 hits judged: track "
             f"{_frac(f['track'])}, ambiguous {_frac(f['ambiguous'])}, no L1 "
             f"{_frac(f['no_l1'])}, no L2 {_frac(f['no_l2'])}; of the {xy['tracks']} tracks light "
-            f"(ToT <= {c['tot_light_max']}) {_frac(xy['light_frac'])}, heavy (ToT >= "
+            f"(ToT {_light(c)}) {_frac(xy['light_frac'])}, heavy (ToT >= "
             f"{c['tot_heavy_min']}) {_frac(xy['heavy_frac'])}; cluster square "
             f"{c['cluster_box_px']} px; stage x {st['x_mm']}, y {st['y_mm']} mm ({st['source']}"
             + (f", shift {st['shift_mm'][0]:+g}, {st['shift_mm'][1]:+g} mm" if st["applied"]
@@ -742,7 +748,7 @@ def mupix_xy_figure(summary: dict, store: HistStore, title: str):
          "x (mm)", "y (mm)")
     _map(fig, fig.add_subplot(gs[0, 2]), get("mupix_track_tot"), "Tracks: max ToT",
          "L1 max ToT", "L2 max ToT")
-    rows = (("", "all tracks"), ("_light", f"light, ToT <= {c['tot_light_max']}"),
+    rows = (("", "all tracks"), ("_light", f"light, ToT {_light(c)}"),
             ("_heavy", f"heavy, ToT >= {c['tot_heavy_min']}"))
     for r, (suf, what) in enumerate(rows, start=1):
         _map(fig, fig.add_subplot(gs[r, 0]), get(f"mupix_track_xy{suf}"), f"L1 y / x, {what}",
@@ -768,7 +774,7 @@ def mupix_pairs_line(pr: dict) -> str:
             f"{_frac(pr['paired_frac'])}, "
             + (f"{pr['mean_partners']}" if pr["mean_partners"] is not None else "-")
             + " L2 candidates per pair; of the "
-            f"{pr['n_pairs']} pairs light (both ToT <= {c['tot_light_max']}) "
+            f"{pr['n_pairs']} pairs light (both ToT {_light(c)}) "
             f"{_frac(pr['light_frac'])}, heavy (both ToT >= {c['tot_heavy_min']}) "
             f"{_frac(pr['heavy_frac'])}; stage x {st['x_mm']}, y {st['y_mm']} mm ({st['source']}"
             + (f", shift {st['shift_mm'][0]:+g}, {st['shift_mm'][1]:+g} mm" if st["applied"]
@@ -817,7 +823,7 @@ def mupix_pairs_figure(summary: dict, store: HistStore, title: str):
     ax.tick_params(labelsize=7)
     ax.set_title(f"Partners per L1 pixel ({hn.entries})", fontsize=9)
     c = pr["cuts"]
-    rows = (("", "all pairs"), ("_light", f"light, ToT <= {c['tot_light_max']}"),
+    rows = (("", "all pairs"), ("_light", f"light, ToT {_light(c)}"),
             ("_heavy", f"heavy, ToT >= {c['tot_heavy_min']}"))
     for r, (suf, what) in enumerate(rows, start=1):
         _map(fig, fig.add_subplot(gs[r, 0]), get(f"mupix_pair_xy{suf}"), f"L1 y / x, {what}",

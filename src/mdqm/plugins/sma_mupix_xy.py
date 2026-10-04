@@ -87,6 +87,7 @@ STATE_NAMES = ("no L1", "no L2", "ambiguous", "track")
 
 #: Defaults of ``/DQM/SMA/MuPix/XY``.
 CLUSTER_BOX_PX = 3
+TOT_LIGHT_MIN = 3
 TOT_LIGHT_MAX = 9
 TOT_HEAVY_MIN = 13
 #: S1 rows per frame given to the track finder (``XY/max S1 per frame``):
@@ -212,12 +213,24 @@ def stage_shift(xpos, ypos) -> tuple[float, float]:
     return -float(xpos), float(ypos)
 
 
+def light_class(tot1: np.ndarray, tot2: np.ndarray, lo: int, hi: int) -> np.ndarray:
+    """Both ToTs within [lo, hi]: the light class of a track or a pixel pair."""
+    return (tot1 >= lo) & (tot1 <= hi) & (tot2 >= lo) & (tot2 <= hi)
+
+
+def tot_cuts(s) -> tuple[int, int, int]:
+    """``(light min, light max, heavy min)`` of XYSettings or PairSettings: what,
+    when it changes, resets only the light/heavy maps."""
+    return s.tot_light_min, s.tot_light_max, s.tot_heavy_min
+
+
 @dataclass
 class XYSettings:
     """The parsed ``/DQM/SMA/MuPix/XY``; ``placement`` follows the MuPix chip lists."""
 
     enable: bool = True
     box: int = CLUSTER_BOX_PX
+    tot_light_min: int = TOT_LIGHT_MIN
     tot_light_max: int = TOT_LIGHT_MAX
     tot_heavy_min: int = TOT_HEAVY_MIN
     apply_stage: bool = True
@@ -272,11 +285,12 @@ class S1Tracks:
         s = self.state[self.state >= 0].astype(np.intp)
         return np.bincount(s, minlength=len(STATE_NAMES)).astype(np.int64)
 
-    def classes(self, light_max: int, heavy_min: int) -> tuple[np.ndarray, np.ndarray]:
-        """``(light, heavy)`` masks: tracks with both planes' max ToT <= light_max,
-        or both >= heavy_min."""
+    def classes(self, light_min: int, light_max: int,
+                heavy_min: int) -> tuple[np.ndarray, np.ndarray]:
+        """``(light, heavy)`` masks: tracks with both planes' max ToT within
+        [light_min, light_max], or both >= heavy_min."""
         t = self.track
-        return (t & (self.tot1 <= light_max) & (self.tot2 <= light_max),
+        return (t & light_class(self.tot1, self.tot2, light_min, light_max),
                 t & (self.tot1 >= heavy_min) & (self.tot2 >= heavy_min))
 
 
