@@ -940,25 +940,27 @@ def accidental_corrected(f_in, f_side, width_in=1.0, width_side=1.0):
     return (float(f_in) - a) / (1.0 - a)
 
 
-def mupix_pairs(t_s1, t_pix, lo_ns, hi_ns, max_pairs=MAX_MUPIX_PAIRS):
+def mupix_pairs(t_s1, t_pix, lo_ns, hi_ns, max_pairs=MAX_MUPIX_PAIRS, with_index=False):
     """``(dt, n_s1_used)``: every t(pixel) - t(S1) in [lo, hi), both inputs ascending.
 
     At most about ``max_pairs`` pairs: when the frame would give more, an
     evenly spread subset of the S1 rows is used (every k-th), and
-    ``n_s1_used`` says how many.
+    ``n_s1_used`` says how many. ``with_index``: ``(dt, n_s1_used, j)``, j
+    the index into ``t_pix`` of each pair's pixel.
     """
     t1 = np.asarray(t_s1, dtype=np.int64)
     tp = np.asarray(t_pix, dtype=np.int64)
     lo, hi = int(lo_ns), int(hi_ns) - 1
     if t1.size == 0 or tp.size == 0:
-        return np.zeros(0, dtype=np.int64), int(t1.size)
+        e = np.zeros(0, dtype=np.int64)
+        return (e, int(t1.size), np.zeros(0, dtype=np.intp)) if with_index else (e, int(t1.size))
     a, b = _bounds(t1, tp, lo, hi)
     total = int((b - a).sum())
     if total > max_pairs > 0:
         k = -(-total // int(max_pairs))
         t1 = t1[::k]
-    _i, _j, dt = window_pairs(t1, tp, lo, hi)
-    return dt, int(t1.size)
+    _i, j, dt = window_pairs(t1, tp, lo, hi)
+    return (dt, int(t1.size), j) if with_index else (dt, int(t1.size))
 
 
 # ==============================================================================

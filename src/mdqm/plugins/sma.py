@@ -1884,6 +1884,11 @@ class SmaPlugin:
         h["mupix_row_chip"] = self._h2("mupix_row_chip", cax, Axis(256, -0.5, 255.5, "row"),
                                        f"Row occupancy per chip (rows >= {W.PIXEL_ROWS} are not on "
                                        "the sensor)")
+        # The same pairs as mupix_dt_L1/_L2, by the pixel's chip: a chip whose
+        # clock or link is off shows as its own peak moving away.
+        h["mupix_dt_chip"] = self._h2("mupix_dt_chip", cax, dax,
+                                      "MuPix minus S1 per chip, all pairs (the pairs of "
+                                      "mupix_dt_L1 and _L2)")
         self._build_xy()
         self._build_pairs()
 
@@ -2637,12 +2642,18 @@ class SmaPlugin:
         c[1], c[2:5], c[5:8] = n, fin, fside
         h["mupix_s1_match"].add_counts(c, entries=n)
         b = self.cfg.binning
+        ix, iy = [], []                         # mupix_dt_chip, one fill for both planes
         for p in (W.PLANE_L1, W.PLANE_L2):
-            dt, _used = W.mupix_pairs(t_s1, px.times(p), b["mupix dt min"], b["mupix dt max"],
-                                      m.max_pairs)
+            dt, _used, j = W.mupix_pairs(t_s1, px.times(p), b["mupix dt min"], b["mupix dt max"],
+                                         m.max_pairs, with_index=True)
             if dt.size:
                 hh = h["mupix_dt"][p]
-                _fill_1d_index(hh, (dt - int(hh.x.lo)) // b["mupix dt bin"] + 1)
+                idt = (dt - int(hh.x.lo)) // b["mupix dt bin"] + 1
+                _fill_1d_index(hh, idt)
+                ix.append(chip[px.planes[p]][j] + 1)
+                iy.append(idt)
+        if ix:
+            _fill_2d_index(h["mupix_dt_chip"], np.concatenate(ix), np.concatenate(iy))
 
     def _fill_xy(self, t_s1, px: W.Pixels, sec: _Second) -> None:
         """MuPix x/y of a good frame, on the MuPix S1 sample.

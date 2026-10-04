@@ -199,6 +199,12 @@ def test_all_pairs_are_bounded():
     dt2, used2 = W.mupix_pairs(t1, tp, -2560, 2000, max_pairs=100)
     assert used2 == 12 and dt2.size < 130
     assert np.count_nonzero(dt2 == -40) == 12
+    # with_index: the pixel of each pair, the same pairs.
+    dt3, used3, j = W.mupix_pairs(t1, tp, -2560, 2000, max_pairs=100, with_index=True)
+    assert used3 == used2 and np.array_equal(dt3, dt2) and j.size == dt3.size
+    assert set(np.unique(tp[j])) <= set(tp)
+    e, n0, je = W.mupix_pairs(t1[:0], tp, -2560, 2000, with_index=True)
+    assert e.size == 0 and n0 == 0 and je.size == 0
 
 
 # --- the event display's MuPix selector -------------------------------------------------------
@@ -310,6 +316,12 @@ def test_a_good_frame_fills_the_mupix_histograms():
     assert d1.x.lo == -2560 and d1.x.n == 570
     i40 = int((-40 - d1.x.lo) // 8) + 1
     assert d1.counts[i40] >= 38
+    # Per chip: the same pairs as the plane plots, split by the pixel's chip.
+    dc = h("mupix_dt_chip").counts
+    assert dc.shape == (d1.x.n + 2, W.N_CHIP_IDS + 2)
+    assert np.array_equal(dc[:, 1:5].sum(axis=1), d1.counts), "L1 = chips 0-3"
+    assert np.array_equal(dc[:, 5:9].sum(axis=1), h("mupix_dt_L2").counts), "L2 = chips 4-7"
+    assert int(dc[:, 1 + 9].sum()) == 0, "a chip in no plane has no pairs"
     assert int(h("mupix_tot_L1").counts[1 + 12]) == 40
     assert int(h("mupix_tot_L2").counts[1 + 9]) == 40
     col = h("mupix_col_chip").counts
