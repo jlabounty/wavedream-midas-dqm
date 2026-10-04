@@ -182,7 +182,8 @@ def build() -> dict:
     # The MuPix histograms the page tests look at (the others fall back to the
     # generic 1D/2D ones: a 2D histogram is 140 kB of hex here).
     mupix_hists = {n: p.store.get(n).encode().hex() for n in
-                   ("sma/mupix_dt_L1", "sma/mupix_dt_L2", "sma/mupix_s1_match", "sma/mupix_col_chip")}
+                   ("sma/mupix_dt_L1", "sma/mupix_dt_L2", "sma/mupix_s1_match", "sma/mupix_col_chip",
+                    "sma/mupix_dt_chip")}
     status = {
         "client": "sma_analyzer", "run_number": 682, "run_active": True,
         "events_seen": p.frames, "events_processed": p.frames, "processed_per_s": 4.2,

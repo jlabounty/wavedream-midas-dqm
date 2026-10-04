@@ -777,6 +777,135 @@ test("a lost MuPix time sync is a red chip and a warning flag", async () => {
   assert.strictEqual(byId(page, "dqm-sma-tab-mupix").getAttribute("aria-selected"), "true");
 });
 
+// The per-chip t(pixel) - t(S1): one line per chip, the chips chosen by checkboxes.
+async function chipDtPage(stored) {
+  const page = await boot(undefined, stored);
+  byId(page, "dqm-sma-tab-mupix").onclick();
+  await settle(page);
+  const wrap = byId(page, "dqm-sma-grid-mupix").byClass("dqm-sma-plotwrap")
+    .find((w) => /\[mupix_dt_chip\]$/.test(w.children[0].textContent));
+  return { page, wrap, mpg: () => wrap.byClass("dqm-plot")[0].mpg };
+}
+const labels = (mpg) => mpg.param.plot.map((q) => q.label);
+const toggle = async (page, id, on) => {
+  const box = byId(page, id);
+  box.checked = on;
+  box.onchange.call(box);
+  await settle(page);
+};
+
+test("MuPix dt per chip: a step line per chip of the plane map, a checkbox each, the full range", async () => {
+  const { page, wrap, mpg } = await chipDtPage();
+  const bar = wrap.byClass("dqm-sma-chipbar")[0];
+  assert.ok(bar && wrap.children[1] === bar, "the chip bar sits between the title and the plot");
+  const boxes = bar.byClass("dqm-sma-chipbox").map((b) => b.textContent).filter((t) => /^chip /.test(t));
+  assert.ok(bar.byClass("dqm-sma-swatch").every((sw, i) => sw.style.background === mpg().param.plot[i].line.color),
+            "each checkbox's swatch is its line's colour");
+  assert.deepStrictEqual(boxes, [0, 1, 2, 3].map((c) => `chip ${c} (L1)`)
+    .concat([4, 5, 6, 7].map((c) => `chip ${c} (L2)`)));
+  assert.deepStrictEqual(bar.byClass("dqm-sma-chipbtn").map((b) => b.textContent), ["L1", "L2", "all"]);
+  const g = mpg();
+  assert.deepStrictEqual(labels(g), boxes.concat(["in time", "sideband"]));
+  assert.ok(g.param.plot.slice(0, 8).every((q) => q.type === "scatter" && q.line.draw && !q.line.fill),
+            "unfilled lines: eight filled histograms would hide each other");
+  assert.strictEqual(g.param.xAxis.min, -2560, "the range of mupix_dt_L1/_L2: a chip sliding out is seen");
+  assert.strictEqual(g.param.xAxis.max, 2000);
+  // Steps: two points a bin, at its edges, 8 ns bins from -2560 ns.
+  assert.deepStrictEqual(g.data[0].x.slice(0, 4), [-2560, -2552, -2552, -2544]);
+  assert.strictEqual(g.data[0].y[0], g.data[0].y[1]);
+  assert.strictEqual(g.param.legend.show, false, "the checkboxes are the legend");
+  assert.ok(new Set(g.param.plot.slice(0, 8).map((q) => q.line.color)).size === 8, "eight colours");
+  assert.deepStrictEqual(g.data[8].x, [-150, -150, 450, 450], "the in-time window");
+  assert.deepStrictEqual(g.data[9].x, [-2400, -2400, -1800, -1800], "the sideband");
+  const top = Math.max(...g.data.slice(0, 8).flatMap((d) => d.y));
+  assert.ok(top > 0 && g.data[8].y[1] >= top, "the window as high as the highest chip");
+  const foot = wrap.byClass("dqm-footnote")[0].textContent;
+  assert.ok(/^chip 0: [\d,]+, peak -?\d+ ns · chip 1: /.test(foot), foot);
+  assert.ok(/green: in time, grey: sideband$/.test(foot), foot);
+  assert.ok(!/OUTSIDE/.test(foot), "every peak in the window");
+  // Zoomed on the window, and back.
+  await toggle(page, "dqm-sma-dtzoom", true);
+  assert.strictEqual(mpg().param.xAxis.min, -300);
+  assert.strictEqual(mpg().param.xAxis.max, 600);
+  assert.strictEqual(JSON.parse(globalThis.localStorage._d["dqm-sma-settings"]).dtZoom, true);
+  await toggle(page, "dqm-sma-dtzoom", false);
+  assert.strictEqual(mpg().param.xAxis.min, -2560);
+});
+
+test("MuPix dt per chip: unticked chips are not drawn; L1 / L2 / all; remembered", async () => {
+  const { page, wrap, mpg } = await chipDtPage();
+  await toggle(page, "dqm-sma-dtchip-2", false);
+  assert.deepStrictEqual(labels(mpg()).slice(0, -2),
+    ["chip 0 (L1)", "chip 1 (L1)", "chip 3 (L1)", "chip 4 (L2)", "chip 5 (L2)", "chip 6 (L2)", "chip 7 (L2)"]);
+  assert.strictEqual(byId(page, "dqm-sma-dtchip-2").checked, false);
+  const stored = () => JSON.parse(globalThis.localStorage._d["dqm-sma-settings"]);
+  assert.deepStrictEqual(stored().dtChips, [0, 1, 3, 4, 5, 6, 7]);
+  // A chip keeps its colour whichever chips are shown.
+  const colourOf = (label) => mpg().param.plot.find((q) => q.label === label).line.color;
+  const c3 = colourOf("chip 3 (L1)");
+  const btn = (t) => wrap.byClass("dqm-sma-chipbtn").find((b) => b.textContent === t);
+  btn("L2").onclick();
+  await settle(page);
+  assert.deepStrictEqual(labels(mpg()).slice(0, -2), [4, 5, 6, 7].map((c) => `chip ${c} (L2)`));
+  assert.strictEqual(byId(page, "dqm-sma-dtchip-0").checked, false);
+  btn("all").onclick();
+  await settle(page);
+  assert.strictEqual(labels(mpg()).length, 10);
+  assert.strictEqual(colourOf("chip 3 (L1)"), c3);
+  assert.strictEqual(stored().dtChips, null, "all chips is stored as null: a new chip shows too");
+  // Ticking the last unticked chip is "all" again.
+  await toggle(page, "dqm-sma-dtchip-5", false);
+  await toggle(page, "dqm-sma-dtchip-5", true);
+  assert.strictEqual(stored().dtChips, null);
+  // None ticked: the plot says so.
+  btn("L1").onclick();
+  await settle(page);
+  for (const c of [0, 1, 2, 3]) await toggle(page, `dqm-sma-dtchip-${c}`, false);
+  assert.strictEqual(labels(mpg()).length, 2);
+  assert.ok(/No chip chosen/.test(wrap.byClass("dqm-footnote")[0].textContent));
+  // A reload draws the stored choice.
+  const again = await chipDtPage({ dtChips: [4, 6], dtNorm: false });
+  assert.deepStrictEqual(labels(again.mpg()).slice(0, -2), ["chip 4 (L2)", "chip 6 (L2)"]);
+});
+
+test("MuPix dt per chip: a peak outside the in-time window is called out", async () => {
+  const s = clone(FX.summary);
+  s.mupix.window_ns = [-40, 450];            // the fixture's peaks: -44 ns (chips 2, 3), -36, -28
+  const page = await boot({ "sma::summary": () => json(s) });
+  byId(page, "dqm-sma-tab-mupix").onclick();
+  await settle(page);
+  const wrap = byId(page, "dqm-sma-grid-mupix").byClass("dqm-sma-plotwrap")
+    .find((w) => /\[mupix_dt_chip\]$/.test(w.children[0].textContent));
+  const foot = wrap.byClass("dqm-footnote")[0];
+  const m = /^PEAK OUTSIDE THE IN-TIME WINDOW: chips? ([\d, ]+) · /.exec(foot.textContent);
+  assert.ok(m, foot.textContent);
+  const peaks = [...foot.textContent.matchAll(/chip (\d+): [\d,]+, peak (-?\d+) ns/g)];
+  const out = peaks.filter((q) => Number(q[2]) < -40).map((q) => q[1]);
+  assert.ok(out.length > 0 && m[1] === out.join(", "), `${m[1]} vs ${out}`);
+  assert.ok(foot.classList.contains("dqm-sma-foot-warn"));
+});
+
+test("MuPix dt per chip: each chip to its peak", async () => {
+  const { page, mpg } = await chipDtPage();
+  const raw = mpg().data.slice(0, 8).map((d) => Math.max(...d.y));
+  assert.ok(raw.some((v) => v > 1), "counts before");
+  await toggle(page, "dqm-sma-dtnorm", true);
+  const g = mpg();
+  g.data.slice(0, 8).forEach(function (d, i) {
+    if (raw[i] > 0) assert.ok(Math.abs(Math.max(...d.y) - 1) < 1e-12, `chip ${i} peaks at 1`);
+  });
+  assert.strictEqual(g.data[8].y[1], 1, "the window outline to 1");
+  assert.strictEqual(g.param.yAxis.title.text, "entries / chip's peak");
+  assert.strictEqual(JSON.parse(globalThis.localStorage._d["dqm-sma-settings"]).dtNorm, true);
+  // Log y: no zero on a log axis, the floor three decades under the peak.
+  const tb = byId(page, "dqm-sma-logy");
+  tb.checked = true;
+  tb.onchange.call(tb);
+  await settle(page);
+  assert.strictEqual(mpg().param.yAxis.min, 1e-3);
+  assert.ok(mpg().data.slice(0, 8).every((d) => d.y.every((v) => v >= 1e-3)));
+});
+
 test("a plane-map edit lays the MuPix tab out again", async () => {
   let s = FX.summary;
   const page = await boot({ "sma::summary": () => json(s) });
@@ -817,8 +946,8 @@ test("MuPix phase space: the x/y plots alone, in rows, in their order; the rest 
   byId(page, "dqm-sma-tab-mupix").onclick();
   await settle(page);
   const diag = shortNames(byId(page, "dqm-sma-grid-mupix"));
-  assert.deepStrictEqual(diag.slice(0, 5), ["mupix_dt_L1", "mupix_dt_L2", "mupix_s1_match",
-                                            "mupix_tot_L1", "mupix_tot_L2"]);
+  assert.deepStrictEqual(diag.slice(0, 6), ["mupix_dt_L1", "mupix_dt_L2", "mupix_dt_chip",
+                                            "mupix_s1_match", "mupix_tot_L1", "mupix_tot_L2"]);
   for (const n of ["mupix_col_chip", "mupix_row_chip", "mupix_hits_chip"]) assert.ok(diag.includes(n), n);
   assert.ok(!diag.some((n) => XY_ORDER.includes(n)), diag.join(" "));
   // The rows: the two hit maps, then all / light / heavy per track map; the

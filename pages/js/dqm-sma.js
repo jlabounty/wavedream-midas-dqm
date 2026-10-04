@@ -134,7 +134,7 @@ const ORDER = {
               /^mupix_pair_yyp$/, /^mupix_pair_yyp_light$/, /^mupix_pair_yyp_heavy$/,
               /^mupix_pair_dt$/, /^mupix_pair_partners$/, /^mupix_pair_/],
   // Every other mupix_ histogram is a diagnostic.
-  mupix: [/^mupix_dt_L1$/, /^mupix_dt_L2$/, /^mupix_s1_match$/, /^mupix_tot_L1$/, /^mupix_tot_L2$/,
+  mupix: [/^mupix_dt_L1$/, /^mupix_dt_L2$/, /^mupix_dt_chip$/, /^mupix_s1_match$/, /^mupix_tot_L1$/, /^mupix_tot_L2$/,
           /^mupix_col_chip/, /^mupix_row_chip/, /^mupix_hits_chip$/, /^mupix_/],
   nim: [/^nim_/, /^s1_coinc_tot$/],
 };
@@ -166,6 +166,9 @@ const PAIR_MAP = /^sma\/mupix_pair_(xy|xxp|yyp)(_light|_heavy)?$/;
 const PAIR_ANY = /^sma\/mupix_pair_\w+$/;
 
 const PAIR_DT = "sma/mupix_pair_dt";
+
+/** t(pixel) - t(S1) by chip (chip x dt): one line per chip, the chips chosen by checkboxes. */
+const CHIP_DT = "sma/mupix_dt_chip";
 
 /**
  * Plots laid out side by side in a row of their own, `cols` to a row on a wide
@@ -224,6 +227,9 @@ const state = {
   xyHead: null,            // the MuPix x/y note and switch, placed by layoutTab
   xyNoteSig: null,         // the note's parts as last drawn
   pairLogZ: false,         // the unseeded pair maps on log z (PAIR_MAP)
+  dtChips: null,           // chips drawn on the per-chip dt plot (CHIP_DT); null = all
+  dtNorm: false,           // the per-chip dt lines scaled to their own peak
+  dtZoom: false,           // the per-chip dt x axis on the in-time window (else the full range)
   pairHead: null,          // the pairs tab's note and switch, placed by layoutTab
   pairNoteSig: null,
   names: null,             // dqm::list, null until the analyzer has answered once
@@ -394,6 +400,10 @@ function groupsFor(tab) {
         const key = `${n}#${plane}:${chips.join(",")}`;
         groups.push({ key, names: [n], occupancy: { axis: occ[1], plane, chips } });
       }
+      continue;
+    }
+    if (n === CHIP_DT) {
+      groups.push({ key: n, names: [n], chipDt: true });
       continue;
     }
     const m = /^(sma\/tot_ch\d+)_lsb([01])$/.exec(n);
@@ -712,6 +722,214 @@ async function drawOccupancy(p) {
   p.sig = sig;
 }
 
+/**
+ * The chips of the per-chip dt plot, in order: L1's, L2's, then any other chip
+ * with entries ("no plane"). [[chip, plane name or ""], ...]
+ */
+function chipDtChips(hist) {
+  const out = [], seen = new Set();
+  for (const [plane, chips] of mupixPlanes()) {
+    for (const c of chips) if (!seen.has(c)) { seen.add(c); out.push([c, plane]); }
+  }
+  const nx = hist.nBins[0] + 2, ny = hist.nBins[1] + 2;
+  for (let c = 0; c < hist.nBins[0]; c++) {
+    if (seen.has(c)) continue;
+    let n = 0;
+    for (let iy = 0; iy < ny && !n; iy++) n = hist.data[(c + 1) + iy * nx];
+    if (n) out.push([c, ""]);
+  }
+  return out;
+}
+
+/** Whether chip c is drawn on the per-chip dt plot. */
+function chipDtShown(c) {
+  return state.dtChips === null || state.dtChips.indexOf(c) >= 0;
+}
+
+/** Choose the chips drawn on the per-chip dt plot (null = all) and redraw it at once. */
+function setDtChips(chips) {
+  state.dtChips = chips;
+  save();
+  redrawVisible();
+}
+
+/**
+ * The per-chip dt plot's controls, between its title and the plot: a checkbox
+ * per chip in the chip's line colour (the plot's legend), L1 / L2 / all
+ * shortcuts and the peak normalisation. Rebuilt when the chip list or the
+ * choice changes.
+ */
+function chipDtBar(p, chips) {
+  const sig = JSON.stringify([chips, state.dtChips, state.dtNorm, state.dtZoom]);
+  if (p.bar && p.barSig === sig) return;
+  if (!p.bar) {
+    p.bar = el("div", { class: "dqm-sma-chipbar" });
+    p.wrap.insertBefore(p.bar, p.div);
+  }
+  p.bar.innerHTML = "";
+  const boxes = el("div", { class: "dqm-sma-chiprow" });
+  for (const [c, plane] of chips) {
+    const id = `dqm-sma-dtchip-${c}`;
+    const box = el("input", { type: "checkbox", id });
+    box.checked = chipDtShown(c);
+    box.onchange = function () {
+      const cur = state.dtChips === null ? chips.map((x) => x[0]) : state.dtChips.slice();
+      const next = this.checked ? cur.concat([c]) : cur.filter((x) => x !== c);
+      setDtChips(chips.every(([x]) => next.indexOf(x) >= 0) ? null : next);
+    };
+    const swatch = el("span", { class: "dqm-sma-swatch" });
+    swatch.style.background = chipColour(c);
+    boxes.appendChild(el("label", { for: id, class: "dqm-sma-chipbox" }, box, swatch,
+                         `chip ${c}${plane ? ` (${plane})` : ""}`));
+  }
+  const tools = el("div", { class: "dqm-sma-chiprow" }, el("span", {}, "show"));
+  const pick = function (text, chosen) {
+    const b = el("button", { type: "button", class: "dqm-sma-chipbtn" }, text);
+    b.onclick = function () { setDtChips(chosen); };
+    tools.appendChild(b);
+  };
+  for (const [plane, list] of mupixPlanes()) if (list.length) pick(plane, list.slice());
+  pick("all", null);
+  const norm = el("input", { type: "checkbox", id: "dqm-sma-dtnorm" });
+  norm.checked = state.dtNorm;
+  norm.onchange = function () {
+    state.dtNorm = !!this.checked;
+    save();
+    redrawVisible();
+  };
+  tools.appendChild(el("label", { for: "dqm-sma-dtnorm", class: "dqm-sma-chipbox dqm-sma-chipnorm" },
+                       norm, "each chip to its peak"));
+  const zoom = el("input", { type: "checkbox", id: "dqm-sma-dtzoom" });
+  zoom.checked = state.dtZoom;
+  zoom.onchange = function () {
+    state.dtZoom = !!this.checked;
+    save();
+    redrawVisible();
+  };
+  tools.appendChild(el("label", { for: "dqm-sma-dtzoom", class: "dqm-sma-chipbox dqm-sma-chipnorm" },
+                       zoom, "zoom on the in-time window"));
+  p.bar.appendChild(boxes);
+  p.bar.appendChild(tools);
+  p.barSig = sig;
+}
+
+/** A chip's line colour, the same whichever chips are shown. */
+function chipColour(c) {
+  return COLOURS[c % COLOURS.length];
+}
+
+/**
+ * The per-chip t(pixel) - t(S1) plot: the chips' columns of the (chip x dt)
+ * histogram, each drawn as an unfilled step line in its own colour (mplot fills
+ * a "histogram", and eight filled ones hide each other), with the in-time
+ * window and the sideband outlined as on mupix_dt_L1/_L2. The x axis is their
+ * full range, so a chip sliding out of the window is seen; "zoom on the in-time
+ * window" narrows it to the window +-150 ns, where the chips' peaks sit a few
+ * 8 ns bins apart. The checkboxes above it are the legend; the footer gives each
+ * drawn chip's entries and peak, and calls out a peak outside the window.
+ */
+async function drawChipDt(p) {
+  const name = p.names[0];
+  if (!(name in state.meta)) {
+    try { state.meta[name] = await BRPC.json(state.client, "dqm::metadata", name); }
+    catch (e) { state.meta[name] = null; }
+    p.title.textContent = titleFor(p);
+  }
+  const hist = await BRPC.histogram(state.client, name);
+  if (hist.dimensions !== 2) throw new Error(`${name} is not 2-D`);
+  const chips = chipDtChips(hist);
+  chipDtBar(p, chips);
+  const shown = chips.filter(([c]) => chipDtShown(c));
+  const mp = state.summary && state.summary.mupix;
+  const series = JSON.stringify(shown);
+  const sig = `${DQMHeatmap.checksum(hist.data)}|${hist.entries}|${state.logY}|${state.dtNorm}|${state.dtZoom}|` +
+    `${series}|${mp ? JSON.stringify([mp.window_ns, mp.sideband_ns]) : ""}`;
+  if (sig === p.sig && p.mpg) return;          // unchanged: nothing to draw
+  if (p.mpg && p.series !== series) {          // other chips: other lines
+    p.div.innerHTML = "";
+    p.mpg = null;
+    p.div.mpg = null;
+  }
+  if (!p.mpg) {
+    p.mpg = coalesce(new MPlotGraph(p.div, {
+      showMenuButtons: true,
+      mouseWheelZoom: true,
+      title: { text: "" },
+      stats: { show: false },
+      legend: { show: false },
+      xAxis: { title: { text: "", textSize: 12 }, textSize: 12 },
+      yAxis: { title: { text: "", textSize: 12 }, textSize: 12 },
+    }));
+    p.div.mpg = p.mpg;
+    for (const [c, plane] of shown) {
+      p.mpg.addPlot({ label: `chip ${c}${plane ? ` (${plane})` : ""}`, type: "scatter",
+                      xData: [], yData: [], line: { draw: true, width: 1.5, color: chipColour(c) },
+                      marker: { draw: false } });
+    }
+    p.mpg.addPlot({ label: "in time", type: "scatter", xData: [], yData: [],
+                    line: { draw: true, width: 2, color: "#2ca02c" }, marker: { draw: false } });
+    p.mpg.addPlot({ label: "sideband", type: "scatter", xData: [], yData: [],
+                    line: { draw: true, width: 2, color: "#7f7f7f" }, marker: { draw: false } });
+    p.series = series;
+    const mpg = p.mpg;
+    window.setTimeout(function () { mpg.resize(); mpg.draw(); }, 0);
+  }
+  const nx = hist.nBins[0] + 2, ny = hist.nBins[1] + 2;
+  const lo = hist.lowEdge[1], w = (hist.highEdge[1] - lo) / hist.nBins[1];
+  const win = (mp && mp.window_ns) || [-150, 450];
+  const side = (mp && mp.sideband_ns) || [-2400, -1800];
+  applyScale(p.mpg, 1);
+  // Normalised, a log axis starts three decades below the peak, not below one count.
+  const floor = state.logY ? (state.dtNorm ? 1e-3 : 0.5) : 0;
+  if (state.logY) p.mpg.param.yAxis.min = floor;
+  if (state.dtZoom) {
+    p.mpg.param.xAxis.min = Math.max(lo, win[0] - 150);
+    p.mpg.param.xAxis.max = Math.min(hist.highEdge[1], win[1] + 150);
+  } else {
+    p.mpg.param.xAxis.min = lo;
+    p.mpg.param.xAxis.max = hist.highEdge[1];
+  }
+  const parts = [], outside = [];
+  let top = 1;
+  shown.forEach(function ([c], i) {
+    // Steps over the in-range bins: two points a bin, at its edges.
+    const xs = new Array(2 * (ny - 2)), ys = new Array(2 * (ny - 2));
+    let n = 0, peak = 0, at = -1;
+    for (let iy = 0; iy < ny; iy++) {
+      const v = hist.data[(c + 1) + iy * nx];
+      n += v;
+      if (iy > 0 && iy < ny - 1 && v > peak) { peak = v; at = iy - 1; }
+    }
+    const scale = state.dtNorm && peak > 0 ? 1 / peak : 1;
+    for (let b = 0; b < ny - 2; b++) {
+      const v = Math.max(hist.data[(c + 1) + (b + 1) * nx] * scale, floor);
+      xs[2 * b] = lo + b * w;
+      xs[2 * b + 1] = lo + (b + 1) * w;
+      ys[2 * b] = ys[2 * b + 1] = v;
+    }
+    if (!state.dtNorm && peak > top) top = peak;
+    p.mpg.setData(i, xs, ys);
+    const t = Math.round(lo + (at + 0.5) * w);
+    if (at >= 0 && (t < win[0] || t >= win[1])) outside.push(c);
+    parts.push(`chip ${c}: ${Math.round(n).toLocaleString()}` + (at >= 0 ? `, peak ${t} ns` : ""));
+  });
+  // The in-time window and the sideband (the last two series).
+  const box = (b) => [[b[0], b[0], b[1], b[1]], [floor, top, top, floor]];
+  p.mpg.setData(shown.length, ...box(win));
+  p.mpg.setData(shown.length + 1, ...box(side));
+  const axes = (state.meta[name] && state.meta[name].axes) || [];
+  p.mpg.param.xAxis.title.text = (axes[1] && axes[1].title) || "t(pixel) - t(S1) (ns)";
+  p.mpg.param.yAxis.title.text = state.dtNorm ? "entries / chip's peak" : "entries";
+  p.mpg.redraw();
+  const out = outside.length
+    ? `PEAK OUTSIDE THE IN-TIME WINDOW: chip${outside.length > 1 ? "s" : ""} ${outside.join(", ")} · ` : "";
+  p.foot.textContent = shown.length
+    ? `${out}${parts.join(" · ")} · green: in time, grey: sideband`
+    : "No chip chosen: tick one above.";
+  p.foot.classList.toggle("dqm-sma-foot-warn", outside.length > 0);
+  p.sig = sig;
+}
+
 /** The pairing window [-w, +w] ns outlined on the L2 - L1 dt (series 1). */
 function markPairWindow(p, hist) {
   const w = pairWindow(state.summary && state.summary.pairs);
@@ -746,6 +964,7 @@ function markMupixWindows(p, hist) {
 
 async function drawPlot(p) {
   if (p.occupancy) { await drawOccupancy(p); return; }
+  if (p.chipDt) { await drawChipDt(p); return; }
   const hists = [];
   for (let i = 0; i < p.names.length; i++) {
     const name = p.names[i];
@@ -2073,7 +2292,7 @@ function save() {
     window.localStorage.setItem(state.view.store, JSON.stringify({
       client: state.client, tab: state.tab, intervalMs: state.intervalMs,
       logY: state.logY, logZ: state.logZ, nimLogY: state.nimLogY, xyLogZ: state.xyLogZ,
-      pairLogZ: state.pairLogZ,
+      pairLogZ: state.pairLogZ, dtChips: state.dtChips, dtNorm: state.dtNorm, dtZoom: state.dtZoom,
     }));
   } catch (e) { /* private browsing or quota */ }
 }
@@ -2089,6 +2308,9 @@ function restore() {
     if (o.nimLogY !== undefined) state.nimLogY = !!o.nimLogY;
     if (o.xyLogZ !== undefined) state.xyLogZ = !!o.xyLogZ;
     if (o.pairLogZ !== undefined) state.pairLogZ = !!o.pairLogZ;
+    if (Array.isArray(o.dtChips)) state.dtChips = o.dtChips.filter((c) => Number.isInteger(c));
+    if (o.dtNorm !== undefined) state.dtNorm = !!o.dtNorm;
+    if (o.dtZoom !== undefined) state.dtZoom = !!o.dtZoom;
   } catch (e) { /* defaults are fine */ }
 }
 
