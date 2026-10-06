@@ -1501,9 +1501,10 @@ class _Snapshot:
     at: float = 0.0
     good_n: int = 0
     #: The NIM view of the settings the frame was analysed (paired) under:
-    #: ``{"roles": ..., "nim_merge": bool}``, None without NIM copies. The
-    #: event display encodes from it, never from the settings of now: a frame
-    #: held across a settings edit keeps the map and merge state of its pairing.
+    #: ``{"roles": ..., "nim_merge": bool, "offsets_ns": [...]}``, None without
+    #: NIM copies. The event display encodes from it, never from the settings
+    #: of now: a frame held across a settings edit keeps the map, merge state
+    #: and NIM offsets of its pairing.
     nim: dict | None = None
 
 
@@ -2403,7 +2404,8 @@ class SmaPlugin:
         return {"roles": {"s1": r.s1, "counters": list(r.counters), "rf": r.rf,
                           "current": r.current, "delayed": list(r.delayed),
                           "nim": list(cfg.nim.channels)},
-                "nim_merge": bool(cfg.merging)}
+                "nim_merge": bool(cfg.merging),
+                "offsets_ns": [int(x) for x in cfg.nim.offsets]}
 
     def _seeded_snap(self):
         """The last frame that had seeds, else the last good one.
@@ -4048,6 +4050,9 @@ class SmaPlugin:
             # (the page then reads the summary's roles block).
             meta["roles"] = snap.nim["roles"]
             meta["nim_merge"] = snap.nim["nim_merge"]
+            # NIM/offset ns per counter ("counters" order), the t' = t - offset
+            # the frame was paired with: the page draws the NIM lanes there.
+            meta["nim_offsets_ns"] = snap.nim["offsets_ns"]
         if extra:
             meta.update(extra)
         block = None

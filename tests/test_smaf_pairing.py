@@ -148,6 +148,7 @@ def test_old_layout_frames_stay_v1_and_v2_without_roles():
     r = framing.decode_sma_frame(p.frame_blob("raster"))
     assert (s["version"], r["version"]) == (2, 1)
     assert "roles" not in s["meta"] and "nim_merge" not in s["meta"]
+    assert "nim_offsets_ns" not in s["meta"] and "nim_offsets_ns" not in r["meta"]
 
 
 def test_merge_off_shows_the_classes_and_holds_nothing_back():
@@ -184,3 +185,33 @@ def test_a_held_frame_keeps_the_nim_view_it_was_paired_with():
     assert d["meta"]["nim_merge"] is False and d["meta"]["roles"]["nim"][4] == -1
     s5l = d["ch"] == 12
     assert np.all((d["cls"][s5l] & framing.PAIR_NIM_SIDE) == 0)
+
+
+def test_the_frame_carries_the_nim_offsets_it_was_paired_with():
+    """meta.nim_offsets_ns: NIM/offset ns per counter ("counters" order), what the
+    page draws the NIM lanes at. A held frame keeps its own across an edit; one
+    rebuilt from the raw ring is paired now, so it carries the current ones."""
+    offsets = [25, 73, 11, 20, 19]
+    p = _plugin_1015({"NIM": {"merge": False, "offset ns": offsets}}, seed=1)
+    for view, kw in (("seeded", {}), ("raster", {"max_hits": 2000}), ("raster", {"words": True})):
+        d = framing.decode_sma_frame(p.frame_blob(view, **kw))
+        assert d["meta"]["nim_offsets_ns"] == offsets, (view, kw)
+        assert len(d["meta"]["nim_offsets_ns"]) == len(d["meta"]["roles"]["counters"])
+    snap = p._last
+    p.apply_settings({"NIM": {"offset ns": [0, 0, 0, 0, 0]}}, rebuild=True)
+    for kw in ({}, {"seed": "any"}):
+        d = framing.decode_sma_frame(p.frame_blob("seeded", **kw))
+        assert d["meta"]["nim_offsets_ns"] == offsets, kw
+    p._last = p._last_good = p._last_seeded = None
+    p._ring.clear()
+    p._frame_cache.clear()
+    d = framing.decode_sma_frame(p.frame_blob("seeded", seq=snap.seq))
+    assert d["meta"]["nim_offsets_ns"] == [0, 0, 0, 0, 0]
+
+
+def test_no_nim_copies_no_offsets_in_the_frame():
+    """NIM/channels = -1 on 1015 cabling: no roles block, no offsets, v2/v1 as before."""
+    p = _plugin_1015({"NIM": {"channels": [-1], "offset ns": [25, 73, 11, 20, 19]}}, seed=1)
+    for view in ("seeded", "raster"):
+        d = framing.decode_sma_frame(p.frame_blob(view))
+        assert d["version"] < 3 and "nim_offsets_ns" not in d["meta"], view

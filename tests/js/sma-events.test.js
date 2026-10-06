@@ -2244,3 +2244,214 @@ test("with no roles block anywhere, the NIM lanes come from the channel rows' pa
   const order = Object.entries(lanes).sort((x, y) => x[1] - y[1]).map(([ch]) => Number(ch));
   assert.deepStrictEqual(order.slice(0, 10), [1, 3, 2, 9, 7, 10, 4, 11, 5, 12]);
 });
+
+// --- NIM lanes at t - NIM/offset ns (meta.nim_offsets_ns), "raw times" -------------------------
+
+const OFFS = [25, 73, 11, 20, 19];
+/** The seeded NIM frame with `offsets` as its NIM/offset ns (per counter, S1..S5). */
+const withOffsets = (hex, offsets) => withMeta(hex, (m) => { m.nim_offsets_ns = offsets; });
+/** Where the full seed window puts t (ns from the seed) on a 900 px canvas. */
+const seedX = (t) => 84 + (t + 200) / 3200 * (888 - 84);
+
+/** The x of every pair tick of a paint: [[xTOT, xNIM], ...]. */
+function tickXs(paint) {
+  const ops = paint.ops;
+  const at = ops.findIndex((o) => o[0] === "stroke" && o[2] === "#3a3a3a");
+  if (at < 0) return [];
+  let begin = at;
+  while (begin > 0 && ops[begin][0] !== "beginPath") begin--;
+  const out = [];
+  for (let i = begin; i < at; i++) {
+    if (ops[i][0] === "moveTo" && ops[i + 1] && ops[i + 1][0] === "lineTo") out.push([ops[i][1][0], ops[i + 1][1][0]]);
+  }
+  return out;
+}
+
+test("the frame's NIM offsets: the fixtures carry them, a frame without NIM copies none", () => {
+  assert.deepStrictEqual(SEEDED_NIM.meta.nim_offsets_ns, [0, 0, 0, 0, 0]);
+  assert.strictEqual(SEEDED_NIM.meta.nim_offsets_ns.length, SEEDED_NIM.meta.roles.counters.length);
+  assert.strictEqual(SEEDED.meta.nim_offsets_ns, undefined);
+});
+
+test("NIM lanes are drawn at t - NIM/offset ns: bars move, the pair ticks stand upright", async () => {
+  // The fixture's NIM copies are 2 +- 1 ns after their TOT words: offsets of 2 align them.
+  const hex = withOffsets(FX.seeded_nim, [2, 2, 2, 2, 2]).toString("hex");
+  const page = await boot(nimEvents({}, hex));
+  const canvases = byId(page, "dqm-smaev-seeds").byTag("canvas");
+  const f = SEEDED_NIM;
+  let n = 0;
+  f.meta.seeds.forEach(function (seed, k) {
+    const ticks = tickXs(lastPaint(canvases[k].getContext("2d")));
+    n += ticks.length;
+    for (const [xt, xn] of ticks) assert.ok(Math.abs(xn - xt) <= 1 / 3200 * 804 + 1e-9, `seed ${k}: ${xt} ${xn}`);
+  });
+  assert.ok(n > 0, "some pair ticks");
+  // "raw times": the ticks slant by NIM - TOT again (2 ns on average).
+  const box = byId(page, "dqm-smaev-rawtimes-seeded");
+  box.checked = true;
+  box.onchange.call(box);
+  let sum = 0, m = 0;
+  for (const c of byId(page, "dqm-smaev-seeds").byTag("canvas")) {
+    for (const [xt, xn] of tickXs(lastPaint(c.getContext("2d")))) { sum += xn - xt; m++; }
+  }
+  assert.ok(m === n && Math.abs(sum / m - 2 / 3200 * 804) < 0.1, `mean slant ${sum / m} px`);
+});
+
+test("each NIM bar sits at its own counter's offset; TOT bars stay where they were", async () => {
+  const page = await boot(nimEvents({}, withOffsets(FX.seeded_nim, OFFS).toString("hex")));
+  const f = SEEDED_NIM;
+  const seed = f.meta.seeds[0];
+  const [a, b] = seed.hits;
+  const paint = lastPaint(byId(page, "dqm-smaev-seeds").byTag("canvas")[0].getContext("2d"));
+  const xsOf = (colour) => paint.ops.filter((o) => o[0] === "fillRect" && o[2] === colour)
+    .map((o) => o[1][0].toFixed(6)).sort();
+  let lanesWithBars = 0;
+  NIM_CH.forEach(function (ch, k) {
+    const want = [], tot = [];
+    for (let i = a; i < b; i++) {
+      const c = f.cls[i] & P.CLASS_MASK;
+      if (f.ch[i] === ch && c !== P.NIM_ONLY) {
+        const t = f.t[i] - OFFS[k] - seed.t_rel;
+        if (!(t + f.tot[i] < -200 || t > 3000)) want.push(seedX(t).toFixed(6));
+      }
+      if (f.ch[i] === f.meta.roles.counters[k] && c !== P.ECHO) {
+        const t = f.t[i] - seed.t_rel;
+        if (!(t + f.tot[i] < -200 || t > 3000)) tot.push(seedX(t).toFixed(6));
+      }
+    }
+    if (want.length) lanesWithBars++;     // S4L's words are all NIM-only (its lag fault)
+    assert.deepStrictEqual(xsOf(lighter(COUNTER_COLOURS[k], 0.35)), want.sort(), `S${k + 1}L at t - ${OFFS[k]} ns`);
+    const drawn = new Set(xsOf(COUNTER_COLOURS[k]));
+    assert.ok(tot.every((x) => drawn.has(x)), `S${k + 1}'s TOT bars at their raw time`);
+  });
+  assert.ok(lanesWithBars >= 3, `${lanesWithBars} NIM lanes with solid bars`);
+  const legend = byId(page, "dqm-smaev-nimlegend").textContent;
+  assert.ok(legend.includes("at t − NIM/offset ns (S1L 25, S2L 73, S3L 11, S4L 20, S5L 19)"), legend);
+});
+
+test("hovering a NIM hit finds it where it is drawn and gives the raw and the aligned time", async () => {
+  const page = await boot(nimEvents({}, withOffsets(FX.seeded_nim, OFFS).toString("hex")));
+  const f = SEEDED_NIM;
+  const t0 = f.meta.t0_ns;
+  // A paired S2L word (offset 73 ns, 18 px) alone on its lane within 30 px either way.
+  let k = -1, i = -1;
+  for (let s = 0; s < f.meta.seeds.length && i < 0; s++) {
+    const [a, b] = f.meta.seeds[s].hits;
+    const on = [];
+    for (let x = a; x < b; x++) if (f.ch[x] === 9) on.push(x);
+    for (const x of on) {
+      const c = f.cls[x] & P.CLASS_MASK, tr = f.t[x] - 73 - f.meta.seeds[s].t_rel;
+      if (c !== P.PAIRED || f.pair[x] < 0 || tr < 0 || tr > 2800) continue;
+      if (on.every((y) => y === x || Math.abs(f.t[y] - f.t[x]) > 120)) { k = s; i = x; break; }
+    }
+  }
+  assert.ok(i >= 0, "an isolated paired S2L word");
+  const canvas = byId(page, "dqm-smaev-seeds").byTag("canvas")[k];
+  const lane = laneMap(canvas.getContext("2d"))[9];
+  const hover = byId(page, "dqm-smaev-seeds").byClass("dqm-sma-seed")[k].byClass("dqm-smaev-hover")[0];
+  const y = 6 + lane * 20 + 10;
+  const tr = f.t[i];
+  canvas.dispatch("mousemove", { clientX: seedX(tr - 73 - f.meta.seeds[k].t_rel) + 1, clientY: y });
+  assert.ok(hover.textContent.startsWith(`ch 9 (S2L) · ToT ${f.tot[i]} · raw t ${t0 + tr} ns (t_rel ${tr} ns) · ` +
+    `aligned t ${t0 + tr - 73} ns (t_rel ${tr - 73} ns) (NIM/offset 73 ns) · `), hover.textContent);
+  const j = f.pair[i];
+  const dt = f.t[i] - f.t[j];
+  assert.ok(hover.textContent.includes(`NIM − TOT ${dt > 0 ? "+" : ""}${dt} ns (aligned ${dt - 73 > 0 ? "+" : ""}${dt - 73} ns)`),
+    hover.textContent);
+  // Its raw position (18 px to the right) is empty lane now.
+  canvas.dispatch("mousemove", { clientX: seedX(tr - f.meta.seeds[k].t_rel) + 1, clientY: y });
+  assert.ok(!/^ch 9 /.test(hover.textContent), hover.textContent);
+  // "raw times": it is found at its raw position again, and the line still gives both.
+  const box = byId(page, "dqm-smaev-rawtimes-seeded");
+  box.checked = true;
+  box.onchange.call(box);
+  canvas.dispatch("mousemove", { clientX: seedX(tr - f.meta.seeds[k].t_rel) + 1, clientY: y });
+  assert.ok(hover.textContent.includes(`raw t ${t0 + tr} ns`) && hover.textContent.includes("aligned t "), hover.textContent);
+  // A TOT word's line is unchanged: one time.
+  const tot = f.pair[i];
+  canvas.dispatch("mousemove", { clientX: seedX(f.t[tot] - f.meta.seeds[k].t_rel) + 1,
+                                 clientY: 6 + laneMap(canvas.getContext("2d"))[f.ch[tot]] * 20 + 10 });
+  assert.ok(hover.textContent.includes(` · t ${t0 + f.t[tot]} ns (t_rel ${f.t[tot]} ns) · `) &&
+            !hover.textContent.includes("aligned t"), hover.textContent);
+});
+
+test("raw times: off by default, remembered, shared by both tabs, hidden without offsets", async () => {
+  const hex = withOffsets(FX.seeded_nim, OFFS).toString("hex");
+  const page = await boot(nimEvents({}, hex));
+  const lab = byId(page, "dqm-smaev-rawtimeslab-seeded");
+  const box = byId(page, "dqm-smaev-rawtimes-seeded");
+  assert.ok(!lab.style.display && box.checked === false, "shown, off");
+  assert.ok(/at their raw SMA time/.test(lab.getAttribute("title")));
+  box.checked = true;
+  box.onchange.call(box);
+  assert.strictEqual(JSON.parse(globalThis.localStorage._d["dqm-sma-events-settings"]).rawTimes, true);
+  assert.ok(byId(page, "dqm-smaev-rawtimes-raster").checked === true, "the raster's box follows");
+  assert.ok(/S\*k\*L lanes: the counter's NIM copy, lighter, outlined, at their raw time \(raw times\) · /
+    .test(byId(page, "dqm-smaev-nimlegend").textContent));
+  // Raw: the S2L bars at their raw time.
+  const f = SEEDED_NIM, seed = f.meta.seeds[0];
+  const paint = lastPaint(byId(page, "dqm-smaev-seeds").byTag("canvas")[0].getContext("2d"));
+  const xs = new Set(paint.ops.filter((o) => o[0] === "fillRect" && o[2] === lighter(COUNTER_COLOURS[1], 0.35))
+    .map((o) => o[1][0].toFixed(6)));
+  let raw = 0;
+  for (let i = seed.hits[0]; i < seed.hits[1]; i++) {
+    if (f.ch[i] === 9 && xs.has(seedX(f.t[i] - seed.t_rel).toFixed(6))) raw++;
+  }
+  assert.ok(raw > 0 && raw === xs.size, `${raw} of ${xs.size} S2L bars raw`);
+  // A reload remembers it.
+  const p2 = await boot(nimEvents({}, hex), { rawTimes: true });
+  assert.ok(byId(p2, "dqm-smaev-rawtimes-seeded").checked === true, "restored");
+  // No offsets in the frame (no NIM copies, an older analyzer): hidden, drawn raw.
+  const p3 = await boot();
+  assert.strictEqual(byId(p3, "dqm-smaev-rawtimeslab-seeded").style.display, "none");
+  const old = withMeta(FX.seeded_nim, (m) => { delete m.nim_offsets_ns; });
+  const p4 = await boot(nimEvents({}, old.toString("hex")));
+  assert.strictEqual(byId(p4, "dqm-smaev-rawtimeslab-seeded").style.display, "none");
+  assert.ok(!/NIM\/offset/.test(byId(p4, "dqm-smaev-nimlegend").textContent));
+});
+
+test("the raster draws the NIM rows at t - NIM/offset ns too, and points at them there", async () => {
+  // 1 ms on S2L: ~24 px on the whole-frame raster, enough to see and to point at.
+  const offs = [0, 1000000, 0, 0, 0];
+  const rhex = withOffsets(FX.raster_nim, offs).toString("hex");
+  const page = await boot(nimEvents({
+    "sma::frame": () => envelope("smaf", Buffer.from(rhex, "hex")),
+  }), { tab: "raster" });
+  const ctx = byId(page, "dqm-smaev-raster").getContext("2d");
+  const rowXs = (paint, ch) => paint.ops.filter((o) => o[0] === "rect" && o[1][1] === 6 + ch * 22 + 4).map((o) => o[1][0]);
+  const al = lastPaint(ctx);
+  const s2l = rowXs(al, 9), s2 = rowXs(al, 2);
+  const box = byId(page, "dqm-smaev-rawtimes-raster");
+  assert.ok(!byId(page, "dqm-smaev-rawtimeslab-raster").style.display, "shown on the raster");
+  assert.ok(/S\*k\*L rows: the NIM copies, at t − NIM\/offset ns \(S1L 0, S2L 1000000/.test(
+    byId(page, "dqm-smaev-rasternim").textContent));
+  box.checked = true;
+  box.onchange.call(box);
+  const raw = lastPaint(ctx);
+  const r2l = rowXs(raw, 9), r2 = rowXs(raw, 2);
+  assert.deepStrictEqual(r2, s2, "S2 (TOT) unchanged");
+  const f = RASTER_NIM;
+  const off = f.meta.t0_ns - f.meta.frame_first_ns;
+  const hi = Math.max(f.meta.span_ns / 1e6, (off + f.t[f.nHits - 1]) / 1e6);
+  const px = 1 / hi * (790 - 84);                  // px per ms
+  // Every S2L mark 1 ms (px) to the left of its raw place, less the ones the axis start clips.
+  const shifted = new Set(s2l.map((x) => (x + px).toFixed(4)));
+  const back = r2l.filter((x) => shifted.has(x.toFixed(4)));
+  assert.ok(back.length === s2l.length && r2l.length - s2l.length <= 30, `${back.length} ${s2l.length} ${r2l.length}`);
+  // Pointing: the S2L hit found is one drawn under the mouse (its aligned time), on
+  // a raster too dense to have a hit alone on its row.
+  box.checked = false;
+  box.onchange.call(box);
+  const X = (t) => 84 + ((off + t) / 1e6) / hi * (790 - 84) + 0.75;
+  const hover = byId(page, "dqm-smaev-pane-raster").byClass("dqm-smaev-hover")[0];
+  let n = 0;
+  for (let i = 0; i < f.nHits && n < 20; i++) {
+    if (f.ch[i] !== 9 || f.t[i] + off < 2e6) continue;
+    const x = X(f.t[i] - 1e6);
+    byId(page, "dqm-smaev-raster").dispatch("mousemove", { clientX: x, clientY: 6 + 9 * 22 + 11 });
+    const m = /^ch 9 \(S2L\) · .* · aligned t -?\d+ ns \(t_rel (-?\d+) ns\) \(NIM\/offset 1000000 ns\)/.exec(hover.textContent);
+    assert.ok(m && Math.abs(X(Number(m[1])) - x) <= 4 + 1e-6, hover.textContent);
+    n++;
+  }
+  assert.strictEqual(n, 20);
+});

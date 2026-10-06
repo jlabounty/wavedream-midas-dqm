@@ -42,7 +42,11 @@
 // guessed from labels when the analyzer says it. With the merge on, the
 // pattern boxes and the per-counter selector are of the merged counters; with
 // it off (the default) they are the TOT words alone, and the NIM-only hits are
-// shown but not merged -- every legend and tooltip says which.
+// shown but not merged -- every legend and tooltip says which. A NIM copy
+// arrives a cable delay after its TOT word (tens of ns), so its lane is drawn
+// at t - NIM/offset ns, the offsets the frame was paired with (meta.nim_offsets_ns):
+// a pair then sits one above the other. "raw times" draws the raw SMA times
+// instead; the hover line gives both, and tags, word lists and Δt stay raw.
 //
 // Drawn on our own <canvas>, not mplot: mplot has no shapes (see dqm-evd.js,
 // markEdge), and a 33k-hit raster as 16 scatter series would be both slow and
@@ -145,6 +149,7 @@ const state = {
   zoom: "full",
   hideCurrent: true,
   hidePixels: false,             // the raster's "hide MuPix"
+  rawTimes: false,               // "raw times": the NIM lanes at their raw time, not t - offset
   intervals: { seeded: 250, raster: 500 },
   // Which hits seed the seeded view, and which oddities it is limited to (OR):
   // this viewer's choice, sent with every seeded request (see seedArgs()).
@@ -428,6 +433,36 @@ function fromRolesBlock(b, out) {
   const taken = new Set([...out.counters, ...out.nim.filter((n) => n !== null), out.rf, out.current]);
   out.delayed = (b.delayed || []).map(ch).filter((c) => c !== null && !taken.has(c));
   return out;
+}
+
+/**
+ * The NIM offsets a frame was paired with, by channel: `out[n]` is the
+ * NIM/offset ns of the counter whose NIM copy is channel n, null for every
+ * other channel. Null when the frame carries none (no NIM copies, or an
+ * analyzer older than meta.nim_offsets_ns): its NIM lanes are drawn raw.
+ */
+function nimOffsets(frame) {
+  const m = (frame && frame.meta) || {};
+  const r = m.roles, o = m.nim_offsets_ns;
+  if (!r || !Array.isArray(r.counters) || !Array.isArray(r.nim) || !Array.isArray(o)) return null;
+  const out = new Array(16).fill(null);
+  let any = false;
+  r.nim.forEach(function (n, k) {
+    if (!Number.isInteger(n) || n < 0 || n >= 16 || n === r.counters[k] || !Number.isFinite(o[k])) return;
+    out[n] = o[k];
+    any = true;
+  });
+  return any ? out : null;
+}
+
+/** What the views subtract from a hit's time, by channel: nimOffsets(), or null ("raw times"). */
+function drawShift(frame) {
+  return state.rawTimes ? null : nimOffsets(frame);
+}
+
+/** Hit i's time as drawn: t_rel, less its NIM offset when `sh` (drawShift) has one. */
+function drawnT(frame, i, sh) {
+  return frame.t[i] - ((sh && sh[frame.ch[i]]) || 0);
 }
 
 /** Whether the counters are the merged TOT + NIM hits: the frame's word, else the summary's. */
@@ -739,10 +774,11 @@ function renderSeeded(frame) {
       : "This frame has no S1 hit whose whole window lies inside it.");
   }
   const ls = lanes(frame);
+  updateRawToggle("seeded", frame);
   const nl = document.getElementById("dqm-smaev-nimlegend");
   if (nl) {
     nl.style.display = ls.some((l) => l.nim) ? "" : "none";
-    const text = nimLegend(nimMerge());
+    const text = nimLegend(nimMerge(), alignText(frame));
     if (nl.textContent !== text) nl.textContent = text;
   }
   const nums = tagNumbers("seeded", frame);
@@ -1003,10 +1039,11 @@ function paintSeed(canvas, frame, seed, a, b, ls, laneOf, range, nums, pix) {
   ctx.clip();
   const marks = [];
   const cls = frame.cls;
+  const sh = drawShift(frame);
   for (let i = a; i < b; i++) {
     const lane = laneOf[frame.ch[i]];
     if (lane === undefined) continue;
-    const t = frame.t[i] - seed.t_rel;
+    const t = drawnT(frame, i, sh) - seed.t_rel;
     const tot = frame.tot[i];
     if (t + tot < range[0] || t > range[1]) continue;
     const flags = frame.hitFlags[i];
@@ -1061,7 +1098,7 @@ function paintSeed(canvas, frame, seed, a, b, ls, laneOf, range, nums, pix) {
     const n = nums.any ? nums.of(i) : undefined;
     if (n !== undefined) marks.push([px0, y, ww, h, n]);
   }
-  paintPairTicks(ctx, frame, seed, a, b, ls, laneOf, X, range);
+  paintPairTicks(ctx, frame, seed, a, b, ls, laneOf, X, range, sh);
   paintSeedPixels(ctx, frame, seed, pix, X, range, marks, nums);
   for (const [mx, my, mw, mh] of marks) {
     // A tagged hit, boxed in black: its number is its row in "Tagged hits".
@@ -1075,15 +1112,16 @@ function paintSeed(canvas, frame, seed, a, b, ls, laneOf, range, nums, pix) {
   for (const [mx, my, mw, mh, n] of marks) {
     tagMarker(ctx, mx + mw + 3, mx - 3, my + (mh - 13) / 2, n, x1);
   }
-  return { x0, x1, laneOf };
+  return { x0, x1, laneOf, sh };
 }
 
 /**
  * The pair ticks: a thin dark line from each TOT word to the NIM word it is
  * paired with, start to start, across the counter's lane and its NIM lane
  * (adjacent, see lanes()). Only pairs with both words shipped and on screen.
+ * With the NIM lane shifted by its offset (`sh`) a tick is all but upright.
  */
-function paintPairTicks(ctx, frame, seed, a, b, ls, laneOf, X, range) {
+function paintPairTicks(ctx, frame, seed, a, b, ls, laneOf, X, range, sh) {
   const pair = frame.pair, cls = frame.cls;
   if (!pair || !cls) return;
   ctx.strokeStyle = PAIR_TICK;
@@ -1095,7 +1133,7 @@ function paintPairTicks(ctx, frame, seed, a, b, ls, laneOf, X, range) {
     if (j < a || j >= b || (cls[i] & SMAF.PAIR.NIM_SIDE)) continue;   // drawn once, from the TOT word
     const lt = laneOf[frame.ch[i]], ln = laneOf[frame.ch[j]];
     if (lt === undefined || ln === undefined) continue;
-    const ti = frame.t[i] - seed.t_rel, tj = frame.t[j] - seed.t_rel;
+    const ti = drawnT(frame, i, sh) - seed.t_rel, tj = drawnT(frame, j, sh) - seed.t_rel;
     if (ti < range[0] || ti > range[1] || tj < range[0] || tj > range[1]) continue;
     ctx.moveTo(X(ti) + 0.5, MARGIN.top + lt * LANE_H + LANE_H / 2);
     ctx.lineTo(X(tj) + 0.5, MARGIN.top + ln * LANE_H + LANE_H / 2);
@@ -1159,7 +1197,7 @@ function seedHitAt(p, x, y) {
   let best = -1, bestD = HIT_SLOP_PX;
   for (let i = g.a; i < g.b; i++) {
     if (f.ch[i] !== ch) continue;
-    const t = f.t[i] - g.seed.t_rel;
+    const t = drawnT(f, i, g.sh) - g.seed.t_rel;     // where paintSeed drew it
     const px0 = X(t);
     const pw = Math.max(2, X(t + f.tot[i]) - px0);
     const d = x < px0 ? px0 - x : x > px0 + pw ? x - px0 - pw : 0;
@@ -1204,10 +1242,12 @@ function renderRaster(frame) {
     return;
   }
   clearNote("raster");
+  updateRawToggle("raster", frame);
   const rn = document.getElementById("dqm-smaev-rasternim");
   if (rn) {
     rn.style.display = frame.cls ? "" : "none";
-    const text = "S*k*L rows: the NIM copies · dark mark above a hit: a NIM-only word" +
+    const at = alignText(frame);
+    const text = `S*k*L rows: the NIM copies${at ? `, ${at}` : ""} · dark mark above a hit: a NIM-only word` +
       (nimMerge() ? " (merged; grey: held back, lag fault)" : " (not merged: NIM merge off)");
     if (rn.textContent !== text) rn.textContent = text;
   }
@@ -1313,8 +1353,9 @@ function paintRaster(frame) {
   const paths = new Array(BUCKETS + 1);
   const scale = 1e6;
   const off = frameOffsetNs(frame);
+  const sh = drawShift(frame);
   for (let i = 0; i < frame.nHits; i++) {
-    const t = (off + frame.t[i]) / scale;
+    const t = (off + drawnT(frame, i, sh)) / scale;
     if (t < range[0] || t > range[1]) continue;
     const c = frame.ch[i];
     if (c >= nCh) continue;
@@ -1340,7 +1381,7 @@ function paintRaster(frame) {
     for (let i = 0; i < frame.nHits; i++) {
       const st = hitStyle(frame.cls[i]);
       if (st !== "hollow" && st !== "held") continue;
-      const t = (off + frame.t[i]) / scale;
+      const t = (off + drawnT(frame, i, sh)) / scale;
       if (t < range[0] || t > range[1] || frame.ch[i] >= nCh) continue;
       outl[st].push(X(t), M.top + frame.ch[i] * ROW_H + 1);
     }
@@ -1382,7 +1423,7 @@ function paintRaster(frame) {
     if (n === undefined) continue;
     const pixel = isPix(frame, i);
     const j = i - frame.nHits;
-    const t = (off + (pixel ? pixRel(frame, j) : frame.t[i])) / scale;
+    const t = (off + (pixel ? pixRel(frame, j) : drawnT(frame, i, sh))) / scale;
     const c = pixel ? rowOf[px.flags[j] & SMAF.PIX.PLANE_MASK] : frame.ch[i];
     if (t < range[0] || t > range[1] || c === undefined || c >= nRows) continue;
     // A tagged hit, boxed in black: its number is its row in "Tagged hits".
@@ -1399,7 +1440,7 @@ function paintRaster(frame) {
     const a = Math.min(state.drag.x0, state.drag.x1), b = Math.max(state.drag.x0, state.drag.x1);
     ctx.fillRect(a, M.top, b - a, nRows * ROW_H);
   }
-  state.rasterGeom = { x0, x1, range, planes };
+  state.rasterGeom = { x0, x1, range, planes, sh };
 }
 
 /**
@@ -1431,7 +1472,7 @@ function rasterHitAt(frame, x, y) {
   }
   for (let i = 0; i < frame.nHits; i++) {
     if (frame.ch[i] !== c) continue;
-    const t = (off + frame.t[i]) / 1e6;
+    const t = (off + drawnT(frame, i, g.sh)) / 1e6;     // where paintRaster drew it
     if (t < g.range[0] || t > g.range[1]) continue;
     const d = Math.abs(g.x0 + (t - g.range[0]) * k + 0.75 - x);   // the mark is 1.5 px wide
     if (d <= bestD) { best = i; bestD = d; }
@@ -1798,8 +1839,13 @@ function hitText(frame, i, tab) {
   const named = l && !/^ch\d+$/.test(l);
   const m = frame.meta || {};
   const tRel = frame.t[i];
+  const tText = (tr) => (Number.isFinite(m.t0_ns) ? `t ${m.t0_ns + tr} ns (t_rel ${tr} ns)` : `t_rel ${tr} ns`);
+  const offs = nimOffsets(frame);
+  const o = offs ? offs[c] : null;
+  // A NIM copy: its raw time and the aligned one, t - NIM/offset ns, whichever is drawn.
   const parts = [`ch ${c}${named ? ` (${l})` : ""}`, `ToT ${frame.tot[i]}`,
-    Number.isFinite(m.t0_ns) ? `t ${m.t0_ns + tRel} ns (t_rel ${tRel} ns)` : `t_rel ${tRel} ns`,
+    o === null ? tText(tRel)
+      : `raw ${tText(tRel)} · aligned ${tText(tRel - o)} (NIM/offset ${o} ns)`,
     `fine/coarse ${frame.hitFlags[i] & SMAF.HIT.MISMATCH ? "MISMATCH" : "ok"}`];
   const pt = pairText(frame, i);
   if (pt) parts.push(pt);
@@ -1829,7 +1875,11 @@ function pairText(frame, i) {
       text += " (freeze for its partner)";
     } else if (j >= 0) {
       const dt = nimSide ? frame.t[i] - frame.t[j] : frame.t[j] - frame.t[i];
-      text += ` with ${labelOf(frame.ch[j])} (ch ${frame.ch[j]}), NIM − TOT ${dt > 0 ? "+" : ""}${dt} ns`;
+      const offs = nimOffsets(frame);
+      const o = offs ? offs[nimSide ? frame.ch[i] : frame.ch[j]] : null;
+      const sg = (x) => `${x > 0 ? "+" : ""}${x}`;
+      text += ` with ${labelOf(frame.ch[j])} (ch ${frame.ch[j]}), NIM − TOT ${sg(dt)} ns` +
+        (o === null ? "" : ` (aligned ${sg(dt - o)} ns)`);
     } else {
       text += " (partner outside what was shipped)";
     }
@@ -2592,6 +2642,7 @@ function build() {
   sbar.appendChild(labelled("window", select(
     [["full", "full (-200 ns .. +3 us)"], ["prompt", "prompt (±150 ns)"]], state.zoom,
     function (v) { state.zoom = v; save(); if (state.frames.seeded) render("seeded"); })));
+  sbar.appendChild(rawToggle("seeded"));
   const seedSel = select(seedOptions(), state.seedSel.seed, function (v) {
     state.seedSel.seed = v;
     seedChoiceChanged();
@@ -2678,6 +2729,7 @@ function build() {
                   "hide MuPix");
   plab.insertBefore(pbox, plab.firstChild);
   rbar.appendChild(plab);
+  rbar.appendChild(rawToggle("raster"));
   rbar.appendChild(el("span", { class: "dqm-footnote" },
     "drag to zoom in time, double-click for the whole frame, click a hit to tag it " +
     "(a live frame is frozen first, for its word data)"));
@@ -2701,6 +2753,41 @@ function build() {
 }
 
 /**
+ * "raw times", one checkbox per tab, both bound to state.rawTimes: the NIM
+ * lanes/rows at their raw SMA time instead of t - NIM/offset ns. Shown only for
+ * a frame that carries its NIM offsets (updateRawToggle); display only, nothing
+ * is refetched.
+ */
+function rawToggle(tab) {
+  const box = el("input", { type: "checkbox", id: `dqm-smaev-rawtimes-${tab}` });
+  box.checked = state.rawTimes;
+  box.onchange = function () {
+    state.rawTimes = !!this.checked;
+    for (const t of ["seeded", "raster"]) {
+      const b = document.getElementById(`dqm-smaev-rawtimes-${t}`);
+      if (b) b.checked = state.rawTimes;
+    }
+    save();
+    redraw();
+  };
+  const lab = el("label", {
+    for: `dqm-smaev-rawtimes-${tab}`, class: "dqm-chip", id: `dqm-smaev-rawtimeslab-${tab}`,
+    title: "Draw the NIM copies (S*k*L) at their raw SMA time. Off: at t − NIM/offset ns, the " +
+           "offsets the frame was paired with, so a NIM copy sits under its TOT word. The hover " +
+           "line gives both times; tags and word lists are always raw",
+  }, "raw times");
+  lab.insertBefore(box, lab.firstChild);
+  lab.style.display = "none";
+  return lab;
+}
+
+/** "raw times" only where it changes something: a frame with NIM offsets. */
+function updateRawToggle(tab, frame) {
+  const lab = document.getElementById(`dqm-smaev-rawtimeslab-${tab}`);
+  if (lab) lab.style.display = nimOffsets(frame) ? "" : "none";
+}
+
+/**
  * The per-counter pattern selector: S1..Sn (the counters of the roles) each
  * any / present / absent (a hit within the coincidence window of the seed, or
  * none), AND-ed with the seed choice, the boxes and MuPix. Explicit, so nothing
@@ -2715,10 +2802,25 @@ function patternRow() {
   return row;
 }
 
-/** The NIM line of the seeded view's legend, for the merge on or off. */
-function nimLegend(merged) {
-  return "S*k*L lanes: the counter's NIM copy, lighter, outlined · dark tick: a TOT word and its " +
-    "NIM copy · " + (merged
+/**
+ * Where the NIM lanes/rows are drawn, for the legends: at t - NIM/offset ns
+ * (the frame's offsets, per copy), at their raw time ("raw times"), or "" when
+ * the frame has no offsets (drawn raw, nothing to choose).
+ */
+function alignText(frame) {
+  const offs = nimOffsets(frame);
+  if (!offs) return "";
+  if (state.rawTimes) return "at their raw time (raw times)";
+  const r = (frame.meta || {}).roles || {};
+  const each = (r.nim || []).filter((n) => Number.isInteger(n) && offs[n] !== null && offs[n] !== undefined)
+    .map((n) => `${labelOf(n)} ${offs[n]}`);
+  return `at t − NIM/offset ns (${each.join(", ")})`;
+}
+
+/** The NIM line of the seeded view's legend, for the merge on or off; `align`: alignText(). */
+function nimLegend(merged, align) {
+  return `S*k*L lanes: the counter's NIM copy, lighter, outlined${align ? `, ${align}` : ""} · ` +
+    "dark tick: a TOT word and its NIM copy · " + (merged
     ? "hollow: NIM-only (merged into its counter) · grey: NIM-only held back (lag fault) · "
     : "hollow: NIM-only (shown, not merged: NIM merge off, the counters and the pattern are " +
       "the TOT words only) · ") +
@@ -2900,6 +3002,7 @@ function save() {
     window.localStorage.setItem(LS, JSON.stringify({
       client: state.client, tab: state.tab, zoom: state.zoom,
       hideCurrent: state.hideCurrent, hidePixels: state.hidePixels, intervals: state.intervals,
+      rawTimes: state.rawTimes,
     }));
   } catch (e) { /* private browsing or quota */ }
 }
@@ -2912,6 +3015,7 @@ function restore() {
     if (o.zoom === "full" || o.zoom === "prompt") state.zoom = o.zoom;
     if (o.hideCurrent !== undefined) state.hideCurrent = !!o.hideCurrent;
     if (o.hidePixels !== undefined) state.hidePixels = !!o.hidePixels;
+    if (o.rawTimes !== undefined) state.rawTimes = !!o.rawTimes;
     if (o.intervals) {
       for (const tab of ["seeded", "raster"]) {
         const v = Number(o.intervals[tab]);

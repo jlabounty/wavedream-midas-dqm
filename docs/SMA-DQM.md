@@ -511,6 +511,22 @@ light two entries up at once.
   MuPix hit count and their word range. Real hits sit a little before the seed
   line (the peak is at about -30 ns on run 1008) with a tail of low-ToT hits up
   to a few hundred ns later (time walk).
+* **NIM lanes** (since run 1015): each counter's NIM copy S*k*L has its own lane
+  under the counter. It is drawn at **t - `NIM/offset ns`**, the offsets the
+  frame was paired with (they travel with the frame, so a later ODB edit does
+  not move a frame already analysed). With the offsets right, a NIM copy sits
+  under its TOT word and the dark tick joining a pair is upright; a slanted
+  tick means the offset is off by that much. The legend lists the offsets.
+  *raw times* draws the NIM lanes at their raw SMA time instead (each sits
+  ~10-75 ns right of its TOT word, the cable delay); both tabs share the
+  switch, and the page remembers it. Hovering a NIM word gives both times (raw
+  and aligned) and, for a pair, NIM - TOT raw and aligned. Tags, *Copy seed
+  words*, the word ranges and the Δt of the tagged list stay on raw times (they
+  point at file words). The analyzer picks a seed's hits by their raw time, so
+  a NIM word in the last `offset` ns of the window is not shipped and its lane
+  can be empty there. The whole-frame raster shifts its S*k*L rows the same
+  way (visible only when zoomed in). An analyzer older than this, or one with
+  no NIM copies, sends no offsets: the lanes are raw and the switch is hidden.
 * **Whole-frame raster** (2 Hz): time vs channel for the whole frame, ToT as
   colour, hit count per channel on the right. Drag to zoom in time, double-click
   for the whole frame. *hide the current channel* removes the proton-current
@@ -1068,9 +1084,9 @@ not pair. The analyzer also votes the NIM copy's fine-time lag against S1
 
 Where to look: the **NIM / TOT** tab on SMAPlots (a table per counter above its
 plots, and the S1 coincidences with and without the merge), and the NIM lanes
-on SMAEvents (S*k*L under each counter, a dark tick joining a TOT word to its
-NIM copy, hollow bars for NIM-only words, grey for held-back ones, a hatch for
-TOT echo words).
+on SMAEvents (S*k*L under each counter, drawn at t - `NIM/offset ns`, a dark
+tick joining a TOT word to its NIM copy, hollow bars for NIM-only words, grey
+for held-back ones, a hatch for TOT echo words).
 
 ### The merge is off until the offsets are measured
 
