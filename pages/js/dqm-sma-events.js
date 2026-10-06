@@ -657,7 +657,8 @@ function frameHeader(frame, holder) {
   holder.appendChild(badge(m.gap_ns === null || m.gap_ns === undefined
     ? "gap —" : `gap ${ms(m.gap_ns)} ms`));
   holder.appendChild(badge(`${num(m.n_words)} words: ${num(m.n_filler)} filler · ` +
-    `${num(m.n_pixel)} pixel · ${num(m.n_trigger)} trigger (${num(m.n_kept)} kept)`));
+    `${num(m.n_pixel)} pixel · ${num(m.n_trigger)} trigger (${num(m.n_kept)} kept)` +
+    (m.n_zero ? ` · ${num(m.n_zero)} zero (dropped)` : "")));
   if (frame.suspect || m.suspect) {
     holder.appendChild(badge(`SUSPECT time base${m.stale_reason ? `: ${m.stale_reason}` : ""}`,
                              "red"));

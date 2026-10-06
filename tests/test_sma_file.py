@@ -410,3 +410,20 @@ def test_hist_arrays_cover_every_histogram():
     arrays = S.hist_arrays(p.store)
     for name in store.names():
         assert arrays[name].shape == store.get(name).counts.shape
+
+
+def test_zero_frames_are_counted_apart_from_rejected_ones(tmp_path, capsys):
+    """A frame of nothing but zero words is dropped by the plugin, not rejected."""
+    frames = [np.zeros(1024, dtype="<u8")] * 3 + synth_frames(4)
+    path = write_file(tmp_path / "run00682_00000.mid", frames)
+    p, stats = S.feed(MF.MidasFile(path), S.build_settings(), 682, clock=S.DataClock(T0))
+    assert stats.frames_fed == 7 and stats.frames_zero == 3 and stats.frames_rejected == 0
+    assert p.frames_zero == 3 and p.frames == 4
+    out = tmp_path / "out"
+    rc = S.main([str(path), "--out", str(out), "--no-png", "--settings",
+                 '{"NIM": {"channels": [-1]}}'])
+    assert rc == S.EXIT_OK
+    assert "zero 3 (3072 zero words dropped)" in capsys.readouterr().out
+    with np.load(out / "hists.npz") as z:
+        meta = json.loads(str(z["__meta__"]))
+    assert meta["frames_zero"] == 3 and meta["frames_rejected"] == 0

@@ -88,8 +88,9 @@ const VIEWS = {
   mupix: { tabs: ["mupixxy", "mupixpair", "mupix"], store: "dqm-sma-mupix-settings", page: "MuPixPlots",
            // The MuPix flags, and those that leave the MuPix plots empty or wrong:
            // no frames, every frame stale, no S1 seeds, a settings error (a bad
-           // chip list turns x/y off with one).
-           flags: /^(mupix_\w+|settings|no_frames|all_stale|no_seeds)$/, table: false },
+           // chip list turns x/y off with one); and the zero frames dropped,
+           // which would otherwise be one bright L1 pixel.
+           flags: /^(mupix_\w+|settings|no_frames|all_stale|no_seeds|zero_frames)$/, table: false },
 };
 
 /** The view named by the page's <body data-view>, else the SMAPlots page. */
@@ -1738,8 +1739,9 @@ function renderStatus(s, st) {
     runActive === false ? "yellow" : ""));
 
   const offered = f.offered !== undefined ? f.offered : f.seen_by_serial;
+  // Frames of nothing but zero words (a run start) are dropped undecoded.
   bar.appendChild(chip(`frames ${num(f.processed)} analysed · ${num(offered)} offered · ` +
-                       `${num(f.stale)} stale`));
+                       `${num(f.stale)} stale` + (f.zero ? ` · ${num(f.zero)} zero` : "")));
   if (f.suspect) bar.appendChild(chip(`${num(f.suspect)} suspect time base`, "red"));
 
   // Frames the analyzer skipped on purpose (the CPU budget) are information,

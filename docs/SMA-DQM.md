@@ -223,7 +223,7 @@ frames/s, the live fraction and the shift check.
 | `analyzer throttled` (red) | the DAQ-health valve lowered its rate. For SMA this valve is off (no musip loss counter known yet, `sma.py:550-552`), so this should not appear | tell the DQM expert |
 | `no analyzer` (red) + `last seen HH:MM:SS` (yellow) | the analyzer did not answer; the page greys out and everything shown is from the time given | see "Analyzer not connected" below |
 | `run N` / `run N (stopped)` | run number the analyzer sees; yellow when no run is active | nothing |
-| `frames A analysed · B offered · C stale` | A = frames analysed since the analyzer started, B = frames the DAQ sent (counted from the event serial numbers, so skipped frames are counted without being read), C = stale frames | nothing |
+| `frames A analysed · B offered · C stale` | A = frames analysed since the analyzer started, B = frames the DAQ sent (counted from the event serial numbers, so skipped frames are counted without being read), C = stale frames; `· D zero` when frames of nothing but zero words were dropped (see the `zero_frames` flag) | nothing |
 | `analysed X % of frames` (blue) | the share of the frames sent in the last 60 s that the analyzer analysed. Below 100 % is normal at high rate: it samples to stay within its CPU budget. Shown as `... since start` when no frame arrived in the last 60 s | nothing; see "Sampling" below |
 | `CPU x % / budget y %` | the analyzer's own CPU (last 5 s, % of one core) and its budget. Yellow above 1.1 x the budget, which should not last more than a few seconds | if it stays yellow, tell the DQM expert |
 | `N missed (serial gaps)` (yellow) | only with the development flag `--no-cpu-budget` (process everything): frames the analyzer never saw because the buffer overwrote them first. It keeps its count until the analyzer restarts | restart it without the flag (sampling is the normal mode) |
@@ -318,6 +318,7 @@ Worst first. Codes as in `sma.py:1152-1232`:
 | `no_frames` | error (warning before the first frame) | no SMA frame for more than 5 s while a run is active | check that the SMA/musip readout is running and the SMA link is enabled |
 | `efficiency_drop` | warning | a counter's efficiency given S1 fell by more than 10 points in the last 30 s compared with the last 10 min | check HV and cabling of that counter |
 | `oversize` | warning | a frame had more than `Cuts/max words per frame` words and was not decoded | tell the SMA expert (the readout sent a huge frame) |
+| `zero_frames` | info | "zero frames dropped (N)": 64-bit words equal to 0 were removed before decoding, and N frames held nothing else. A run start can send whole frames of them; each zero word would otherwise be a MuPix hit at chip 0, column 0, row 0 (a bright L1 pixel the chip mask cannot remove). Switch off with `Cuts/drop zero words` | nothing |
 | `sampling` | info | not every frame was analysed (CPU budget): histogram counts are from the sample, rates and fractions are not affected | nothing |
 | `settings` | warning | a value under `/DQM/SMA` was invalid and its default is used; the text names it. "Channel roles look pre-1015" means a NIM channel is also S1, a counter, the RF, `current` or a `delayed` channel: NIM is then off altogether | fix the ODB value; for "pre-1015", run the odbedit lines under [Settings](#settings-dqmsma) |
 | `mupix_sync` | warning | fewer than 30 % of S1 hits have an L1 **and** an L2 pixel hit in time (accidentals taken out) for more than 30 s while S1 fires; or no pixel words at all | see [MuPix time sync](#mupix-time-sync-what-the-flag-means) |
@@ -1293,6 +1294,8 @@ histograms.
 | `Cuts/tot corrupt` | 250 | ToT code counted as corrupt | yes |
 | `Cuts/delayed lo ns`, `delayed hi ns` | -1000, 10000 | delayed-channel window | yes |
 | `Cuts/max words per frame` | 1048576 | larger frames (over 8 MiB) are counted as `oversize` (summary, status, a warning flag) and not decoded: one costs ~0.6 s of CPU and hundreds of MB. 0 = no limit | yes |
+| `Cuts/drop zero words` | y | remove every 64-bit word equal to 0 before decoding; a frame with nothing else is counted as `zero` (summary, status, the `zero_frames` info flag) and not decoded. n = decode them, as before | yes |
+| `Cuts/max frame span ms` | 60000 | a frame that is neither stale nor suspect but whose kept words span more than this is stale, reason "span": the frames sent after a run stop, with a frozen SMA clock, span hundreds of seconds. Genuine frames reach seconds (beam trip, slow run). 0 = no limit | yes |
 | `Cuts/max S1 per frame` | 2000 | a frame with more kept S1 hits gives the S1-seeded analyses (pattern, efficiency, S2..S5 - S1, RF, delayed) to an evenly spread sample of this many; 0 = no cap. Bounds the cost of a dense frame | yes |
 | `Cuts/max gap s`, `max overlap ms` | 10, 10 | larger jumps between frames count as a loop/run boundary | yes |
 | `Cuts/stale frame ...`, `suspect kept fraction` | see `sma.py:145-153` | the stale/suspect frame rules (`sma.py:407-473`) | yes |

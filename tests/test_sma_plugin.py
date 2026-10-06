@@ -1094,3 +1094,149 @@ def test_status_is_json_safe():
     st = p.status()
     assert st["frames_stale"] == 1 and st["last_frame"]["class"] == "stale"
     json.dumps(st, allow_nan=False)
+
+
+# --- zero words and the frame span (Cuts/drop zero words, max frame span ms) -----
+
+def _hists(p):
+    return {n: (p.store.get(n).counts.copy(), p.store.get(n).entries) for n in p.store.names()}
+
+
+def _same_hists(a, b):
+    ha, hb = _hists(a), _hists(b)
+    assert ha.keys() == hb.keys()
+    for n in ha:
+        np.testing.assert_array_equal(ha[n][0], hb[n][0], err_msg=n)
+        assert ha[n][1] == hb[n][1], n
+
+
+def test_zero_words_are_found_on_the_64_bit_words():
+    """A 64-bit word is two dwords: only both zero make a zero word."""
+    words = np.array([0, 1, 1 << 32, 1 << 63, 0, 5], dtype="<u8")
+    data = words.view("<u4")                     # the bank as midas hands it over
+    got, n, pos = P.drop_zero_words(data)
+    assert n == 2
+    np.testing.assert_array_equal(got, words[words != 0])
+    assert pos.tolist() == [1, 2, 3, 5], "positions in 64-bit words of the bank"
+    clean = np.array([1, 2, 3], dtype="<u8").view("<u4")
+    got, n, pos = P.drop_zero_words(clean)
+    assert n == 0 and got is clean and pos is None, "no zero word: the bank itself, not a copy"
+    got, n, pos = P.drop_zero_words(np.zeros(6, dtype="<u4"))
+    assert got is None and n == 3
+    got, n, pos = P.drop_zero_words(np.zeros(0, dtype="<u4"))
+    assert n == 0 and got.size == 0, "an empty bank is not a zero frame"
+
+
+def test_an_all_zero_bank_is_counted_fills_nothing_and_resets_the_gap_chain():
+    p = _plugin()
+    _feed(p, R682[4], serial=1)
+    before = _hists(p)
+    assert p.process(_Event(np.zeros(4096, dtype="<u8"), serial=2), run_number=682) is False
+    assert p.frames_zero == 1 and p.zero_words == 4096 and p.frames == 1
+    after = _hists(p)
+    for n in before:
+        np.testing.assert_array_equal(before[n][0], after[n][0], err_msg=n)
+    assert _h(p, "mupix_col_chip").entries == before["sma/mupix_col_chip"][1]
+    _feed(p, R682[5], serial=3)
+    assert _h(p, "frame_gap_ms").entries == 0, "the zero frame broke the chain"
+    assert _h(p, "live_fraction").entries == 0
+    s = p.summary()
+    assert s["frames"]["zero"] == 1 and s["frames"]["zero_words"] == 4096
+    assert s["frames"]["window"]["zero"] == 1 and s["frames"]["window"]["zero_words"] == 4096
+    assert s["frames"]["offered"] == 3 and s["frames"]["processed"] == 2
+    assert s["sampling"]["analysed_frac"] == 1.0, "dropping a zero frame is not sampling"
+    assert s["frames"]["analysed_frac"] == 1.0
+    assert "sampling" not in [f["code"] for f in s["flags"]]
+    flags = {f["code"]: f for f in s["flags"]}
+    assert flags["zero_frames"]["severity"] == "info"
+    assert flags["zero_frames"]["text"].startswith("zero frames dropped (1)")
+    st = p.status()
+    assert st["frames_zero"] == 1 and st["zero_words"] == 4096
+    # Without the zero frame in between the same two frames have a gap.
+    q = _plugin()
+    _feed(q, R682[4], serial=1)
+    _feed(q, R682[5], serial=2)
+    assert _h(q, "frame_gap_ms").entries == 1
+
+
+def test_a_bank_with_some_zero_words_fills_what_the_clean_bank_fills():
+    rng = np.random.default_rng(7)
+    clean = np.asarray(R1008, dtype="<u8")
+    at = np.sort(rng.integers(0, clean.size, 500))
+    mixed = np.insert(clean, at, np.uint64(0))
+    a, b = _plugin(), _plugin()
+    sa = _feed(a, mixed, run=1008)
+    sb = _feed(b, clean, run=1008)
+    assert sa.cls == sb.cls == "good"
+    assert a.zero_words == 500 and a.frames_zero == 0 and b.zero_words == 0
+    _same_hists(a, b)
+    s = a.summary()
+    assert s["frames"]["zero"] == 0 and s["frames"]["window"]["zero_words"] == 500
+    assert "zero_frames" in [f["code"] for f in s["flags"]]
+    assert "zero_frames" not in [f["code"] for f in b.summary()["flags"]]
+    # The word indices are bank positions, zero words counted: the event
+    # page's word ranges and the raw event download refer to the bank.
+    for fr in (sa.fr,):
+        np.testing.assert_array_equal(mixed[fr.word_index], fr.raw)
+        np.testing.assert_array_equal(mixed[fr.px.word_index], fr.px.raw)
+        assert fr.n_zero == 500 and fr.n_words == clean.size
+    np.testing.assert_array_equal(sb.fr.word_index + np.searchsorted(at, sb.fr.word_index,
+                                                                     side="right"),
+                                  sa.fr.word_index)
+    meta = framing.decode_sma_frame(a.frame_blob("raster"))["meta"]
+    assert meta["n_words"] == mixed.size and meta["n_zero"] == 500
+    # A frame rebuilt from the raw ring drops them too, with the same indices.
+    a._last = a._last_good = a._last_seeded = None
+    a._ring.clear()
+    rebuilt = a._snapshot_for(sa.seq)
+    assert rebuilt is not None and rebuilt.fr.n_words == clean.size
+    np.testing.assert_array_equal(rebuilt.fr.word_index, sa.fr.word_index)
+
+
+def test_word_indices_of_a_bank_starting_with_zero_words():
+    """[0, 0, 0, hit, hit]: the hits are bank words 3 and 4, not 0 and 1."""
+    hits = synth_frame(10**12, n=20)
+    bank = np.concatenate([np.zeros(3, dtype="<u8"), hits])
+    snap = _feed(_plugin(), bank)
+    assert int(snap.fr.word_index.min()) == 3
+    np.testing.assert_array_equal(bank[snap.fr.word_index], snap.fr.raw)
+
+
+def test_drop_zero_words_off_decodes_them_as_before():
+    p = _plugin({"Cuts": {"drop zero words": False}})
+    assert p.cfg.drop_zero_words is False and _plugin().cfg.drop_zero_words is True
+    snap = _feed(p, np.zeros(4096, dtype="<u8"), serial=1)
+    assert snap.cls == "empty" and p.frames_zero == 0 and p.zero_words == 0
+    # Every zero word is a MuPix pixel at chip 0, column 0, row 0.
+    col = _h(p, "mupix_col_chip").counts
+    assert int(col[1, 1]) > 0 and int(col.sum()) == int(col[1, 1])
+    assert "zero_frames" not in [f["code"] for f in p.summary()["flags"]]
+
+
+def test_a_frame_spanning_minutes_is_stale_by_span():
+    """After a run stop the SMA clock freezes: kept words spread over minutes."""
+    far = 100 * 10**9
+    p = _plugin()
+    assert p.cfg.max_span_ns == 60 * 10**9, "default 60 s"
+    snap = _feed(p, synth_frame(10**12, far=far))
+    assert snap.cls == "stale" and snap.reason.startswith("span:")
+    assert p.frames_stale == 1 and _h(p, "words_per_ch").entries == 0
+    p = _plugin({"Cuts": {"max frame span ms": 0}})
+    assert p.cfg.max_span_ns is None
+    assert _feed(p, synth_frame(10**12, far=far)).cls == "good", "0 = no limit"
+    # The kept span, not that of every word: old words outside the frame's
+    # time clusters (dropped by the stale-hit rule) do not make it stale.
+    w = synth_frame(10**12)
+    coarse, fine = W.fields_of(np.array([10**12 + 300 * 10**9]), 14)
+    old = W.encode(np.array([3]), np.array([20]), coarse, fine)
+    snap = _feed(_plugin(), np.concatenate([old, w]))
+    assert snap.cls == "good" and snap.fr.span_ns < 10**9
+    assert int(snap.fr.stale_per_ch.sum()) == 1
+    # Checked last: a wrong shift stretches the times too and stays suspect,
+    # whatever its span, so the shift check keeps learning from it.
+    p = _plugin()
+    got = [_feed(p, x, serial=i, run=342) for i, x in enumerate(R342)]
+    assert [g.cls for g in got] == ["suspect", "suspect"]
+    assert all(g.fr.span_ns > p.cfg.max_span_ns for g in got), "kept spans of ~290 s"
+    p = _plugin({"Cuts": {"max frame span ms": "inf"}})
+    assert p.cfg.max_span_ns == 60 * 10**9 and p.cfg.errors, "not finite: the default"

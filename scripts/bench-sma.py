@@ -92,7 +92,11 @@ def read_frames(path, n_frames, skip=0):
 
 def pipeline(bank, shift, roles, cuts, nim=None):
     """Everything WP3 computes per frame, bar the histogram fills; with `nim`
-    (an sma.Config) the TOT + NIM pairing too, the analysis on merged counters."""
+    (an sma.Config) the TOT + NIM pairing too, the analysis on merged counters.
+    The plugin's zero-word check (Cuts/drop zero words, on by default) first."""
+    bank, _n_zero, _pos = P.drop_zero_words(bank)
+    if bank is None:
+        return None
     fr = W.prepare_frame(bank, shift, cuts.stale_gap_ns, cuts.latch_margin_ns)
     occupancy = W.per_channel_bit_counts(fr.ch, fr.fine)
     bad = ~fr.consistent
@@ -115,6 +119,12 @@ def time_steps(banks, shift, roles, cuts, nim=None):
 
     for b in banks:
         t0 = time.perf_counter()
+        b, _n_zero, _pos = P.drop_zero_words(b)
+        tz = time.perf_counter()
+        add("zero words", tz - t0)
+        if b is None:
+            continue
+        t0 = tz
         w = W.words_from_bank(b)
         d = W.decode(w, shift)
         t1 = time.perf_counter()
@@ -157,7 +167,10 @@ def observe(banks, shift, roles, cuts, label, nim=None):
     spans = []
     tot_bad = np.zeros(W.N_CHANNELS, dtype=np.int64)
     for b in banks:
-        fr, a, _occ, _mb = pipeline(b, shift, roles, cuts, nim)
+        got = pipeline(b, shift, roles, cuts, nim)
+        if got is None:                  # nothing but zero words
+            continue
+        fr, a, _occ, _mb = got
         words += fr.n_words
         trig += fr.n_trigger
         stale += int(fr.stale_per_ch.sum())

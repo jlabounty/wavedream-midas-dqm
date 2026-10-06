@@ -1631,3 +1631,21 @@ test("SMAPlots lists every flag, links them as before, and has no other-flags li
   assert.strictEqual(byId(page, "dqm-sma-flags").byClass("dqm-sma-flagsmore").length, 0,
                      "SMAPlots lists every flag");
 });
+
+test("zero frames: counted in the frames chip, and their flag is listed on the MuPix page", async () => {
+  const s = clone(FX.summary);
+  s.frames.zero = 1605;
+  s.frames.zero_words = 52592640;
+  const ZERO = { severity: "info", code: "zero_frames", text: "zero frames dropped (1605): ..." };
+  s.flags = [ZERO];
+  let page = await boot({ "sma::summary": () => json(s) });
+  const f = s.frames;
+  assert.strictEqual(chipText(page, /^frames /).textContent,
+    `frames ${f.processed} analysed · ${f.offered} offered · ${f.stale} stale · 1,605 zero`);
+  page = await bootMupixPage({ "sma::summary": () => json(s) });
+  const flags = byId(page, "dqm-sma-flags").byClass("dqm-sma-flag");
+  assert.deepStrictEqual(flags.map((x) => x.attrs["data-code"]), ["zero_frames"]);
+  // None dropped: the chip reads as before.
+  page = await boot();
+  assert.ok(!/zero/.test(chipText(page, /^frames /).textContent));
+});

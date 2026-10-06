@@ -218,7 +218,8 @@ class FeedStats:
     frames_seen: int = 0          # id-301 events read (before --skip/--frames)
     frames_fed: int = 0           # handed to process()
     frames_skipped: int = 0
-    frames_rejected: int = 0      # process() returned False (no H000)
+    frames_rejected: int = 0      # process() returned False (no H000, or oversize)
+    frames_zero: int = 0          # nothing but zero words (Cuts/drop zero words), not rejected
     bank_errors: list = field(default_factory=list)
     t_first: int | None = None
     t_last: int | None = None
@@ -261,8 +262,12 @@ def feed(events, settings: dict, run_number, *, frames: int | None = None, skip:
             stats.t_first = h.timestamp
         stats.t_last = h.timestamp
         stats.frames_fed += 1
+        n_zero = plugin.frames_zero
         if not plugin.process(ev, run_number=run_number):
-            stats.frames_rejected += 1
+            if plugin.frames_zero > n_zero:
+                stats.frames_zero += 1
+            else:
+                stats.frames_rejected += 1
     if plugin is None:
         plugin = make_plugin(settings, clock, stage)
     return plugin, stats
@@ -400,7 +405,9 @@ def text_summary(summary: dict, stats: FeedStats, file_label: str, elapsed_s: fl
         + (f", {span} s of data" if span is not None else ""),
         f"frames: good {_good(f)}, stale {f['stale']}, suspect {f.get('suspect', 0)}, "
         f"empty {f['empty']}, "
-        f"rejected {f['rejected']}, missed by serial {f['missed_by_serial']}, "
+        + (f"zero {f['zero']} ({f.get('zero_words', 0)} zero words dropped), "
+           if f.get("zero") or f.get("zero_words") else "")
+        + f"rejected {f['rejected']}, missed by serial {f['missed_by_serial']}, "
         f"gap resets {f['gap_resets']}",
         f"live fraction {_frac(summary['live_fraction'])}, kept-hit span "
         f"{summary['span_s'] or 0:.3g} s, covered {summary.get('covered_s') or 0:.3g} s",
@@ -1078,7 +1085,8 @@ def main(argv=None) -> int:
     out.mkdir(parents=True, exist_ok=True)
     meta = {"file": str(path.resolve()), "run": run, "subrun": subrun,
             "frames_seen": stats.frames_seen, "frames_fed": stats.frames_fed,
-            "frames_skipped": stats.frames_skipped, "t_first": stats.t_first,
+            "frames_skipped": stats.frames_skipped, "frames_rejected": stats.frames_rejected,
+            "frames_zero": stats.frames_zero, "t_first": stats.t_first,
             "t_last": stats.t_last, "truncated": reader.truncated,
             "bank_errors": stats.bank_errors, "settings": settings,
             "clock": "event time stamp", "run_active": False}

@@ -212,6 +212,18 @@ SETTINGS_DEFAULTS: dict[str, object] = {
         #: "oversize" and not decoded: one would take ~0.6 s of CPU and
         #: hundreds of MB. 0 = no limit.
         "max words per frame": 1 << 20,
+        #: Remove every 64-bit word that is exactly 0 before decoding. A run
+        #: can start with whole frames of them; each would decode as a MuPix
+        #: hit on chip 0, column 0, row 0. A frame left with no words is
+        #: counted as "zero" and not decoded. A real word equal to 0 would
+        #: need tick 0 and TS2 0 on that one pixel.
+        "drop zero words": True,
+        #: A frame whose kept words span more than this is stale ("span"): an
+        #: SMA clock frozen after a run stop spreads a frame over hundreds of
+        #: seconds. The kept span, not that of every word: a genuine frame can
+        #: carry a few words of an earlier run (the stale-hit rule drops them),
+        #: and a beam trip or a slow run stretches one to seconds. 0 = no limit.
+        "max frame span ms": 60000.0,
     },
     "Binning": {
         "words per frame max": 50000,
@@ -517,6 +529,8 @@ class Config:
     suspect_kept_frac: float = 0.5
     flag_channels: tuple = (1, 2, 4, 5, 6, 7)
     max_words: int | None = 1 << 20
+    drop_zero_words: bool = True
+    max_span_ns: int | None = 60 * 10**9
     max_gap_ns: int = 10 * 10**9
     max_overlap_ns: int = 10 * 10**6
     raw_ring_bytes: int = 16 << 20
@@ -795,6 +809,9 @@ def parse_settings(settings: dict | None) -> Config:
         suspect_kept_frac=get(C, "suspect kept fraction", float),
         flag_channels=flag_channels,
         max_words=get(C, "max words per frame", int, lambda v: v >= 0) or None,
+        drop_zero_words=get(C, "drop zero words", _as_bool),
+        max_span_ns=int(get(C, "max frame span ms", float,
+                                lambda v: 0 <= v < math.inf) * 1e6) or None,
         raw_ring_bytes=int(get("Sampling", "raw ring MB", float, lambda v: v >= 0) * (1 << 20)),
         seed_ring_frames=get("Sampling", "seed ring frames", int,
                              lambda v: 0 <= v <= SEED_RING_MAX),
@@ -1026,6 +1043,14 @@ def classify_frame(fr: W.Frame, cfg: Config, n_s1: int, scan_counts, n_s1_all: i
        means anything, so suspect frames stay out of the physics; they still
        feed the shift check, which reads the fine and coarse fields and needs
        no times -- that is how the page learns which shift to set.
+
+    4. Neither stale nor suspect, but its kept words span more than ``max
+       frame span ms``: stale ("span"). After a run stop the SMA clock freezes
+       and the board keeps sending frames whose times spread over hundreds of
+       seconds; the first of them can carry enough real words to pass the
+       rules above. Genuine frames reach seconds at most (a beam trip, a slow
+       run). Checked last, so a wrong shift, which stretches the times too,
+       stays suspect and keeps feeding the shift check.
     """
     if fr.n_trigger == 0:
         return "empty", "no trigger words", float("nan")
@@ -1052,6 +1077,9 @@ def classify_frame(fr: W.Frame, cfg: Config, n_s1: int, scan_counts, n_s1_all: i
     if n_kept < cfg.suspect_kept_frac * fr.n_trigger:
         return ("suspect", f"only {n_kept} of {fr.n_trigger} words in the frame's time "
                 "clusters: the coarse shift is probably wrong", best)
+    if cfg.max_span_ns is not None and fr.span_ns > cfg.max_span_ns:
+        return ("stale", f"span: the kept words span {fr.span_ns / 1e6:.0f} ms, more than "
+                f"Cuts/max frame span ms ({cfg.max_span_ns / 1e6:g})", best)
     return "good", "", best
 
 
@@ -1221,6 +1249,40 @@ def pair_frame(fr: W.Frame, cfg: Config, memory: dict | None = None,
     return out
 
 
+def drop_zero_words(data) -> tuple:
+    """``(words, n_zero, pos)``: the H000 bank without its 64-bit words that are exactly 0.
+
+    ``data`` as `SmaPlugin._bank_data` returns it (``uint32``: a 64-bit word is
+    two dwords, so the test is on the 64-bit view, `sma_words.words_from_bank`).
+    A bank with no zero word comes back as ``data`` itself, not copied, and
+    ``pos`` None; one with some as the remaining ``uint64`` words and ``pos``
+    their positions in the bank (64-bit words, see `bank_positions`); one with
+    nothing else as None.
+    """
+    w = W.words_from_bank(data)
+    nz = int(np.count_nonzero(w))
+    if nz == w.size:
+        return data, 0, None
+    if nz == 0:
+        return None, int(w.size), None
+    pos = np.flatnonzero(w)
+    return w[pos], int(w.size) - nz, pos
+
+
+def bank_positions(fr: W.Frame, pos, n_zero: int) -> None:
+    """A frame decoded from a bank's non-zero words: its word indices back to bank positions.
+
+    ``word_index`` (trigger words and pixels) counts 64-bit words of the words
+    decoded; ``pos`` (`drop_zero_words`) maps those to the bank, which is what
+    the event page's word ranges and the raw event download refer to.
+    """
+    fr.n_zero = int(n_zero)
+    if fr.word_index is not None:
+        fr.word_index = pos[fr.word_index].astype(np.uint32)
+    if fr.px is not None:
+        fr.px.word_index = pos[fr.px.word_index].astype(np.uint32)
+
+
 # ---------------------------------------------------------------------------
 # per-second accumulators (trend, summary, shift ring)
 # ---------------------------------------------------------------------------
@@ -1230,7 +1292,7 @@ class _Second:
 
     __slots__ = ("t", "epoch", "frames", "offered", "stale", "empty", "suspect", "span_ns",
                  "cover_ns", "delta_ns", "live_ns", "hits", "rate_hits", "oversize",
-                 "mismatch", "tot_bad",
+                 "zero", "zero_words", "mismatch", "tot_bad",
                  "stale_words", "n_s1", "n_s1_kept", "eff", "rf_valid", "rf_vetoed", "scan",
                  "shift_counts", "shift_n", "mp_frames", "mp_pix", "mp_examined", "mp_skipped",
                  "mp_n", "mp_in", "mp_side", "mp_chip", "mp_rows", "mp_unsorted", "nim",
@@ -1251,6 +1313,9 @@ class _Second:
         #: Hits of the frames the rates use (see SmaPlugin._fill_good).
         self.rate_hits = np.zeros(NCH, dtype=np.int64)
         self.oversize = 0
+        #: Frames of nothing but zero words, and the zero words dropped from
+        #: every frame (Cuts/drop zero words).
+        self.zero = self.zero_words = 0
         self.mismatch = np.zeros(NCH, dtype=np.int64)
         self.tot_bad = np.zeros(NCH, dtype=np.int64)
         self.stale_words = np.zeros(NCH, dtype=np.int64)
@@ -1501,6 +1566,10 @@ class SmaPlugin:
         self.frames_rejected = 0
         #: Frames above Cuts/max words per frame: counted, not decoded.
         self.frames_oversize = 0
+        #: Cuts/drop zero words: frames of nothing but zero words (counted, not
+        #: decoded) and the zero words removed from every frame.
+        self.frames_zero = 0
+        self.zero_words = 0
         self.gap_resets = 0
         self.missed_by_serial = 0
         #: Frames the DAQ sent, from the serial numbers of the analysed ones.
@@ -2096,9 +2165,29 @@ class SmaPlugin:
             self._prev_extent = None
             self._prev_timed = None
             return False
-        fr = W.prepare_frame(data, cfg.shift, c.stale_gap_ns, c.latch_margin_ns,
+        words = data
+        if cfg.drop_zero_words:
+            # count_nonzero first: a frame without zero words is not copied.
+            words, n_zero, pos = drop_zero_words(data)
+            if n_zero:
+                self.zero_words += n_zero
+                self._roll(now).zero_words += n_zero
+            if words is None:
+                # Nothing but zero words: counted like an oversize frame, not
+                # decoded, and its neighbour has no predecessor.
+                self.frames_zero += 1
+                self.last_frame_at = now
+                sec = self._roll(now)
+                sec.offered += offered
+                sec.zero += 1
+                self._prev_extent = None
+                self._prev_timed = None
+                return False
+        fr = W.prepare_frame(words, cfg.shift, c.stale_gap_ns, c.latch_margin_ns,
                              rescue_shifts=cfg.scan, rescue_min_words=c.rescue_min_words,
                              rescue_min_fraction=c.rescue_min_fraction, mupix=cfg.mupix)
+        if words is not data:
+            bank_positions(fr, pos, n_zero)
         n_s1, scan_counts = kept_s1_scan(fr, cfg)
         s1_all = fr.ch == cfg.roles.s1
         n_s1_all = int(np.count_nonzero(s1_all))
@@ -2282,9 +2371,15 @@ class SmaPlugin:
         if bank is None:
             return None
         cfg, c = self.cfg, self.cfg.cuts
-        fr = W.prepare_frame(bank.data, cfg.shift, c.stale_gap_ns, c.latch_margin_ns,
+        words, n_zero, pos = (drop_zero_words(bank.data) if cfg.drop_zero_words
+                              else (bank.data, 0, None))
+        if words is None:
+            return None
+        fr = W.prepare_frame(words, cfg.shift, c.stale_gap_ns, c.latch_margin_ns,
                              rescue_shifts=cfg.scan, rescue_min_words=c.rescue_min_words,
                              rescue_min_fraction=c.rescue_min_fraction, mupix=cfg.mupix)
+        if pos is not None:
+            bank_positions(fr, pos, n_zero)
         n_s1, scan_counts = kept_s1_scan(fr, cfg)
         s1_all = fr.ch == cfg.roles.s1
         scan_all = W.shift_scan(fr.coarse[s1_all], fr.fine[s1_all], cfg.scan, c.latch_margin_ns)
@@ -3028,7 +3123,8 @@ class SmaPlugin:
         st = self.sampling_state or {}
         sampling = {
             # Frames: analysed / sent (from the serial numbers), in the window.
-            "analysed_frac": _ratio(frames, offered, 4),
+            # A zero frame was read whole: dropping it is not sampling.
+            "analysed_frac": _ratio(frames + total("zero"), offered, 4),
             "offered_per_s": _ratio(offered, max(1.0, len(secs)), 4),
             # S1 hits given the S1-seeded analyses / kept S1 hits (Cuts/max S1
             # per frame), over the analysed frames.
@@ -3048,17 +3144,20 @@ class SmaPlugin:
                 "empty": self.frames_empty, "suspect": self.frames_suspect,
                 "rejected": self.frames_rejected,
                 "oversize": self.frames_oversize,
+                "zero": self.frames_zero, "zero_words": self.zero_words,
                 "missed_by_serial": self.missed_by_serial,
                 "seen_by_serial": self.frames + self.missed_by_serial,
                 #: Frames the DAQ sent (serial numbers), and the analysed share.
                 "offered": self.offered_by_serial,
-                "analysed_frac": _ratio(self.frames, self.offered_by_serial, 4),
+                "analysed_frac": _ratio(self.frames + self.frames_zero,
+                                        self.offered_by_serial, 4),
                 "gap_resets": self.gap_resets,
                 "serial_breaks": self.serial_breaks,
                 "last_age_s": _num(age, 4),
                 "window": {"frames": frames, "good": good, "stale": stale, "empty": empty,
                            "suspect": suspect, "offered": offered,
-                           "oversize": total("oversize"),
+                           "oversize": total("oversize"), "zero": total("zero"),
+                           "zero_words": total("zero_words"),
                            "analysed_frac": sampling["analysed_frac"],
                            "per_s": _ratio(frames, max(1.0, len(secs)), 4)},
             },
@@ -3423,6 +3522,12 @@ class SmaPlugin:
             add("warn", "oversize",
                 f"{w['oversize']} frame(s) in the last {s['window_s']:.0f} s had more than "
                 f"{self.cfg.max_words} words (Cuts/max words per frame) and were not decoded")
+        if w.get("zero") or w.get("zero_words"):
+            add("info", "zero_frames",
+                f"zero frames dropped ({w['zero']}): in the last {s['window_s']:.0f} s "
+                f"{w['zero_words']} 64-bit word(s) equal to 0 were removed before decoding, "
+                f"and {w['zero']} frame(s) held nothing else (Cuts/drop zero words). A run "
+                "start can send them; each would be a MuPix hit at chip 0, column 0, row 0")
         if w["frames"] and w["stale"] == w["frames"]:
             add("error", "all_stale",
                 f"All {w['frames']} frames in the last {s['window_s']:.0f} s are stale: the "
@@ -3912,7 +4017,8 @@ class SmaPlugin:
             "view": view, "seq": snap.seq, "run": snap.run, "serial": snap.serial,
             "class": snap.cls, "stale": snap.cls == "stale", "suspect": snap.cls == "suspect",
             "stale_reason": snap.reason,
-            "n_words": fr.n_words, "n_filler": fr.n_filler, "n_pixel": fr.n_pixel,
+            # n_words: the bank's 64-bit words, zero words (n_zero, below) included.
+            "n_words": fr.n_words + fr.n_zero, "n_filler": fr.n_filler, "n_pixel": fr.n_pixel,
             "n_trigger": fr.n_trigger, "n_kept": n, "n_rescued": int(fr.n_rescued),
             "span_ns": int(fr.span_ns), "gap_ns": snap.gap_ns,
             "t0_ns": t0, "time_shift": k, "frame_first_ns": int(fr.first), "shift": snap.shift,
@@ -3930,6 +4036,9 @@ class SmaPlugin:
             "raw_held": snap.seq in self._raw,
             "words": bool(words and widx is not None),
         }
+        if fr.n_zero:
+            # Only when some were dropped: a clean frame's payload is unchanged.
+            meta["n_zero"] = fr.n_zero
         if snap.nim is not None:
             # With NIM copies configured when the frame was analysed: its
             # channel map (as sma::summary's "roles"; -1 = none, "nim" follows
@@ -4159,9 +4268,11 @@ class SmaPlugin:
             "frames_suspect": self.frames_suspect,
             "frames_rejected": self.frames_rejected,
             "frames_oversize": self.frames_oversize,
+            "frames_zero": self.frames_zero,
+            "zero_words": self.zero_words,
             "missed_by_serial": self.missed_by_serial,
             "offered_by_serial": self.offered_by_serial,
-            "analysed_frac": _ratio(self.frames, self.offered_by_serial, 4),
+            "analysed_frac": _ratio(self.frames + self.frames_zero, self.offered_by_serial, 4),
             "gap_resets": self.gap_resets,
             "serial_breaks": self.serial_breaks,
             "max_s1_per_frame": self.cfg.cuts.max_s1,
@@ -4208,10 +4319,10 @@ def _merge_seconds(secs: list[_Second]) -> _Second:
     for s in secs:
         for a in ("frames", "offered", "stale", "empty", "suspect", "span_ns", "cover_ns",
                   "delta_ns", "live_ns", "n_s1", "n_s1_kept", "rf_valid", "rf_vetoed",
-                  "oversize", "mp_frames", "mp_pix", "mp_examined", "mp_skipped", "mp_n",
-                  "mp_rows", "mp_unsorted", "xy_light", "xy_heavy", "xy_ctrk", "pr_l1",
-                  "pr_paired", "pr_partners", "pr_light", "pr_heavy", "pr_ctrk", "pr_mponly",
-                  "pr_h1", "pr_h2"):
+                  "oversize", "zero", "zero_words", "mp_frames", "mp_pix", "mp_examined",
+                  "mp_skipped", "mp_n", "mp_rows", "mp_unsorted", "xy_light", "xy_heavy",
+                  "xy_ctrk", "pr_l1", "pr_paired", "pr_partners", "pr_light", "pr_heavy",
+                  "pr_ctrk", "pr_mponly", "pr_h1", "pr_h2"):
             setattr(out, a, getattr(out, a) + getattr(s, a))
         out.xy_state += s.xy_state
         out.hits += s.hits

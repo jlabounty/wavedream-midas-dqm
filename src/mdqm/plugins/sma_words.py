@@ -1073,6 +1073,10 @@ class Frame:
     #: words, filler and pixel included) and the raw word.
     word_index: np.ndarray | None = None
     raw: np.ndarray | None = None
+    #: 64-bit words equal to 0 removed from the bank before decoding (the
+    #: plugin's Cuts/drop zero words); not in ``n_words``. ``word_index`` (and
+    #: the pixels') still count bank positions, zero words included.
+    n_zero: int = 0
     #: The MuPix pixel hits (:func:`prepare_pixels`), on the same time basis as
     #: ``s_t``; None when the frame was prepared without MuPix.
     px: Pixels | None = None
