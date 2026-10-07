@@ -51,6 +51,7 @@ import midas.client
 
 from mdqm.dqm import settings as odb_settings
 from mdqm.dqm.hist import HistStore
+from mdqm.dqm.mupix_no_data import MupixNoData
 from mdqm.dqm.server import Server
 
 DEFAULT_CLIENT = "wd_analyzer"
@@ -422,6 +423,11 @@ class Analyzer:
         self.settings_defaults = (self.plugin.settings_defaults if has_defaults
                                   else odb_settings.SECTIONS)
 
+        #: The "MuPix no data" alarm, for plugins that ask for it (ODB reads only,
+        #: polled from the main loop; see mupix_no_data).
+        self.mupix_no_data = (MupixNoData(self.client_name)
+                              if getattr(self.plugin, "mupix_no_data_alarm", False) else None)
+
         self.settings = None
         self._settings_shape = None
         self._settings_error = None
@@ -490,6 +496,8 @@ class Analyzer:
             "histograms": len(self.store),
             "reconfigures": self.reconfigures,
             "settings_root": self.settings_root,
+            "mupix_no_data": (None if self.mupix_no_data is None
+                              else self.mupix_no_data.status()),
             "binning": (self.settings or {}).get("Binning", {}),
             # Read back off the histograms themselves. The settings dict says
             # what was requested; this says what exists, and the two disagreeing
@@ -1196,6 +1204,11 @@ def main(argv=None) -> int:
                     print(f"{args.client}: seeded {created} settings key(s) under "
                           f"{analyzer.settings_root}", flush=True)
                 analyzer.apply_settings(client, force=True)
+                if analyzer.mupix_no_data is not None:
+                    created = analyzer.mupix_no_data.seed(client)
+                    if created:
+                        print(f"{args.client}: seeded {created} key(s) under "
+                              f"{analyzer.mupix_no_data.root}", flush=True)
 
                 client.register_brpc_callback(analyzer.serve)
                 max_event = max_event_size(client, args.max_event_size)
@@ -1218,6 +1231,9 @@ def main(argv=None) -> int:
                     if now - last_health > 10.0:
                         analyzer.check_daq_health(client)
                         last_health = now
+                    if analyzer.mupix_no_data is not None:
+                        # Time-gated inside (Period seconds); never raises.
+                        analyzer.mupix_no_data.maybe_poll(client)
                     client.communicate(analyzer.next_wait_ms(args.cycle_ms))
 
         except KeyboardInterrupt:

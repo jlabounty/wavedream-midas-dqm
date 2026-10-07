@@ -1551,6 +1551,8 @@ class SmaPlugin:
     wants_raw = True
     settings_root = "/DQM/SMA"
     settings_defaults = SETTINGS_DEFAULTS
+    #: Run the "MuPix no data" alarm in this analyzer (mdqm.dqm.mupix_no_data).
+    mupix_no_data_alarm = True
 
     def __init__(self, store, settings: dict | None = None, clock=time.time):
         self.store = store

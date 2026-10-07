@@ -1246,6 +1246,134 @@ firing, the shift check `ok`), with `NIM/merge` still **n**.
 Write the measured offsets and the run number in the elog. Redo the measurement
 after any change to the NIM cables, thresholds or delays.
 
+## The "MuPix no data" alarm
+
+`sma_analyzer` raises the internal MIDAS alarm **`MuPix no data`** (class `DAQ Alarm`: red
+banner, sound, Slack; it does not stop the run) when the run is going, beam is on, and no
+MuPix data arrives for `Bad seconds` of running time. It reads only ODB values, about 20 every
+5 s, and never looks at event data, so it costs nothing per frame. The code and the reasoning
+are in `src/mdqm/dqm/mupix_no_data.py`. MIDAS cannot express an AND of two keys in an evaluated
+alarm (`&` there is a bitwise test), which is why this lives in code.
+
+It runs in the DQM rather than in a readout frontend, so that turning it on or changing it
+means restarting `sma_analyzer`, which is safe while data is being taken.
+
+**"Beam is on"** means all of the following:
+
+- every scintillator in `Scint indices` (S1-S5 = `/Equipment/WDScalers/Variables/S036[0..4]`,
+  written by the scaler frontend every 5 s) reads at least `Scint min rate Hz`;
+- the beam blocker (`/Equipment/EPICS/Variables/Measured[30]`) is open;
+- FEB 0 is active in `FEBsActive`.
+
+Otherwise the poll is ignored.
+
+**"No MuPix data"** comes from the musip Quads counters `/Equipment/Quads/Variables/RCNT`,
+judged in two places:
+
+- **During the run.** This needs State running, no transition in progress, and a Quads write
+  since running began. The run is bad if `RCNT[5]` HIT 0 RATE is below `MuPix min rate Hz`, if
+  `Readout/Statistics/Events sent` is 0, or if `Events sent` has not changed for
+  `Max MuPix age seconds` (Readout stalled).
+- **After the run, once per run.** The run is bad if `RCNT[4]` HIT 0 CNT, the run's total hit
+  count, is below `MuPix min rate Hz` x the run length, or if Readout sent no events. Most of a
+  10 s sequencer run is start and stop transition, so this is the check that sees those runs.
+  Across runs 1022-3213, healthy runs had at least 22.7k hits; the "MuPix silent" runs had 3.
+
+Both checks also flag a Readout that took no part in the run. Readout's begin-of-run rewrites
+`Events sent`, so a write older than the run start means Readout is not running or not
+connected. MIDAS itself does not alarm on that: `/Programs/Readout` has no alarm class.
+
+Neither is judged during a transition. The State stays "running" through the stop transition,
+while Quads has already stopped the FEBs and writes HIT 0 RATE = 0. A Quads RCNT older than
+`Max MuPix age seconds` also counts as no data, because the Quads frontend is dead. After a
+resume it waits up to 3 s for a fresh write, since Quads does not write while paused. Around
+transitions it polls every second, so the short stopped gap between sequencer runs, where the
+end-of-run check happens, is never missed.
+
+**Counting.** A bad verdict adds the run time not yet counted. A dead 10 s sequencer run adds
+about 10 s; a long run adds one poll period per bad poll. A good verdict clears the total.
+Ignored polls leave it alone, so several short runs add up. With the default 30 s it fires
+after about three dead sequencer runs, or about 30 s into a long run.
+
+It resets itself after `Good seconds` of good running. Resetting it by hand on the Alarms page
+re-arms it: if MuPix is still silent, it fires again after another `Bad seconds`.
+
+**The sequencer.** When it fires, and `Stop sequencer after run` is `y`, it presses **Stop after
+run** on the PySequencer. The current run ends normally at its event count, then the script
+exits. The alarm never stops a run itself and never restarts the script. It does not use Pause,
+because a script paused mid-run would leave that run going with no end.
+
+With short runs it usually fires between runs, from the end-of-run check. The script has then
+already claimed the next run-DB config, so it takes one more run before it stops. That config
+is used up and must be queued again. The script ends with "End of Sequencer has been reached",
+which needs OK.
+
+**When it is blind.** While a gate is closed the alarm cannot fire: a scintillator below
+`Scint min rate Hz` (S5 was below 1 kHz in about 2 % of past beam-on runs), the blocker reading
+closed, or FEB 0 inactive. If a gate stays closed for 5 min of running, the analyzer log says
+`blind for ... s of running: <reason>`, and `dqm::status` shows the gate.
+
+Its state is in `dqm::status` under `mupix_no_data`: verdict, reason, bad/good seconds, and
+the cost of the last poll.
+
+### Settings: `/DQM/SMA/MuPix no data`
+
+This is its own tree, read by its own poll every `Period seconds`, so edits take effect within
+one period. Keys are seeded when absent and never overwritten.
+
+| key | default | meaning |
+|---|---|---|
+| `Enabled` | `y` | `n` switches the check off and resets a raised alarm (the CLI ignores it) |
+| `Period seconds` | 5 | how often it polls (1-15) |
+| `Scint path`, `Scint indices` | `/Equipment/WDScalers/Variables/S036`, `0 1 2 3 4` | the scintillators that must all fire. Disabled channels (-1) are left out |
+| `Scint min rate Hz` | 1000 | if any of them is below this, the beam counts as off and the poll is ignored |
+| `Max scaler age seconds` | 15 | older scaler rates count as no reading (scaler frontend down) |
+| `MuPix min rate Hz` | 1000 | MuPix hits/s below this count as no data |
+| `Bad seconds` | 30 | running time with no MuPix data before the alarm fires |
+| `Good seconds` | 10 | running time with MuPix data before a raised alarm resets |
+| `Max MuPix age seconds` | 15 | an older Quads RCNT counts as no data |
+| `Check Readout events` | `y` | also alarm when Readout sends no events |
+| `Stop sequencer after run` | `y` | press Stop after run on the PySequencer when it fires |
+| `RCNT path`, `RCNT rate index`, `RCNT count index` | `/Equipment/Quads/Variables/RCNT`, 5, 4 | the musip counters |
+| `Readout events path` | `/Equipment/Readout/Statistics/Events sent` | empty = skip the Readout check |
+| `FEB active path`, `FEB active index` | `/Equipment/Quads/Settings/DAQ/Links/FEBsActive`, 0 | empty = no FEB gate |
+| `Blocker path`, `Blocker index` | `/Equipment/EPICS/Variables/Measured`, 30 | 1 = open; empty = no blocker gate |
+| `Sequencer path` | `/PySequencer` | its ODB root |
+| `Alarm class` | `DAQ Alarm` | the class used when the alarm is first created |
+
+### For the shifter, when it fires
+
+1. The alarm text names the run and the cause:
+   - `0 Hz` or `3 hits`: no hits reach the switching board;
+   - `Readout sent 0 events`, `Readout stalled`, or `Readout not in this run`: MuPix and SMA
+     data are not being written. Check that the Readout program is running;
+   - `Quads RCNT not updated`: the Quads frontend is down.
+2. Check the Quads page (`HIT 0 RATE`, `HIT 0 CNT`, `FEB HIT 0 RATE`) and WDScalers (S1-S5).
+   If `FEB HIT 0 RATE` is in the MHz range, the chips are hitting but nothing reaches the
+   switching board.
+3. Call the MuPix/DAQ expert; past recoveries are in the elog. The sequencer stops by itself
+   after the current run.
+4. Once MuPix is back, queue again the run-DB config the stopped script used up, acknowledge
+   "End of Sequencer has been reached", and press **Start script** on the Sequencer page. The
+   alarm resets itself after `Good seconds` of good running, or you can reset it on the Alarms
+   page.
+5. For runs taken without MuPix on purpose, set `Enabled` = `n` (or deactivate FEB 0). Set it
+   back afterwards.
+
+### Manual path: `mdqm-mupix-no-data`
+
+The same check by hand, in the analyzer's Python environment:
+
+```bash
+mdqm-mupix-no-data -e bt2026 --once          # settings, what it sees now, the verdict, the cost
+mdqm-mupix-no-data -e bt2026 --watch         # the same state machine every Period seconds, raises nothing
+mdqm-mupix-no-data -e bt2026 --watch --live  # also raises/resets and stops; only while Enabled = n
+```
+
+Without the console script: `python -m mdqm.dqm.mupix_no_data ...`. The CLI ignores `Enabled`,
+and `--live` beside a running analyzer whose check is on would have two watchers fighting over
+one alarm.
+
 ## Settings: `/DQM/SMA`
 
 The analyzer re-reads the tree every 2 s (`analyzer.py:231-233`); edits take

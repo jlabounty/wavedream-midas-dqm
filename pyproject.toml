@@ -22,6 +22,7 @@ dev = ["pytest>=8", "pytest-benchmark>=4", "ruff>=0.5"]
 mdqm-analyzer = "mdqm.dqm.analyzer:main"
 mdqm-register-pages = "mdqm.install.register_pages:main"
 mdqm-sma-file = "mdqm.tools.sma_file:main"
+mdqm-mupix-no-data = "mdqm.dqm.mupix_no_data:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
