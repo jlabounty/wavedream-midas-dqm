@@ -589,16 +589,21 @@ def test_the_time_comparing_nim_flags_wait_for_the_time_base():
     assert codes(q.summary(True)) >= {"nim_missing", "nim_pairing", "nim_offset", "nim_lag"}
 
 
-def test_a_tot_channel_with_a_timestamp_fault_is_not_judged_for_pairing():
+def test_a_tot_channel_with_a_timestamp_fault_withholds_the_pairing():
     """S3: S4's TOT words fine/coarse inconsistent (a known timestamp fault):
-    its pair efficiency means nothing, so no nim_pairing for S4."""
+    its pair efficiency is withheld with the reason, and the mismatch flag (not
+    a second nim_pairing alarm blaming the NIM threshold) says the pairing
+    collapsed; nim_offset (which compares times) is not judged."""
     events = [ev() for _ in range(N_EV)]
     p = plugin()
     feed(p, frame(events, fine_lag={4: LAG}))
     s = p.summary(True)
     assert [f["ch"] for f in s["timestamp_faults"]["counters"]] == [4]
-    assert nim_row(s, "S4")["pair_eff"] == 0.0
+    r = nim_row(s, "S4")
+    assert r["pair_eff"] is None and "timestamp fault" in r["pair_eff_reason"]
     assert not [f for f in s["flags"] if f["code"] in ("nim_pairing", "nim_offset")]
+    mm = [f for f in s["flags"] if f["code"] == "mismatch" and "(ch 4)" in f["text"]]
+    assert mm and "pairing (S4 + S4L) collapses" in mm[0]["text"]
 
 
 def test_the_nim_counts_leave_the_summary_after_its_window():
@@ -626,8 +631,8 @@ def test_the_summary_keys_the_pages_read():
     assert set(s["nim"]["counters"][0]) == {
         "counter", "k", "ch", "nim_ch", "label", "nim_label", "tot_hits", "nim_hits",
         "tot_words", "nim_words", "paired", "tot_only", "nim_only", "echo", "lag_held",
-        "shadow", "multi", "frames", "pair_eff", "purity", "nim_only_frac", "median_dt_ns",
-        "dt_entries", "offset_ns", "echo_rule", "lag"}
+        "shadow", "multi", "frames", "eff_paired", "eff_tot_only", "pair_eff", "purity",
+        "nim_only_frac", "median_dt_ns", "dt_entries", "offset_ns", "echo_rule", "lag"}
     assert set(s["nim"]["counters"][0]["lag"]) == {
         "none", "ambiguous", "ok", "faulted", "skipped", "voted", "faulted_frac",
         "state_ok", "state_faulted", "state_faulted_frac", "state", "epoch_votes",

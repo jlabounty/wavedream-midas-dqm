@@ -1321,6 +1321,9 @@ function nimFlagsOf(s, r) {
  */
 function lagText(lg) {
   if (!lg) return "—";
+  // A coarse offset shown by the epoch vote: the lag vote pairs on equal
+  // coarse fields, i.e. with the wrong S1 word, and its lag means nothing.
+  if (lg.na) return `n/a: ${lg.na}`;
   const s0 = lg.state || lg.last_state;
   const st = s0 ? (s0 === "faulted" ? "FAULTED" : s0) : "no vote";
   const nst = (lg.state_ok || 0) + (lg.state_faulted || 0);
@@ -1401,8 +1404,16 @@ function renderNim(s) {
     put(0, `${r.label} (ch ${r.ch}) / ${r.nim_label} (ch ${r.nim_ch})`, "",
         `${num(r.tot_words)} TOT words, ${num(r.nim_words)} NIM words in the window` +
         (r.echo_rule ? `; echo rule on (${num(r.echo)} echo words)` : ""));
-    put(1, pct(r.pair_eff, 1), "", `paired / (paired + TOT-only): ${num(r.paired)} of ` +
-        `${num((r.paired || 0) + (r.tot_only || 0))} TOT words have a NIM copy`);
+    // Within the frames' coverage when a channel is epoch-repaired (eff_*):
+    // a TOT word whose partner lies in the next frame is left out.
+    const ep = r.eff_paired === undefined ? r.paired : r.eff_paired;
+    const et = r.eff_tot_only === undefined ? r.tot_only : r.eff_tot_only;
+    if ((r.pair_eff === null || r.pair_eff === undefined) && r.pair_eff_reason) {
+      put(1, "n/a", "dqm-sma-na", r.pair_eff_reason);
+    } else put(1, pct(r.pair_eff, 1), "", `paired / (paired + TOT-only): ${num(ep)} of ` +
+        `${num((ep || 0) + (et || 0))} TOT words have a NIM copy` +
+        (ep !== r.paired || et !== r.tot_only
+          ? " (TOT words inside the frames' coverage of the epoch-repaired channel only)" : ""));
     put(2, pct(r.purity, 1), "", `paired / NIM words: ${num(r.paired)} of ${num(r.nim_words)}`);
     put(3, pct(r.nim_only_frac, 1), "", `${num(r.nim_only)} NIM words without a TOT word, of the ` +
         (s.nim_merge ? "merged hits: what the merge adds"
@@ -2024,9 +2035,11 @@ function renderTable(s) {
       return { tr, tds };
     });
     const foot = el("div", { class: "dqm-footnote" }, "");
+    const repair = el("div", { class: "dqm-footnote dqm-sma-repair" }, "");
     holder.appendChild(t);
     holder.appendChild(foot);
-    state.table = { rows, foot };
+    holder.appendChild(repair);
+    state.table = { rows, foot, repair };
   }
 
   s.channels.forEach(function (c, i) {
@@ -2042,7 +2055,7 @@ function renderTable(s) {
     const nr = c.role === "nim" ? nimRow[c.ch] : null;
     if (nr) {
       const lg = nr.lag || {};
-      put(2, `${roleText(c, eff[c.ch])}${lg.last_state === "faulted" ? " · lag FAULTED" : ""}`, "role",
+      put(2, `${roleText(c, eff[c.ch])}${lg.last_state === "faulted" && !lg.na ? " · lag FAULTED" : ""}`, "role",
           "", `NIM copy of ${labelOf(c.pair_of)}; lag vote: ${lagText(lg)}`);
     } else {
       put(2, roleText(c, eff[c.ch]));
@@ -2056,6 +2069,9 @@ function renderTable(s) {
       // not a fault and must not read like one.
       put(6, `${pct(c.mismatch_frac, 1)} (not flagged)`, null, "dqm-sma-na",
           "Not judged: only S1, the counters and RF are checked for fine/coarse mismatch");
+    } else if (offsetVerdict(c)) {
+      const v = offsetVerdict(c);
+      put(6, v.cell, "mismatch", "", v.line);
     } else {
       put(6, pct(c.mismatch_frac, 1), "mismatch");
     }
@@ -2065,7 +2081,10 @@ function renderTable(s) {
     // analyzer declines to quote (a timestamp fault makes the window
     // meaningless) says n/a and why, inline and in full on hover.
     const e = eff[c.ch];
-    if (nr) {
+    if (nr && (nr.pair_eff === null || nr.pair_eff === undefined) && nr.pair_eff_reason) {
+      // Withheld: a timestamp fault on either channel of the pair.
+      put(8, "pair n/a (timestamp fault)", "eff", "dqm-sma-na", nr.pair_eff_reason);
+    } else if (nr) {
       // Not an efficiency given S1: the share of its counter's TOT words it pairs with.
       put(8, `pair ${pct(nr.pair_eff, 1)}`, "eff", "", "TOT + NIM pair efficiency: the share of " +
           `${labelOf(nr.ch)}'s TOT words with this NIM copy within ±${s.nim.pair_window_ns} ns`);
@@ -2086,6 +2105,90 @@ function renderTable(s) {
     `(${secs(s.covered_s !== undefined ? s.covered_s : s.span_s)} s in the window)` +
     (s.efficiency_kind ? ` · efficiency: ${s.efficiency_kind}` : "");
   if (state.table.foot.textContent !== foot) state.table.foot.textContent = foot;
+  renderRepair(s, state.table.repair);
+}
+
+const TIMES_TEXT = { ok: "times right", repaired: "times repaired", wrong: "times WRONG",
+                     unknown: "times unknown" };
+
+/** Why an epoch vote is undecided (the analyzer's repair.undecided), in words. */
+function undecidedText(rp) {
+  if (rp.undecided === "few") {
+    return `not enough S1 coincidences yet (${Math.max(0, Math.round(rp.excess || 0))} of ${rp.min_votes})`;
+  }
+  if (rp.undecided === "short") {
+    return `frames shorter than the coarse offset (${rp.frame_ms} ms vs ${rp.offset_ms} ms)`;
+  }
+  return "no whole-epoch shift brings its hits to S1";
+}
+
+/**
+ * A channel's coarse-offset verdict (the analyzer's kind "coarse_offset"):
+ * the mismatch cell's text and one line with its epoch vote, the evidence
+ * that the repair makes nothing up. Candidates are labelled by the correction
+ * they apply to the word times (−1: one epoch earlier), as the flags say it.
+ * null for any other channel.
+ */
+function offsetVerdict(c) {
+  if (!c || c.kind !== "coarse_offset") return null;
+  const o = c.offset_ticks;
+  const off = o === null || o === undefined ? "?" : `${o > 0 ? "+" : ""}${Math.round(o)} ticks`;
+  const times = TIMES_TEXT[c.times] || String(c.times);
+  const rp = c.repair;
+  let vote = "no nominal delay to S1 for this channel (NIM/lag nominal ns): its epochs are " +
+    "not voted on";
+  if (rp) {
+    const v = (rp.votes || []).map(([k, n, x, e]) =>
+      `${epochsText(k)}: ${kilo(n)} in / ${kilo(Math.round(x))} off of ${kilo(e)}`).join(" · ");
+    vote = `S1 coincidences per correction (in time / off time of words exposed): ${v || "none yet"}` +
+      (rp.correction === null || rp.correction === undefined
+        ? ` → undecided: ${undecidedText(rp)}`
+        : ` → ${epochsText(rp.correction)}; since then only its neighbours count`);
+  }
+  let moved = "";
+  if (rp && rp.moved) {
+    moved = `, ${pct(rp.moved_share, 1)} of hits moved ${epochsText(rp.moved_by)}`;
+  } else if (rp && rp.would_move) {
+    moved = `, ${pct(rp.would_move_share, 1)} of hits whole epochs off (not repaired)`;
+  }
+  const line = `${c.label} (ch ${c.ch}): coarse field ${off} from fine (R ${c.R}), ${times}` +
+    `${moved}. ${vote}`;
+  return { cell: `${pct(c.mismatch_frac, 1)} · coarse ${off} · ${times}`, line };
+}
+
+/** A correction in whole epochs as the flags say it: "−1 epoch", "0 epochs", "+2 epochs". */
+function epochsText(k) {
+  return `${signed(k)} epoch${Math.abs(k) === 1 ? "" : "s"}`;
+}
+
+/** Under the table: the epoch repair's switch and each coarse-offset channel's vote. */
+function renderRepair(s, holder) {
+  if (!holder) return;
+  const lines = (s.channels || []).map(offsetVerdict).filter(Boolean).map((v) => v.line);
+  const er = s.epoch_repair;
+  if (lines.length && er) {
+    lines.unshift(`Epoch repair (Cuts/epoch repair) ${er.enabled ? "on" : "OFF"}: a channel ` +
+      "whose coarse field is offset from its fine field gets its times moved by whole 2^20 ns " +
+      "epochs, chosen by its S1 coincidences in time against an off-time sideband (words " +
+      "whose moved time falls inside the frame only).");
+  }
+  const text = lines.join("\n");
+  if (holder.getAttribute("data-text") === text) return;
+  holder.setAttribute("data-text", text);
+  holder.innerHTML = "";
+  for (const l of lines) holder.appendChild(el("div", {}, l));
+}
+
+function kilo(n) {
+  if (n === null || n === undefined) return "—";
+  for (const [d, u] of [[1e6, "M"], [1e3, "k"]]) {
+    if (n >= d) return `${(n / d).toFixed(n / d < 10 ? 1 : 0)}${u}`;
+  }
+  return String(n);
+}
+
+function signed(k) {
+  return k > 0 ? `+${k}` : k < 0 ? `−${-k}` : "0";
 }
 
 function setCell(td, text, cls, title) {

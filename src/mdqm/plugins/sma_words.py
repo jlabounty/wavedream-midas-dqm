@@ -58,6 +58,7 @@ Conventions
 
 from __future__ import annotations
 
+import math
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import NamedTuple
@@ -964,6 +965,752 @@ def mupix_pairs(t_s1, t_pix, lo_ns, hi_ns, max_pairs=MAX_MUPIX_PAIRS, with_index
 
 
 # ==============================================================================
+# Epoch repair: a coarse field offset from its fine field
+# ==============================================================================
+#
+# A word's time takes only the 2^20 ns epoch from the coarse field
+# (:func:`time_of`). When an input's coarse counter runs ahead of (or behind)
+# its fine field by O, its words stay right while |O| < 2^19 ns and land one or
+# more whole epochs off beyond. Per word the right time is then
+# ``fine + 2^20 * round((D - O) / 2^20)`` with ``D = (coarse << shift) - fine``
+# (:func:`apply_epoch_repair`). O modulo 2^20 is the circular mean of D over a
+# frame's words of the channel; the whole epochs in O cannot come from the
+# fields at all, so they are voted on (:func:`epoch_votes`): per candidate, how
+# many of the channel's words have an S1 hit at the channel's nominal delay
+# (in time), against the same count in an off-time sideband, among the words
+# whose candidate time lies inside the frame's S1 hits (exposed). The vote runs
+# over the frames of a run (:class:`EpochRepair`), since a quiet frame has too
+# few coincidences to decide alone. Every correction is a whole number of epochs
+# and every word keeps its own fine time; the S1 coincidences only choose the
+# epochs, they are not made: a word without an S1 partner moves by the same O.
+#
+# The board files a word by its coarse time, so a channel offset by O carries
+# the words of [first - O, last - O] of its frame. The candidate with the right
+# epochs puts them there, which is outside the frame's S1 hits when the frame
+# is shorter than |O|: such a candidate has no exposure, gets no votes, and the
+# channel stays undecided ("frames shorter than the coarse offset") rather
+# than taking the accidentals of a wrong candidate that lands inside the frame.
+#
+# Reference: ``psm-analysis-josh-2026/sma-afterpulse/raw_override.py``
+# (``coarse_minus_fine``, ``epoch_repair``), which votes once per subrun file.
+
+#: The whole epochs (2^20 ns) the S1 vote chooses among, around the channel's
+#: unwrapped circular mean of D. Shown as the correction each applies to the
+#: word times (:func:`epoch_correction`), not by this index.
+EPOCH_CANDIDATES = tuple(range(-4, 5))
+#: Words of a channel per frame given the S1 vote, at most (evenly spread):
+#: bounds the cost of a dense frame. The thresholds count these votes. Once a
+#: channel's vote is decided, its frames only keep the neighbours in view and
+#: use fewer.
+EPOCH_VOTE_MAX_WORDS = 2000
+EPOCH_MONITOR_MAX_WORDS = 500
+#: A decided channel whose offset is within EPOCH_MIN_OFFSET_TICKS of 0 and
+#: whose words are mostly consistent (a healthy one) is voted on in one frame of
+#: this many, on at most EPOCH_QUIET_MAX_WORDS words: it stays in view (an
+#: offset of a whole epoch, or a slip by one, looks healthy in the fields) at a
+#: fraction of the cost. Measured on a slip of a simulated healthy channel at
+#: 1 MHz: one frame of 4 on 200 words repairs it after 6-13 frames and counts at
+#: most the 1-3 frames before the first voted one in the efficiency (0.36 ms a
+#: dense frame for 7 channels); every frame on 50 words, 6-8 frames and none
+#: (0.67 ms).
+EPOCH_MONITOR_EVERY = 4
+EPOCH_QUIET_MAX_WORDS = 200
+#: The recent votes: each voted frame multiplies them by this before adding its
+#: own (about the last 1 / (1 - decay) voted frames count). When they decide on
+#: another candidate than the run's votes (with EPOCH_WINDOW_MIN_VOTES), the
+#: channel has slipped by whole epochs: the run's votes are replaced by them
+#: (a resync). While their leader disagrees with the run's winner, the
+#: channel's times are not known to be right.
+EPOCH_WINDOW_DECAY = 0.8
+EPOCH_WINDOW_MIN_VOTES = 50
+#: A frame's own votes (or the recent ones) say "another epoch" (the frame
+#: counts in no efficiency) only when the run's winner has at least this many
+#: exposed words in them too (a short frame can leave it out) and the other
+#: candidate leads it, clear of its sideband, by at least
+#: EPOCH_LEAN_MIN_EXCESS in excess.
+EPOCH_FRAME_MIN_EXPOSURE = 20
+EPOCH_LEAN_MIN_EXCESS = 10
+#: The off-time sideband: S1 hits between these after the in-time window's
+#: nominal delay (an S1 hit 200-700 ns before the nominal partner time),
+#: scaled to the in-time window's width. Accidentals only.
+EPOCH_SIDEBAND_NS = (200, 700)
+#: A candidate decides only with its excess at least this many standard
+#: deviations of its scaled off-time count (Poisson, from the raw count) and its
+#: in-time count at least EPOCH_SIDEBAND_RATIO times the scaled off time:
+#: accidentals give a ratio of about 1, a channel whose words are mostly
+#: unrelated to S1 (high rate, low purity) a few but a large excess.
+EPOCH_SIDEBAND_SIGMA = 5.0
+EPOCH_SIDEBAND_RATIO = 3.0
+#: A candidate with fewer exposed words than this does not compete (its rate of
+#: excess per word means nothing yet).
+EPOCH_MIN_EXPOSURE = 50
+#: A frame measures a channel's offset (its circular mean and R) only with at
+#: least this many words of it; a sparser frame takes the run's offset.
+EPOCH_MIN_WORDS = 20
+#: A channel whose share of fine/coarse inconsistent words is at least this, or
+#: whose offset is more than EPOCH_MIN_OFFSET_TICKS from 0, has suspect times:
+#: its frames count in no efficiency until the vote has decided (a healthy
+#: channel is below 1 %, a coarse offset of a few ticks or more near 100 %).
+EPOCH_START_MISMATCH = 0.5
+#: An offset within this many coarse ticks (2^shift ns) of 0 is a word latched
+#: a tick or two apart, not a fault: nothing is repaired.
+EPOCH_MIN_OFFSET_TICKS = 2
+#: A frame's circular mean further than this (coarse ticks) from the run's is
+#: a jump; two measuring frames in a row with the same jump are a
+#: resynchronisation and the vote starts again. The offset varies by a few
+#: ticks from frame to frame with the rate.
+EPOCH_JUMP_TICKS = 8
+#: Only frames with this many words of the channel test for a jump (a short
+#: frame's mean scatters more).
+EPOCH_JUMP_MIN_WORDS = 200
+#: The run's offset follows the measuring frames, each weighted n / (n + this).
+EPOCH_REF_WORDS = 4000
+#: The repair is defined from this shift up (time_of agrees with the reco's
+#: there, and the ticks are what the fine_coarse_diff histogram shows).
+EPOCH_MIN_SHIFT = 12
+#: Only words in the offset's cluster are repaired: D within this many circular
+#: standard deviations of O (from the run's R), and never less than
+#: EPOCH_CLUSTER_MIN_TICKS. A lone word far from the cluster (a corrupted
+#: word, no S1 partner at either time) keeps the time of :func:`time_of`.
+EPOCH_CLUSTER_SD = 5.0
+EPOCH_CLUSTER_MIN_TICKS = 8
+#: "frames shorter than the offset" is said only when an unexposed candidate
+#: is within this many epochs of zero (offsets seen so far are under two): in a
+#: few-ms frame the candidates three or four epochs away are always unexposed.
+EPOCH_SHORT_MAX_EPOCHS = 2.5
+#: The undecided reasons (:class:`EpochDecision`): too few votes yet, the
+#: frames shorter than the offset (a candidate unexposed), no candidate above
+#: its sideband.
+EPOCH_REASONS = ("few", "short", "no signal")
+
+
+def coarse_minus_fine(coarse, fine, shift=DEFAULT_SHIFT) -> np.ndarray:
+    """``D = (coarse << shift) - fine`` per word (int64): the epoch :func:`time_of`
+    takes is ``round(D / 2^20)``; on a healthy word ``D mod 2^20`` lies within a
+    coarse tick of 0."""
+    return (np.asarray(coarse, dtype=np.int64) << int(shift)) - np.asarray(fine, dtype=np.int64)
+
+
+def circ_mean_R(D, period=FINE_WRAP_NS) -> tuple[float, float]:
+    """``(mean, R)``: the circular mean of ``D`` modulo ``period``, in [0, period),
+    and the resultant length R in [0, 1] (1: all equal; ~0: spread evenly).
+    ``(nan, 0.0)`` for no values. Exact, per value; the plugin uses the binned
+    :func:`residue_sums`."""
+    d = np.asarray(D, dtype=np.int64)
+    if d.size == 0:
+        return float("nan"), 0.0
+    ang = (2 * np.pi / period) * (d % period).astype(np.float64)
+    c, s = float(np.cos(ang).mean()), float(np.sin(ang).mean())
+    return float((math.atan2(s, c) / (2 * np.pi)) % 1.0 * period), float(math.hypot(c, s))
+
+
+def residue_sums(ch, D, shift=DEFAULT_SHIFT, n_channels=N_CHANNELS) -> np.ndarray:
+    """Per channel ``[n, sum cos, sum sin]`` of ``D mod 2^20`` on the 2^20 circle
+    (float64, ``(n_channels, 3)``), each value taken at the centre of its
+    coarse tick (2^shift ns): one bincount, no trigonometry per word. Sums add
+    over frames; :func:`circ_of_sums` turns them into a mean and R."""
+    s = int(shift)
+    nb = 1 << shared_bits(s)
+    b = (np.asarray(D, dtype=np.int64) & np.int64(FINE_WRAP_NS - 1)) >> np.int64(s)
+    flat = np.asarray(ch, dtype=np.int64) * nb + b
+    cnt = np.bincount(flat, minlength=n_channels * nb)[:n_channels * nb].reshape(n_channels, nb)
+    ang = (2 * np.pi / nb) * (np.arange(nb) + 0.5)
+    out = np.empty((n_channels, 3), dtype=np.float64)
+    out[:, 0] = cnt.sum(axis=1)
+    out[:, 1] = cnt @ np.cos(ang)
+    out[:, 2] = cnt @ np.sin(ang)
+    return out
+
+
+def circ_of_sums(sums) -> tuple[np.ndarray, np.ndarray]:
+    """``(mean, R)`` per row of :func:`residue_sums` (summed or not): the mean as
+    a signed offset in [-2^19, 2^19) ns, NaN and 0 for a row without values."""
+    s = np.asarray(sums, dtype=np.float64).reshape(-1, 3)
+    n = s[:, 0]
+    with np.errstate(invalid="ignore", divide="ignore"):
+        R = np.where(n > 0, np.hypot(s[:, 1], s[:, 2]) / n, 0.0)
+        mean = np.where(n > 0, np.arctan2(s[:, 2], s[:, 1]) / (2 * np.pi) * FINE_WRAP_NS, np.nan)
+    return mean, R
+
+
+def epoch_correction(offset_ns) -> int:
+    """The whole epochs an offset O moves a word at its centre by: ``-round(O / 2^20)``,
+    half up (``floor(x + 1/2)``, as the pages round). -1: one epoch earlier."""
+    return -int(math.floor(float(offset_ns) / FINE_WRAP_NS + 0.5))
+
+
+def apply_epoch_repair(fine, D, offset_ns, width_ns=None) -> np.ndarray:
+    """``fine + 2^20 * round((D - O) / 2^20)``, masked to 2^40 ns (int64; round
+    half up, as :func:`time_of`, which is the case O = 0).
+
+    ``width_ns``: only words whose D lies within this of O on the 2^20 circle
+    are repaired; the others get :func:`time_of`'s time (None: every word).
+    """
+    f = np.asarray(fine, dtype=np.int64)
+    d = np.asarray(D, dtype=np.int64)
+    off = np.int64(offset_ns)
+    if width_ns is not None:
+        off = np.where(np.abs(wrap_signed(d - off, FINE_BITS)) <= width_ns, off, np.int64(0))
+    k = (d - off + (FINE_WRAP_NS >> 1)) >> FINE_BITS
+    return (f + (k << FINE_BITS)) & np.int64(TIME_WRAP_NS - 1)
+
+
+def cluster_width_ns(R, shift=DEFAULT_SHIFT) -> int:
+    """The half width of an offset's cluster (:func:`apply_epoch_repair`'s
+    ``width_ns``): EPOCH_CLUSTER_SD circular standard deviations ``sqrt(-2 ln R)``
+    of the residues, at least EPOCH_CLUSTER_MIN_TICKS ticks, at most half an
+    epoch (every word)."""
+    r = min(max(float(R), 1e-6), 1.0)
+    sd = math.sqrt(-2.0 * math.log(r)) / (2 * math.pi) * FINE_WRAP_NS
+    w = max(EPOCH_CLUSTER_SD * sd, EPOCH_CLUSTER_MIN_TICKS * (1 << int(shift)))
+    return int(min(w, FINE_WRAP_NS >> 1))
+
+
+def sideband_scale(tol_ns, sideband=EPOCH_SIDEBAND_NS) -> float:
+    """The off-time count's factor to the in-time window's width (2 tol)."""
+    return 2.0 * float(tol_ns) / float(sideband[1] - sideband[0])
+
+
+def main_cluster(t_sorted, gap_ns=STALE_GAP_NS) -> np.ndarray:
+    """The run of ascending times holding the median, split at gaps over ``gap_ns``
+    (stale words of an earlier run do not stretch the frame)."""
+    t = np.asarray(t_sorted, dtype=np.int64)
+    if t.size < 2:
+        return t
+    cut = np.flatnonzero(np.diff(t) > gap_ns) + 1
+    if not cut.size:
+        return t
+    bounds = np.r_[0, cut, t.size]
+    k = int(np.searchsorted(cut, (t.size - 1) // 2, side="right"))
+    return t[bounds[k]:bounds[k + 1]]
+
+
+def prepare_s1(s1_sorted, bits=TIME_BITS) -> np.ndarray:
+    """S1 times unwrapped around their median and ascending (:func:`epoch_votes`)."""
+    s1 = np.asarray(s1_sorted, dtype=np.int64)
+    if s1.size < 2:
+        return s1
+    s1 = unwrap_near(s1, int(s1[(s1.size - 1) // 2]), bits)
+    if np.any(s1[1:] < s1[:-1]):                    # across the wrap only
+        s1 = np.sort(s1)
+    return s1
+
+
+def epoch_votes(t, s1_sorted, delay_ns, tol_ns, ks=EPOCH_CANDIDATES, bits=TIME_BITS,
+                sideband=EPOCH_SIDEBAND_NS, prepared=False) -> np.ndarray:
+    """``(3, len(ks))`` int64: per candidate k in ``ks``, for the times
+    ``x = t - k * 2^20 - delay`` (``t``: a channel's words repaired with the
+    k = 0 offset, :func:`apply_epoch_repair`):
+
+    * row 0, in time: the exposed x with an S1 hit within +-``tol_ns``;
+    * row 1, off time: the S1 hits in [x - sideband[1], x - sideband[0]) summed
+      over the exposed x (scale with :func:`sideband_scale`);
+    * row 2, exposure: the x whose in-time and off-time windows lie inside the
+      S1 hits' extent (``s1_sorted``, ascending, this frame's): only these vote,
+      so a candidate that puts the words outside the frame counts nothing.
+
+    Both sides are unwrapped around the S1 median first, so a frame across the
+    2^40 wrap votes too (``prepared``: ``s1_sorted`` already is, as
+    :func:`prepare_s1` makes it once per frame)."""
+    t = np.asarray(t, dtype=np.int64)
+    s1 = np.asarray(s1_sorted, dtype=np.int64)
+    out = np.zeros((3, len(ks)), dtype=np.int64)
+    if t.size == 0 or s1.size < 2:
+        return out
+    ref = int(s1[(s1.size - 1) // 2])
+    if not prepared:
+        s1 = prepare_s1(s1, bits)
+    x0 = unwrap_near(t, ref, bits) - np.int64(int(round(delay_ns)))
+    tol = float(tol_ns)
+    sb_lo, sb_hi = int(sideband[0]), int(sideband[1])
+    lo_lim, hi_lim = int(s1[0]) + sb_hi, int(s1[-1]) - tol
+    # Every candidate at once: x per (candidate, word), the exposed ones kept
+    # with their candidate's row.
+    x = x0[None, :] - (np.asarray(ks, dtype=np.int64)[:, None] << FINE_BITS)
+    m = (x >= lo_lim) & (x <= hi_lim)
+    row = np.broadcast_to(np.arange(len(ks))[:, None], x.shape)[m]
+    x = x[m]
+    if not x.size:
+        return out
+    i = np.searchsorted(s1, x)
+    hi = np.minimum(i, s1.size - 1)
+    lo = np.maximum(i - 1, 0)
+    near = np.minimum(np.abs(s1[hi] - x), np.abs(x - s1[lo])) <= tol
+    off = np.searchsorted(s1, x - sb_lo) - np.searchsorted(s1, x - sb_hi)
+    n = len(ks)
+    out[0] = np.bincount(row[near], minlength=n)[:n]
+    out[1] = np.bincount(row, weights=off, minlength=n)[:n].astype(np.int64)
+    out[2] = np.bincount(row, minlength=n)[:n]
+    return out
+
+
+class EpochDecision(NamedTuple):
+    """:func:`decide_epoch`: the winner (its index, None: undecided) and why."""
+
+    index: int | None
+    #: The best candidate's in-time count, its scaled off-time count, their
+    #: difference (the excess) and its exposed words.
+    inn: int = 0
+    off: float = 0.0
+    excess: float = 0.0
+    exposure: int = 0
+    #: The runner-up's excess per exposed word, times the best one's exposure.
+    runner_up: float = 0.0
+    #: "" when decided, else one of EPOCH_REASONS.
+    reason: str = "few"
+    #: The best candidate's index whatever the verdict (None: none exposed),
+    #: and whether it is clear of its own sideband (EPOCH_SIDEBAND_SIGMA,
+    #: EPOCH_SIDEBAND_RATIO).
+    best: int | None = None
+    side: bool = False
+
+    @property
+    def leader(self) -> int | None:
+        """The best candidate when it is clear of its sideband (whatever its
+        margin over the runner-up and its count); else None."""
+        return self.best if self.side else None
+
+
+def decide_epoch(votes, min_votes, min_margin, scale, min_exposure=EPOCH_MIN_EXPOSURE,
+                 offsets=None) -> EpochDecision:
+    """The vote's verdict on ``votes`` (:func:`epoch_votes` rows, summed).
+
+    Candidates with at least ``min_exposure`` exposed words compete on their
+    excess per exposed word (in time less the scaled off time). The best one
+    decides when its excess is at least ``min_votes`` and at least
+    EPOCH_SIDEBAND_SIGMA standard deviations of the scaled off-time count, its
+    in-time count at least EPOCH_SIDEBAND_RATIO times its scaled off-time
+    count, and its excess per word above, and at least ``min_margin`` times,
+    the runner-up's. A tie
+    never decides. Otherwise the reason is "few" (the best one is clear of its
+    sideband but has fewer than ``min_votes``, or nothing is exposed enough
+    yet), "short" (a candidate is unexposed: the frames may be shorter than
+    the offset; with ``offsets``, the candidates' offsets O in ns, only one
+    within EPOCH_SHORT_MAX_EPOCHS of zero counts) or "no signal".
+    """
+    v = np.asarray(votes, dtype=np.float64).reshape(3, -1)
+    inn, sb, exp = v[0], v[1] * float(scale), v[2]
+    sig = np.sqrt(np.maximum(v[1], 0.0)) * float(scale)
+    exc = inn - sb
+    ok = exp >= min_exposure
+    if not ok.any():
+        return EpochDecision(None, reason="few")
+    rate = np.where(ok, exc / np.maximum(exp, 1.0), -np.inf)
+    order = np.argsort(rate, kind="stable")
+    i = int(order[-1])
+    r2 = float(rate[order[-2]]) if int(ok.sum()) > 1 else 0.0
+    r2 = max(r2, 0.0)
+    side = (inn[i] > 0 and inn[i] >= EPOCH_SIDEBAND_RATIO * sb[i]
+            and exc[i] >= EPOCH_SIDEBAND_SIGMA * sig[i])
+    clear = side and rate[i] > r2 and rate[i] >= min_margin * r2
+    d = dict(inn=int(inn[i]), off=float(sb[i]), excess=float(exc[i]), exposure=int(exp[i]),
+             runner_up=float(r2 * exp[i]), best=i, side=bool(side))
+    if clear and exc[i] >= min_votes:
+        return EpochDecision(i, reason="", **d)
+    if clear:
+        return EpochDecision(None, reason="few", **d)
+    unexposed = ~ok
+    if offsets is not None:
+        unexposed &= np.abs(np.asarray(offsets, dtype=np.float64)) \
+            < EPOCH_SHORT_MAX_EPOCHS * FINE_WRAP_NS
+    return EpochDecision(None, reason="short" if unexposed.any() else "no signal", **d)
+
+
+def _leads(votes, winner: int, ks, scale, min_exposure) -> bool:
+    """``winner`` has the highest excess per exposed word among the candidates
+    ``ks`` that have ``min_exposure`` (or none of the others has any): a quick
+    test that :func:`decide_epoch` would not lean elsewhere."""
+    v = votes[:, list(ks)].tolist()
+    best, rate_w = None, None
+    for j, k in enumerate(ks):
+        n_in, n_off, n_exp = v[0][j], v[1][j], v[2][j]
+        r = (n_in - n_off * scale) / n_exp if n_exp >= min_exposure else None
+        if k == winner:
+            rate_w = r
+        elif r is not None and (best is None or r > best):
+            best = r
+    return best is None or (rate_w is not None and rate_w > best)
+
+
+def _no_votes() -> np.ndarray:
+    return np.zeros((3, len(EPOCH_CANDIDATES)), dtype=np.int64)
+
+
+#: A frame's votes when it was not voted on (shared, read-only).
+_NONE = _no_votes()
+_NONE.flags.writeable = False
+
+
+@dataclass
+class EpochState:
+    """One channel's epoch vote over a run (:class:`EpochRepair`)."""
+
+    #: The run's offset: the circular mean of D, unwrapped (ns, float); the
+    #: candidates' labels k are relative to it, so they stay put when the mean
+    #: crosses the 0/2^20 boundary.
+    ref: float
+    #: In time, off time, exposure per EPOCH_CANDIDATES entry since the run start
+    #: or the last resync (:func:`epoch_votes`).
+    votes: np.ndarray = field(default_factory=_no_votes)
+    #: R of the measuring frames, weighted as ``ref`` is.
+    R: float = 1.0
+    #: A first jump frame's mean, waiting for the next measuring frame.
+    pending: float | None = None
+    frames: int = 0
+    #: The S1 extent of the last measuring frame (ns).
+    span: int = 0
+    #: Frames to pass before the next vote of a healthy-looking channel.
+    skip: int = 0
+    decision: EpochDecision = field(default_factory=lambda: EpochDecision(None))
+    #: The last voted frame's recent votes leaned to another epoch.
+    disagree: bool = False
+    #: The run's votes have decided at least once since the run start.
+    ever: bool = False
+    #: The recent votes (EPOCH_WINDOW_DECAY), float.
+    window: np.ndarray = field(default_factory=lambda: _no_votes().astype(np.float64))
+
+
+@dataclass
+class ChannelEpoch:
+    """One channel in one frame (:meth:`EpochRepair.plan`)."""
+
+    ch: int
+    n: int                      # words of the channel in the frame
+    mismatch: float             # their fine/coarse inconsistent share
+    measured: bool              # n >= EPOCH_MIN_WORDS: mean and R from this frame
+    u: float                    # the offset used (ns, unwrapped): this frame's or the run's
+    R: float                    # this frame's R (the run's when not measured)
+    R_run: float                # the run's R with this frame's: what the repair needs
+    jump: bool                  # a jump: voted alone, nothing committed but the jump
+    resync: bool                # a confirmed jump: the vote starts again from this frame
+    voted: bool                 # the frame's words were voted on
+    ks: tuple                   # the candidate indices voted in this frame
+    frame_votes: np.ndarray     # (3, n candidates): this frame's (0 where not voted)
+    votes: np.ndarray           # the run's votes with this frame's
+    decision: EpochDecision
+    k: int | None               # the decided candidate (EPOCH_CANDIDATES value)
+    offset_ns: int | None       # u + k * 2^20 when decided
+    correction: int | None      # epoch_correction(offset_ns)
+    repair: bool                # this frame's words of the channel are repaired
+    suspect: bool               # the fields say the times may be off (see EPOCH_START_MISMATCH)
+    far: bool                   # decided at half an epoch or more
+    would_move: int             # words a repair would move but did not (off, or R low)
+    span: int                   # this frame's S1 extent (ns)
+    #: The recent votes with this frame's, and what they say: ``slip``, they
+    #: decided another candidate (a whole-epoch slip: the run's votes take
+    #: theirs); ``disagree``, their leader is not the run's winner.
+    window: np.ndarray | None = None
+    slip: bool = False
+    disagree: bool = False
+
+    @property
+    def bad_times(self) -> bool:
+        """The channel's times in this frame are not known to be right: suspect
+        and undecided, decided whole epochs off and not repaired, or the recent
+        votes lean to another epoch than the run's."""
+        return (self.suspect and self.k is None) or (not self.repair and self.would_move > 0) \
+            or (self.far and not self.repair) or self.disagree
+
+
+@dataclass
+class EpochPlan:
+    """:meth:`EpochRepair.plan` of one frame: commit it (:meth:`EpochRepair.commit`)
+    only for a frame whose words are this run's (a good frame)."""
+
+    #: Per channel [n, sum cos, sum sin] of D (:func:`residue_sums`), every channel.
+    residue: np.ndarray
+    channels: dict = field(default_factory=dict)        # ch -> ChannelEpoch
+    #: The channels repaired: ch -> (O ns, cluster half width ns), as
+    #: :func:`prepare_frame`'s ``repair`` takes them.
+    offsets: dict = field(default_factory=dict)
+
+
+class EpochRepair:
+    """The epoch vote of a run, and which channels' times a frame repairs.
+
+    ``delays``: channel -> its nominal delay after S1 (ns); only these channels
+    are candidates (S1 itself never is). ``enabled`` False still votes and
+    reports (the plan says what a repair would do, and how many words it would
+    move) but repairs nothing. Per candidate channel and frame (:meth:`plan`):
+
+    * its words' D (:func:`coarse_minus_fine`) give the circular mean u and R;
+      a frame with fewer than EPOCH_MIN_WORDS of them takes the run's mean.
+      The mean is unwrapped next to the run's, so the labels k keep meaning
+      the same epochs.
+    * Every candidate channel is voted on from its first words in the run on,
+      whatever its fields say: an offset of a whole epoch leaves the fields
+      consistent and shows only in the S1 coincidences. Every candidate k
+      (EPOCH_CANDIDATES) gets a vote (:func:`epoch_votes`) until one is decided
+      (:func:`decide_epoch` with ``min_votes`` and ``min_margin``, on the run's
+      votes plus this frame's), then only k* - 1, k*, k* + 1, on at most
+      EPOCH_MONITOR_MAX_WORDS words: the neighbours stay in view as the
+      evidence that the choice is not made up. A decided channel that looks
+      healthy is voted on in one frame of EPOCH_MONITOR_EVERY, on at most
+      EPOCH_QUIET_MAX_WORDS words.
+    * The recent votes (decayed by EPOCH_WINDOW_DECAY per voted frame) are
+      judged too: deciding another candidate is a whole-epoch slip (a resync:
+      the run's votes become the recent ones), and while their leader, or the
+      frame's own, disagrees with the run's winner the channel's frames count
+      in no efficiency.
+    * The frame is repaired with O = u + k* 2^20 when decided, the run's R
+      (frames weighted by their words, this one included) >= ``min_R`` and
+      |O| > EPOCH_MIN_OFFSET_TICKS: undecided or below that, its times are
+      those of :func:`time_of`, unchanged. Only the words in O's cluster are
+      repaired (:func:`cluster_width_ns`).
+    * A measuring frame (>= EPOCH_JUMP_MIN_WORDS words) whose mean is more
+      than EPOCH_JUMP_TICKS from the run's is a jump: it votes on its own
+      words alone, is repaired only if that vote decides, and commits nothing.
+      The next one with the same jump confirms a resync (the board was
+      resynchronised): the channel's votes start again from it.
+
+    The state changes only in :meth:`commit`; :meth:`reset` at a run start or
+    a settings rebuild.
+    """
+
+    def __init__(self, delays: dict | None = None, s1: int = 1, shift: int = DEFAULT_SHIFT,
+                 tol_ns: float = 5.0, min_votes: int = 200, min_margin: float = 5.0,
+                 min_R: float = 0.6, enabled: bool = True):
+        self.delays = {int(c): float(v) for c, v in (delays or {}).items() if int(c) != int(s1)}
+        self.s1 = int(s1)
+        self.shift = int(shift)
+        self.tol_ns = float(tol_ns)
+        self.min_votes = int(min_votes)
+        self.min_margin = float(min_margin)
+        self.min_R = float(min_R)
+        self.enabled = bool(enabled)
+        self.scale = sideband_scale(self.tol_ns)
+        self.states: dict[int, EpochState] = {}
+        #: Confirmed resyncs since the last reset, per channel.
+        self.resyncs: dict[int, int] = {}
+
+    @property
+    def active(self) -> bool:
+        return bool(self.delays) and self.shift >= EPOCH_MIN_SHIFT
+
+    def reset(self) -> None:
+        self.states = {}
+        self.resyncs = {}
+
+    def decide(self, votes, u: float = 0.0) -> EpochDecision:
+        """`decide_epoch` on ``votes``; ``u`` the unwrapped mean the candidates
+        are labelled around."""
+        offs = [u + (k << FINE_BITS) for k in EPOCH_CANDIDATES]
+        return decide_epoch(votes, self.min_votes, self.min_margin, self.scale, offsets=offs)
+
+    def decision(self, ch: int) -> EpochDecision:
+        """Channel ``ch``'s decision on its run votes (undecided without a vote)."""
+        st = self.states.get(int(ch))
+        return EpochDecision(None) if st is None else st.decision
+
+    def offset_of(self, ch: int) -> int | None:
+        """The offset O (ns) channel ``ch``'s vote has decided, None if undecided."""
+        st = self.states.get(int(ch))
+        if st is None or st.decision.index is None:
+            return None
+        return int(round(st.ref + (EPOCH_CANDIDATES[st.decision.index] << FINE_BITS)))
+
+    def unexposed_offset(self, ch: int, votes=None, u=None) -> int | None:
+        """The smallest |O| (ns) among the candidates of channel ``ch`` that have
+        no exposure worth the name (the frames are shorter than it)."""
+        st = self.states.get(int(ch))
+        if votes is None:
+            if st is None:
+                return None
+            votes, u = st.votes, st.ref
+        exp = np.asarray(votes)[2]
+        offs = [abs(u + (k << FINE_BITS)) for j, k in enumerate(EPOCH_CANDIDATES)
+                if exp[j] < EPOCH_MIN_EXPOSURE
+                and abs(u + (k << FINE_BITS)) < EPOCH_SHORT_MAX_EPOCHS * FINE_WRAP_NS]
+        return int(min(offs)) if offs else None
+
+    @staticmethod
+    def _leans(dec: EpochDecision, votes, winner: int, min_exposure: int) -> bool:
+        """``votes`` lean to another candidate than ``winner``: their best one,
+        clear of its sideband with at least EPOCH_LEAN_MIN_EXCESS in excess,
+        while the winner was exposed in them."""
+        return (dec.leader is not None and dec.leader != winner
+                and dec.excess >= EPOCH_LEAN_MIN_EXCESS
+                and votes[2, winner] >= min_exposure)
+
+    def plan(self, d: dict) -> EpochPlan:
+        """This frame's per-channel offsets, votes and decisions, the state untouched.
+
+        ``d``: the decoded frame (:func:`decode`, stream order) with ``consistent``
+        (bool per word) added.
+        """
+        ch, fine, coarse = d["ch"], d["fine"], d["coarse"]
+        D = coarse_minus_fine(coarse, fine, self.shift)
+        plan = EpochPlan(residue=residue_sums(ch, D, self.shift))
+        if not self.active or ch.size == 0:
+            return plan
+        tick = 1 << self.shift
+        half = FINE_WRAP_NS >> 1
+        mean, R = circ_of_sums(plan.residue)
+        n_ch = plan.residue[:, 0]
+        bad = np.bincount(ch[~d["consistent"]].astype(np.intp), minlength=N_CHANNELS)[:N_CHANNELS]
+        s1 = None                   # the frame's S1 hits, sorted: only when voting
+        span = 0
+        nk = len(EPOCH_CANDIDATES)
+        for c, delay in self.delays.items():
+            n = int(n_ch[c])
+            st = self.states.get(c)
+            if n == 0 and st is None:
+                continue
+            measured = n >= EPOCH_MIN_WORDS
+            mism = float(bad[c] / n) if n else 0.0
+            r = float(R[c])
+            jump = resync = False
+            if st is None:
+                u, r_run = float(mean[c]), r
+            elif not n:
+                u, r, r_run = st.ref, st.R, st.R
+            else:
+                u = st.ref + ((mean[c] - st.ref + half) % FINE_WRAP_NS - half)
+                w = n / (n + EPOCH_REF_WORDS)
+                r_run = st.R + w * (r - st.R)
+                if not measured:
+                    u, r = st.ref, st.R
+                jump = (n >= EPOCH_JUMP_MIN_WORDS
+                        and abs(u - st.ref) > EPOCH_JUMP_TICKS * tick)
+                if (jump and st.pending is not None
+                        and abs(u - st.pending) <= EPOCH_JUMP_TICKS * tick):
+                    # The second jump frame in a row: a resync. The labels
+                    # restart around the new mean, signed.
+                    u, r_run, jump, resync = float(mean[c]), r, False, True
+            # A new vote (the first frame, a resync) and a jump frame vote on
+            # their own words alone: a jump frame may be either a resync not
+            # confirmed yet or an outlier, and its own S1 coincidences say
+            # which epochs it holds.
+            alone = st is None or jump or resync
+            base = _no_votes() if alone else st.votes
+            d0 = EpochDecision(None) if alone else st.decision
+            suspect = mism >= EPOCH_START_MISMATCH or abs(u) > EPOCH_MIN_OFFSET_TICKS * tick
+            if d0.index is None:
+                ks = tuple(range(nk))
+                cap = EPOCH_VOTE_MAX_WORDS
+            else:
+                ks = tuple(j for j in (d0.index - 1, d0.index, d0.index + 1) if 0 <= j < nk)
+                cap = EPOCH_MONITOR_MAX_WORDS
+            quiet = (d0.index is not None and not suspect
+                     and abs(u + (EPOCH_CANDIDATES[d0.index] << FINE_BITS))
+                     <= EPOCH_MIN_OFFSET_TICKS * tick)
+            voted = bool(n) and not (quiet and st.skip > 0)
+            if voted and s1 is None:
+                s1 = prepare_s1(main_cluster(np.sort(d["time"][ch == self.s1])))
+                span = int(s1[-1] - s1[0]) if s1.size > 1 else 0
+            voted = voted and s1.size > 1
+            if quiet:
+                cap = EPOCH_QUIET_MAX_WORDS
+            fv = _NONE
+            if voted:
+                # A small sample from a busy channel: scan every s-th word of
+                # the stream only (still spread over the frame).
+                step = max(1, n // (2 * cap))
+                sel = np.flatnonzero(ch[::step] == c) * step if step > 1 \
+                    else np.flatnonzero(ch == c)
+                if sel.size > cap:
+                    sel = sel[even_sample(sel.size, cap)]
+                t0 = apply_epoch_repair(fine[sel], D[sel], int(round(u)))
+                fv = _no_votes()
+                fv[:, list(ks)] = epoch_votes(t0, s1, delay, self.tol_ns,
+                                              [EPOCH_CANDIDATES[j] for j in ks], prepared=True)
+            votes = base + fv if voted or alone else base
+            # A quiet channel keeps its decision unless something leans away
+            # from it (below): re-deciding every frame costs more than the vote.
+            dec = self.decide(votes, u) if (voted and not quiet) or alone else d0
+            # The recent votes: a whole-epoch slip of a decided channel leaves
+            # its residues as they were and is outvoted in the run's votes for
+            # a long time; the recent ones see it within a few voted frames.
+            win, slip, disagree = None, False, False
+            if alone:
+                win = fv.astype(np.float64)
+            elif voted:
+                win = st.window * EPOCH_WINDOW_DECAY + fv
+                # Once the run has decided: after a slip the run's votes can
+                # stay undecided for long (the old winner's history), so the
+                # recent votes take over then too. Before, the run's own rule
+                # (min_votes) decides.
+                if (dec.index is not None or st.ever) and not (
+                        dec.index is not None
+                        and _leads(win, dec.index, ks, self.scale, EPOCH_MIN_EXPOSURE)
+                        and _leads(fv, dec.index, ks, self.scale, EPOCH_FRAME_MIN_EXPOSURE)):
+                    # (Skipped while the winner still leads in both, the
+                    # usual case: nothing can slip or lean then.)
+                    wd = decide_epoch(win, EPOCH_WINDOW_MIN_VOTES, self.min_margin, self.scale)
+                    # This frame's own votes lean to another epoch (a slip
+                    # shows there first; a dead channel gives no candidate
+                    # anything and leans nowhere).
+                    fd = decide_epoch(fv, EPOCH_LEAN_MIN_EXCESS, self.min_margin, self.scale,
+                                      min_exposure=EPOCH_FRAME_MIN_EXPOSURE)
+                    if quiet and voted:
+                        dec = self.decide(votes, u)
+                    if wd.index is not None and wd.index != dec.index:
+                        slip = True
+                        votes = np.rint(win).astype(np.int64)
+                        dec = wd
+                    elif dec.index is not None and (
+                            self._leans(wd, win, dec.index, EPOCH_MIN_EXPOSURE)
+                            or self._leans(fd, fv, dec.index, EPOCH_FRAME_MIN_EXPOSURE)):
+                        disagree = True
+            elif st is not None and st.disagree:
+                disagree = True
+            k = dec.index
+            # Undecided again after a decision (a slip being voted out): the
+            # fields may look healthy, the times are not known.
+            if k is None and st is not None and st.ever:
+                suspect = True
+            off = None if k is None else int(round(u + (EPOCH_CANDIDATES[k] << FINE_BITS)))
+            big = off is not None and abs(off) > EPOCH_MIN_OFFSET_TICKS * tick
+            rep = self.enabled and big and r_run >= self.min_R
+            width = cluster_width_ns(r_run, self.shift)
+            would = 0
+            if big and not rep and n:
+                m = ch == c
+                would = int(np.count_nonzero(
+                    apply_epoch_repair(fine[m], D[m], off, width) != d["time"][m]))
+            plan.channels[c] = ChannelEpoch(
+                ch=c, n=n, mismatch=mism, measured=measured, u=u, R=r, R_run=r_run, jump=jump,
+                resync=resync, voted=voted, ks=ks, frame_votes=fv, votes=votes, decision=dec,
+                k=None if k is None else EPOCH_CANDIDATES[k], offset_ns=off,
+                correction=None if off is None else epoch_correction(off), repair=bool(rep),
+                suspect=bool(suspect), far=off is not None and abs(off) >= half,
+                would_move=would, span=span, window=win, slip=slip, disagree=disagree)
+            if rep:
+                plan.offsets[c] = (off, width)
+        return plan
+
+    def commit(self, plan: EpochPlan) -> None:
+        """Take a frame's plan into the run's state (a good frame's only)."""
+        for c, ce in plan.channels.items():
+            st = self.states.get(c)
+            if ce.resync or st is None:
+                if st is not None:
+                    self.resyncs[c] = self.resyncs.get(c, 0) + 1
+                st = self.states[c] = EpochState(ref=ce.u, R=ce.R)
+            elif ce.jump:
+                st.pending = ce.u
+                continue
+            elif ce.measured:
+                st.ref += ce.n / (ce.n + EPOCH_REF_WORDS) * (ce.u - st.ref)
+                st.R = ce.R_run
+                st.pending = None
+            if ce.slip:
+                self.resyncs[c] = self.resyncs.get(c, 0) + 1
+                st.votes = ce.votes
+            elif ce.voted:
+                st.votes = st.votes + ce.frame_votes
+            if ce.window is not None:
+                st.window = ce.window
+            st.disagree = ce.disagree
+            st.decision = ce.decision
+            st.ever = st.ever or ce.decision.index is not None
+            if ce.measured and ce.span:
+                st.span = ce.span
+            st.skip = EPOCH_MONITOR_EVERY - 1 if ce.voted else st.skip - 1
+            st.frames += 1
+
+
+# ==============================================================================
 # One frame
 # ==============================================================================
 
@@ -1060,8 +1807,9 @@ class Frame:
     n_rescued: int = 0
     #: time_bits(shift): the modulus of `time`, for gaps between frames.
     time_bits: int = TIME_BITS
-    #: First and last kept hit whose fine and coarse agree (`first`/`last`
-    #: when fewer than two do). A word with a fine fault has a time that can
+    #: First and last kept hit whose fine and coarse agree, on a channel not
+    #: epoch-repaired (`first`/`last` when fewer than two do). A word with a
+    #: fine fault has a time that can
     #: be wrong by up to ~1 ms -- at a coarse-minus-fine of half a wrap
     #: (-32 ticks at shift 14) time_of lands one 2^20 ns wrap early -- so the
     #: kept extent of a real 1008 frame starts ~1 ms early on a few faulty
@@ -1091,6 +1839,14 @@ class Frame:
     #: ``s_*`` (``sma.NimWords``); None when nothing was paired. Carried for
     #: the event display only; nothing here reads it.
     pairing: tuple | None = None
+    #: The channels whose times were epoch-repaired (:func:`prepare_frame`'s
+    #: ``repair``): channel -> ``(O ns, words moved)``; None: none. ``time``
+    #: and ``s_t`` hold the repaired times; ``diff_ns``, ``consistent`` and the
+    #: fields are the words' own.
+    repaired: dict | None = None
+    #: The plugin's :class:`EpochPlan` of this frame (votes, offsets); None
+    #: when prepared without one.
+    epoch: EpochPlan | None = None
 
     @property
     def span_ns(self) -> int:
@@ -1148,11 +1904,20 @@ def prepare_frame(words, shift=DEFAULT_SHIFT, stale_gap_ns=STALE_GAP_NS,
                   latch_margin_ns=LATCH_MARGIN_NS, rescue_shifts=SHIFT_SCAN,
                   rescue_min_words=RESCUE_MIN_WORDS,
                   rescue_min_fraction=RESCUE_MIN_FRACTION,
-                  mupix: MuPixCuts | None = None) -> Frame:
-    """Word counts, decode, fine vs coarse, stale filter, sort, channel split.
+                  mupix: MuPixCuts | None = None, repair=None) -> Frame:
+    """Word counts, decode, fine vs coarse, epoch repair, stale filter, sort, channel split.
 
     With ``mupix`` (and its analysis enabled) the pixel words too
     (:func:`prepare_pixels`), unwrapped around the kept SMA hits' median.
+
+    ``repair``: channel -> offset O in ns, or -> (O, cluster half width ns)
+    (a dict), or a callable given the decoded frame (:func:`decode`'s dict,
+    stream order, plus ``consistent``) that returns one (the plugin's
+    :meth:`EpochRepair.plan`, which votes on the frame before it is repaired).
+    Each listed channel's words are timed with :func:`apply_epoch_repair`
+    instead of :func:`time_of`, before the stale filter and the sort, so
+    everything after sees the repaired times (``Frame.repaired``). None or an
+    empty dict: the times of :func:`time_of`.
 
     Stale filter: the cluster holding the median time (:func:`stale_mask`)
     is kept, and so is any other cluster of at least ``rescue_min_words``
@@ -1165,6 +1930,23 @@ def prepare_frame(words, shift=DEFAULT_SHIFT, stale_gap_ns=STALE_GAP_NS,
     d = decode(w, shift)
     ch, t = d["ch"], d["time"]
     diff = fine_coarse_diff_ns(d["coarse"], d["fine"], shift)
+    consistent = fine_coarse_consistent(diff, shift, latch_margin_ns)
+    repaired = None
+    if repair is not None:
+        offsets = repair if isinstance(repair, dict) else repair({**d, "consistent": consistent})
+        if offsets:
+            t = t.copy()
+            repaired = {}
+            for c, o in offsets.items():
+                o, width = o if isinstance(o, tuple) else (o, None)
+                m = ch == c
+                old_t = t[m]
+                new_t = apply_epoch_repair(d["fine"][m],
+                                           coarse_minus_fine(d["coarse"][m], d["fine"][m], shift),
+                                           int(o), width)
+                t[m] = new_t
+                repaired[int(c)] = (int(o), int(np.count_nonzero(new_t != old_t)))
+            d["time"] = t
     bits = time_bits(shift)
     order_all, bounds, k_med, u = _clusters(t, stale_gap_ns, bits)
     keep_sorted = np.zeros(t.size, dtype=bool)
@@ -1184,8 +1966,15 @@ def prepare_frame(words, shift=DEFAULT_SHIFT, stale_gap_ns=STALE_GAP_NS,
     keep[order] = True
     s_ch = ch[order]
     s_t = u[order]
-    consistent = fine_coarse_consistent(diff, shift, latch_margin_ns)
-    ct = s_t[consistent[order]]
+    timed = consistent[order]
+    if repaired:
+        # A repaired channel's words that happen to look consistent (an offset
+        # near a whole number of epochs) lie O away from the frame: the frame's
+        # extent is its other channels'.
+        lut = np.ones(N_CHANNELS, dtype=bool)
+        lut[list(repaired)] = False
+        timed = timed & lut[s_ch]
+    ct = s_t[timed]
     t_first, t_last = (int(ct[0]), int(ct[-1])) if ct.size >= 2 else (None, None)
     px = None
     if mupix is not None and mupix.enabled:
@@ -1202,7 +1991,7 @@ def prepare_frame(words, shift=DEFAULT_SHIFT, stale_gap_ns=STALE_GAP_NS,
         chan=split_by_channel(s_ch),
         first=int(s_t[0]) if s_t.size else 0, last=int(s_t[-1]) if s_t.size else 0,
         n_rescued=n_rescued, time_bits=bits, t_first=t_first, t_last=t_last,
-        word_index=d["word_index"], raw=d["raw"], px=px)
+        word_index=d["word_index"], raw=d["raw"], px=px, repaired=repaired)
 
 
 @dataclass

@@ -311,7 +311,7 @@ Worst first. Codes as in `sma.py:1152-1232`:
 
 | Flag | Severity | Meaning | What to do |
 |---|---|---|---|
-| `mismatch` on a channel | error above 50 %, warning above 5 % | that channel's fine and coarse time fields disagree: a timestamp fault on the board. Only shown once the shift check is `ok`, and only for S1-S5 and RF by default | compare with the known faults below; a new channel or a big change goes to the elog and the SMA expert |
+| `mismatch` on a channel | error above 50 %, warning above 5 %; a coarse offset: see [its own section](#coarse-offset-and-the-epoch-repair) | that channel's fine and coarse time fields disagree: a timestamp fault on the board. Only shown once the shift check is `ok`, and only for S1-S5 and RF by default. The text says which kind: a **coarse offset** (all words disagree by about the same amount; the text says whether the times are right, repaired or wrong) or a **scattered** fault ("(a fine-bit fault)") | coarse offset: see [below](#coarse-offset-and-the-epoch-repair); otherwise compare with the known faults below; a new channel or a big change goes to the elog and the SMA expert |
 | `tot_corrupt` | warning above 5 % | many hits with ToT code >= 250 (a corruption marker) | same |
 | `stale_frames` | warning | some frames were old data (not this run's), left out of the plots. Common for the first frames after a run start | nothing unless it persists |
 | `all_stale` | error | every frame in 60 s is stale: the board is sending old data, or S1's own timestamps are broken at every shift | call the SMA expert |
@@ -325,9 +325,9 @@ Worst first. Codes as in `sma.py:1152-1232`:
 | `mupix_unmapped` | warning | pixel hits on a chip id that is in neither `MuPix/L1 chips` nor `L2 chips` | the plane map does not match the FEB Mapping: tell the MuPix expert, then fix the ODB lists |
 | `mupix_skipped` | info | a frame had more pixel hits than `MuPix/max pixel hits per frame`; only the latest were examined | nothing |
 | `nim_missing` | warning | a counter's NIM copy (S*k*L) has no hits while its TOT channel has at least `min hits` | check the NIM cable, the discriminator power and `NIM/channels`; see [the four NIM flags](#the-four-nim-flags) |
-| `nim_pairing` | error below 50 %, warning below 80 % | pair efficiency (paired / (paired + TOT-only)) is low. Only once the shift check is `ok`, and not for a counter whose TOT channel has a known timestamp fault | if the median NIM - TOT is large, measure the offset; if it is near 0, elog it and tell the SMA expert. See [the four NIM flags](#the-four-nim-flags) |
+| `nim_pairing` | error below 50 %, warning below 80 % | pair efficiency (paired / (paired + TOT-only)) is low. Only once the shift check is `ok`. When the TOT or the NIM channel has wrong timestamps the pair efficiency is withheld and the channel's `mismatch` flag says the pairing collapsed; only a channel without a mismatch flag of its own gets a `nim_pairing` warning "pair efficiency withheld: timestamp fault on ch N" | timestamp fault: act on the `mismatch` flag. Otherwise: if the median NIM - TOT is large, measure the offset; if it is near 0, elog it and tell the SMA expert. See [the four NIM flags](#the-four-nim-flags) |
 | `nim_offset` | warning | the median NIM - TOT (since the run start or the last settings change) is more than 5 ns from 0 after `NIM/offset ns`; the text gives the value to set. Same conditions as `nim_pairing` | set `NIM/offset ns`, see [measuring the offsets](#measuring-the-nim-offsets-on-the-first-clean-run) |
-| `nim_lag` | warning | the NIM channel's lag state was "faulted" in more than half of the window's frames, after at least 3 frames voted "faulted" (`Self check/nim lag min votes`); only once the shift check is `ok`. The text says whether NIM-only hits were held back from the merge | elog it with the counter; tell the SMA expert (nothing here corrects it) |
+| `nim_lag` | warning | the NIM channel's lag state was "faulted" in more than half of the window's frames, after at least 3 frames voted "faulted" (`Self check/nim lag min votes`); only once the shift check is `ok`. The text says whether NIM-only hits were held back from the merge. Not raised for a channel whose coarse offset the epoch vote has shown (the lag vote pairs words by equal coarse fields, which a coarse offset makes the wrong ones): its lag reads "n/a: coarse offset" | elog it with the counter; tell the SMA expert (nothing here corrects it) |
 
 **Known timestamp faults (as of 2026-09-28), measured with this DQM on replayed
 runs** (channels as cabled before run 1015: S3 on ch 3, the proton current on ch 7):
@@ -341,15 +341,146 @@ runs** (channels as cabled before run 1015: S3 on ch 3, the proton current on ch
 | S4 (ch 4) | 0.6 % | 0.1 % | |
 | current (ch 7) | 0 % | 100 % | not flagged (not in `mismatch flag channels`) |
 
+### Coarse offset and the epoch repair
+
+**What it is.** Each SMA word has a fine field (the time in ns, modulo 2^20 ns
+= 1.05 ms, one "epoch") and a coarse field (the time in 16.4 µs ticks, 2^14 ns).
+The DQM takes the time from the fine field and only the epoch from the coarse
+field. When an input's coarse counter runs ahead of (or behind) its fine one by
+O, every word of that input disagrees by about O ("coarse offset"). Up to half
+an epoch (32 ticks, 0.52 ms) the times are still right. Beyond that every word
+lands one or more whole epochs (1.05 ms each) late: no S1 coincidence, no NIM
+pair, an efficiency near 0.
+
+**What the DQM does about it** (`Cuts/epoch repair`, on by default). For each
+channel that has a nominal delay after S1 (every counter with a NIM copy and a
+measured `NIM/lag nominal ns`, and that NIM copy), from its first words in the
+run on and whatever its fine/coarse agreement says (an offset of exactly one
+epoch leaves the fields agreeing; only the S1 coincidences show it), it
+
+1. measures O modulo an epoch from the words themselves (the circular mean of
+   coarse minus fine, and R, how concentrated they are: 1 = all equal);
+2. votes on the whole epochs. Each candidate is a correction to the word times
+   (−1 = every word one epoch earlier, 0, +1, ...). For each candidate it
+   counts the channel's words that have an S1 hit at their nominal delay
+   (+-5 ns, **in time**) and the S1 hits 200-700 ns before that, scaled to the
+   same width (**off time**: accidentals only). Only words whose corrected time
+   falls inside the frame's S1 hits count (**exposed**): a candidate that puts
+   the words outside the frame gets no votes at all, rather than "0 votes".
+   The vote runs over the frames of the run;
+3. decides when one candidate has, per exposed word, the most in-time minus
+   off-time coincidences (the excess), at least 200 of them in all, an excess
+   of at least 5 standard deviations of its own off-time count, at least 3
+   times that off-time count in time, and at least 5 times the next
+   candidate's excess per word. (A channel whose words are mostly unrelated to
+   S1 at a high rate has only a few times its off-time count in time, but an
+   excess far above its spread.) Then it moves every word of that channel by that many
+   epochs. Each word keeps its own fine time; the S1 coincidences only choose
+   the epochs, they are not made: a word without an S1 partner is moved by the
+   same amount.
+
+After the decision only the winner and its two neighbours keep counting, on
+fewer words (a healthy channel in one frame of 4, on 200 words): the neighbours staying at
+their off-time level is the check that the choice is real.
+
+**A slip mid-run.** A channel that slips by a whole epoch during a run (healthy
+or already repaired) looks the same in its fields; only its S1 coincidences
+move to a neighbouring correction. Besides the run's votes the DQM keeps the
+recent ones (each voted frame weighs 0.8 of the one after it). As soon as a
+frame's own votes, or the recent ones, lean to another correction, the
+channel's frames count in no efficiency; when the recent votes decide it (50
+in excess, the rules above), the run's votes are replaced by them (counted as
+a resync) and the times are repaired with the new correction. On the
+simulated slips this took 6-13 frames; at most the 1-3 frames before the first
+voted one after the slip (a healthy channel is voted on in one frame of 4)
+still counted in the efficiency. A counter that
+simply dies gives no other correction anything, so its efficiency shows the
+drop as before. The
+table's footnote lists, per correction, in time / off time / exposed words; the
+flag text quotes the winner's in-time and off-time counts. A ToT, a mismatch
+fraction or the `fine_coarse_diff` plot are measured on the raw fields as
+before: the repair changes times, nothing else. A channel's words that lie far
+from its offset (more than 5 standard deviations) keep their own time.
+
+**When it cannot decide.** The board puts a word in the frame of its *coarse*
+time, so the words of a channel offset by O are O earlier in true time than
+their frame. If the frames are shorter than O, no word's right time is inside
+its own frame: the right candidate has no exposure and the vote stays
+undecided ("frames shorter than the coarse offset"), while a wrong candidate
+that lands inside the frame only meets accidentals, which the off-time count
+cancels. At a low rate the first frames of a run are undecided too ("not enough
+S1 coincidences yet"); they are repaired from the frame the vote decides in,
+not before.
+
+**The messages** (flag `mismatch`, on that channel). Corrections are what is
+done to the word times: "moved −1 epoch" = one epoch (1.05 ms) earlier.
+
+| Text | Severity | Meaning | What to do |
+|---|---|---|---|
+| `coarse field N ticks (X µs) late on fine; times still right (S1 coincidences a in time, b off time)` | warning | offset under half an epoch: the times need no repair | keep taking data; elog it and tell the SMA expert. Resynchronise the SMA before it reaches 32 ticks |
+| `coarse field N ticks (X ms) late on fine; times moved by −1 epoch (...)`, or `the P % of hits past half an epoch moved by −1 epoch` | warning | the offset is past half an epoch (or its spread crosses it) and the DQM's times are repaired: efficiencies, NIM pairing, dt plots and SMAEvents are right. "(N of M frames before the vote decided left out of the efficiencies)" when the start of the run was undecided | keep taking data; resynchronise the SMA when convenient (FEB reprogram). Elog it: **the reco decoder does not repair this**, the nearline and farline times of that channel are wrong |
+| `times not checked yet: not enough S1 coincidences yet (N of 200)` | warning | a low rate, or the run just started | wait; if it stays, resynchronise the SMA |
+| `timestamps wrong: frames shorter than the coarse offset (X ms vs Y ms)` | error | the offset is longer than a frame: the epochs cannot be voted on | resynchronise the SMA (FEB reprogram or power cycle) |
+| `timestamps wrong: ... no whole-epoch shift brings its hits to S1 (best ... in time, ... off time)` | error | no candidate rises above its accidentals: a channel not in time with S1, or a fine-time fault rather than a coarse one | resynchronise the SMA; call the SMA expert |
+| `timestamps wrong: coarse field ..., and epoch repair is off: P % of hits are whole epochs off` | error | `Cuts/epoch repair` = n; the vote still counts the words a repair would move | set it back to y, or resynchronise the SMA |
+| `... no nominal delay to S1 for this channel (NIM/lag nominal ns) ...` | warning or error | a coarse offset on a channel the vote cannot check | resynchronise the SMA; set the channel's lag nominal if it should be voted on |
+
+A channel in a TOT + NIM pair adds "Its TOT + NIM pairing (S2 + S2L) collapses
+with it (pair efficiency withheld)" to an error: the `nim_pairing` alarm is
+then not raised a second time.
+
+**What counts in the efficiencies.** A frame in which a channel's times are not
+known to be right (suspect fields and the vote undecided, or whole epochs off
+and not repaired) adds nothing to that counter's timed efficiency or to its
+pair's efficiency; so does a frame whose own or recent votes lean to another
+correction than the run's. When less than 20 % of the window's S1 hits (TOT words) are
+left, the efficiency is withheld with a reason ("n/a (timestamp fault)"),
+rather than quoted from a few frames. A channel whose times are wrong or
+unknown has both withheld, and the "incomplete pattern" test leaves it out; a
+repaired channel or one whose times are still right keeps its efficiencies.
+
+**The frame edge.** For the last O of each frame, a repaired channel's partners
+of the frame's S1 hits come in the next frame. The efficiency of such a counter
+and the pair efficiency of its TOT + NIM pair count only the S1 hits (TOT
+words) inside the part of the frame both cover, less twice the spread of O.
+The histograms (`s1_coinc`, `nim_classes_S*k*`) keep every hit.
+
+**Resynchronisation mid-run.** When the measured offset jumps by more than 8
+ticks on two busy frames in a row the vote starts again, and when the recent
+votes decide another correction (a slip, above) the run's votes take them
+(the summary counts both as `resyncs`). A run start or a settings rebuild also starts it again.
+
+**In the summary** (`sma::summary`, per channel): `kind` ("healthy",
+"coarse_offset", "scattered"), `offset_ticks`, `R`, `times` ("ok",
+"repaired", "wrong", "unknown") and `repair` (the vote: `correction`,
+`moved_by`, `votes` = [correction, in time, off time, exposed], `in_time`,
+`off_time`, `excess`, `min_votes`, `undecided` ("few", "short", "no signal")
+with `frame_ms` / `offset_ms`, `moved_share`, `would_move_share`, `frames`,
+`repaired_frames`, `undecided_frames`, `bad_frames`, `resyncs`,
+`nominal_ns`). The NIM rows add `eff_paired` and `eff_tot_only` (the counts the
+pair efficiency uses) and `pair_eff_reason` when it is withheld. SMAEvents tags
+the lanes of repaired channels "epoch-repaired" and its frame header lists
+them.
+
+**Manual path.** `mdqm-sma-file --settings <the /DQM/SMA JSON> <raw file>`
+replays a file through the same plugin, with the same vote and repair (the vote
+starts at the file's first frame); its text output prints the same flags and a
+`coarse offset` line per channel with the vote. With
+`--settings '{"Cuts": {"epoch repair": false}}'` it shows the raw times.
+
 ### The table
 
 One row per channel: rate (hits per second of covered time), hits per frame,
 fraction of hits with ToT >= 250, fine/coarse mismatch fraction, stale words, and
 **eff. given S1**: the fraction of S1 hits with a hit on that counter within
 +-50 ns. The efficiency shows **n/a (timestamp fault)** when the counter's
-mismatch is above 5 % (`sma.py:1109-1115`): with broken timestamps the
-coincidence misses by microseconds and the number would look like a dead
-counter. Channels outside `mismatch flag channels` show their mismatch in grey,
+times are wrong or unknown (a scattered fine/coarse fault, or a coarse offset
+the epoch repair cannot fix, see above), or when fewer than 20 % of the S1 hits
+fell where its times are known: with broken timestamps the coincidence
+misses by microseconds and the number would look like a dead counter. A
+channel with a coarse offset shows it in the mismatch cell
+("99.4 % · coarse +80 ticks · times repaired") and its vote under the table.
+Channels outside `mismatch flag channels` show their mismatch in grey,
 "(not flagged)". Footnote: RF valid fraction (S1 hits with a usable RF gate) and
 vetoed fraction.
 
@@ -597,12 +728,13 @@ fine time is broken (run 1008: S5 has fine = t/2, 93 % of its words
 fine/coarse inconsistent) is almost never within +-50 ns of anything, so
 without a correction *incomplete pattern* would match nearly every seed (3,527
 of 3,540 on run 1008). The analyzer therefore leaves out of that test every
-counter that SMAPlots currently flags for a fine/coarse mismatch: more than
+counter whose times SMAPlots currently calls wrong or unknown: more than
 `Self check/mismatch warn fraction` (5 %) of its hits inconsistent over the
-summary window (60 s), at least `Self check/min hits` hits, a channel in
-`Self check/mismatch flag channels`, exactly the rule of the `mismatch` flag
-(`sma.py:1849`, `incomplete_rule` at `sma.py:1886`, applied in
-`sma_words.py:1579`). The header then reads **seed: S1 (ch 1) with incomplete
+summary window (60 s), a channel in `Self check/mismatch flag channels`, and
+not a coarse offset whose times are right or repaired
+([the epoch repair](#coarse-offset-and-the-epoch-repair)), the rule of the
+efficiency's n/a (`SmaPlugin._timestamp_faults` and `incomplete_rule` in
+`sma.py`, applied by `sma_words.select_seeds_by`). The header then reads **seed: S1 (ch 1) with incomplete
 pattern (ignoring S5: timestamp fault 93 %)**, each seed's **odd:** badge says
 **incomplete pattern (S5 ignored)**, and the ignored counter's box in the
 seed's pattern is drawn dashed. Only the pattern test changes: the lanes, the
@@ -1179,8 +1311,13 @@ to say `ok`.
   the offset is not set: do the
   [measurement](#measuring-the-nim-offsets-on-the-first-clean-run). If the
   median is near 0, the NIM threshold or the NIM channel is the problem: elog
-  it with the counter, and tell the SMA expert. A counter whose TOT channel has
-  a known timestamp fault (the red `mismatch` flag, S5 for now) is not judged.
+  it with the counter, and tell the SMA expert. When the TOT or the NIM channel
+  has wrong timestamps (the red `mismatch` flag), the pair efficiency is
+  withheld and that flag says the pairing collapsed: act on it. Only a channel
+  without a mismatch flag of its own gets a `nim_pairing` warning naming the
+  timestamp fault. A coarse offset that the epoch repair fixes does
+  not lower the pair efficiency (see
+  [the frame edge](#coarse-offset-and-the-epoch-repair)).
 * `nim_offset` (warning): the median NIM - TOT is more than 5 ns from 0 after
   the offset. The text names the key and the value to set
   (`NIM/offset ns[k-1]` = old offset + the median, rounded). Set it as
@@ -1440,6 +1577,10 @@ histograms.
 | `Cuts/max words per frame` | 1048576 | larger frames (over 8 MiB) are counted as `oversize` (summary, status, a warning flag) and not decoded: one costs ~0.6 s of CPU and hundreds of MB. 0 = no limit | yes |
 | `Cuts/drop zero words` | y | remove every 64-bit word equal to 0 before decoding; a frame with nothing else is counted as `zero` (summary, status, the `zero_frames` info flag) and not decoded. n = decode them, as before | yes |
 | `Cuts/max frame span ms` | 60000 | a frame that is neither stale nor suspect but whose kept words span more than this is stale, reason "span": the frames sent after a run stop, with a frozen SMA clock, span hundreds of seconds. Genuine frames reach seconds (beam trip, slow run). 0 = no limit | yes |
+| `Cuts/epoch repair` | y | repair the times of a channel whose coarse field is offset from its fine field by whole epochs, chosen by an S1 vote ([coarse offset](#coarse-offset-and-the-epoch-repair)). n = vote and report only, times as before | yes |
+| `Cuts/epoch repair min votes`, `epoch repair min margin` | 200, 5 | the vote decides with at least this many in-time coincidences above the scaled off-time count (accidentals), and this many times the next candidate's per exposed word (a tie never decides); also an excess of at least 5 standard deviations of its off-time count and an in-time count at least 3 times it | yes |
+| `Cuts/epoch repair tol ns` | 5 | a vote: a word with an S1 hit at its nominal delay +- this. The nominal delays come from `NIM/lag nominal ns` (a NIM copy) and that minus `NIM/offset ns` (its TOT channel); a counter without a NIM copy or with a lag nominal of 0 is not voted on | yes |
+| `Cuts/coarse offset min R` | 0.6 | how concentrated (resultant length R, 0-1) the coarse-minus-fine residues must be to count as a coarse offset; below, a scattered fault, never repaired | yes |
 | `Cuts/max S1 per frame` | 2000 | a frame with more kept S1 hits gives the S1-seeded analyses (pattern, efficiency, S2..S5 - S1, RF, delayed) to an evenly spread sample of this many; 0 = no cap. Bounds the cost of a dense frame | yes |
 | `Cuts/max gap s`, `max overlap ms` | 10, 10 | larger jumps between frames count as a loop/run boundary | yes |
 | `Cuts/stale frame ...`, `suspect kept fraction` | see `sma.py:145-153` | the stale/suspect frame rules (`sma.py:407-473`) | yes |

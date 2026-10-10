@@ -90,14 +90,40 @@ def read_frames(path, n_frames, skip=0):
     return out
 
 
-def pipeline(bank, shift, roles, cuts, nim=None):
+def epoch_repair_of(cfg, shift):
+    """The plugin's epoch repair (Cuts/epoch repair) for an sma.Config."""
+    return W.EpochRepair(cfg.epoch_delays(), s1=cfg.roles.s1, shift=shift,
+                         tol_ns=cfg.epoch_tol_ns, min_votes=cfg.epoch_min_votes,
+                         min_margin=cfg.epoch_min_margin, min_R=cfg.coarse_min_R,
+                         enabled=cfg.epoch_repair)
+
+
+def prepare(bank, shift, cuts, epoch=None):
+    """`sma_words.prepare_frame` with the plugin's epoch repair (`epoch`, a
+    sma_words.EpochRepair: its residues on every frame, its vote where the
+    settings give it candidates), the plan committed as for a good frame."""
+    if epoch is None:
+        return W.prepare_frame(bank, shift, cuts.stale_gap_ns, cuts.latch_margin_ns)
+    plan = []
+
+    def repair(d):
+        plan.append(epoch.plan(d))
+        return plan[0].offsets
+
+    fr = W.prepare_frame(bank, shift, cuts.stale_gap_ns, cuts.latch_margin_ns, repair=repair)
+    epoch.commit(plan[0])
+    return fr
+
+
+def pipeline(bank, shift, roles, cuts, nim=None, epoch=None):
     """Everything WP3 computes per frame, bar the histogram fills; with `nim`
-    (an sma.Config) the TOT + NIM pairing too, the analysis on merged counters.
-    The plugin's zero-word check (Cuts/drop zero words, on by default) first."""
+    (an sma.Config) the TOT + NIM pairing too, the analysis on merged counters;
+    with `epoch` the epoch repair (`prepare`). The plugin's zero-word check
+    (Cuts/drop zero words, on by default) first."""
     bank, _n_zero, _pos = P.drop_zero_words(bank)
     if bank is None:
         return None
-    fr = W.prepare_frame(bank, shift, cuts.stale_gap_ns, cuts.latch_margin_ns)
+    fr = prepare(bank, shift, cuts, epoch)
     occupancy = W.per_channel_bit_counts(fr.ch, fr.fine)
     bad = ~fr.consistent
     xor = W.fine_coarse_xor(fr.coarse[bad], fr.fine[bad], shift)
@@ -110,7 +136,7 @@ def pipeline(bank, shift, roles, cuts, nim=None):
     return fr, a, occupancy, mismatch_bits
 
 
-def time_steps(banks, shift, roles, cuts, nim=None):
+def time_steps(banks, shift, roles, cuts, nim=None, epoch=None):
     """Per-step mean time [ms], for the profile."""
     steps = {}
 
@@ -145,6 +171,11 @@ def time_steps(banks, shift, roles, cuts, nim=None):
         fr = W.prepare_frame(b, shift, cuts.stale_gap_ns, cuts.latch_margin_ns)
         t6 = time.perf_counter()
         add("prepare_frame (all above but bits)", t6 - t5)
+        if epoch is not None:
+            prepare(b, shift, cuts, epoch)
+            t6b = time.perf_counter()
+            add("prepare_frame + epoch repair", t6b - t6)
+            t6 = t6b
         if nim is not None:
             nf = P.pair_frame(fr, nim)
             if nf is not None:
@@ -158,7 +189,7 @@ def time_steps(banks, shift, roles, cuts, nim=None):
     return {k: 1e3 * v / len(banks) for k, v in steps.items()}
 
 
-def observe(banks, shift, roles, cuts, label, nim=None):
+def observe(banks, shift, roles, cuts, label, nim=None, epoch=None):
     words = trig = stale = 0
     per_ch = np.zeros(W.N_CHANNELS, dtype=np.int64)
     bad_ch = np.zeros(W.N_CHANNELS, dtype=np.int64)
@@ -167,7 +198,7 @@ def observe(banks, shift, roles, cuts, label, nim=None):
     spans = []
     tot_bad = np.zeros(W.N_CHANNELS, dtype=np.int64)
     for b in banks:
-        got = pipeline(b, shift, roles, cuts, nim)
+        got = pipeline(b, shift, roles, cuts, nim, epoch)
         if got is None:                  # nothing but zero words
             continue
         fr, a, _occ, _mb = got
@@ -197,14 +228,14 @@ def observe(banks, shift, roles, cuts, label, nim=None):
                       zip(cuts.shift_scan, shift_counts, strict=True)))
 
 
-def bench(banks, shift, roles, cuts, repeat, nim=None):
+def bench(banks, shift, roles, cuts, repeat, nim=None, epoch=None):
     for b in banks[:5]:
-        pipeline(b, shift, roles, cuts, nim)         # warm up
+        pipeline(b, shift, roles, cuts, nim, epoch)         # warm up
     best = np.inf
     for _ in range(repeat):
         t0 = time.perf_counter()
         for b in banks:
-            pipeline(b, shift, roles, cuts, nim)
+            pipeline(b, shift, roles, cuts, nim, epoch)
         best = min(best, time.perf_counter() - t0)
     n_words = sum(W.words_from_bank(b).size for b in banks)
     return len(banks) / best, n_words / best
@@ -226,6 +257,9 @@ def main(argv=None):
                     help="frames skipped at the start of each file (subrun-0 stale replay)")
     ap.add_argument("--shift", type=int, default=W.DEFAULT_SHIFT)
     ap.add_argument("--repeat", type=int, default=3)
+    ap.add_argument("--no-epoch-repair", action="store_true",
+                    help="leave out the epoch repair step (Cuts/epoch repair; with the "
+                         "defaults it only sums the residues: no channel has a nominal delay)")
     a = ap.parse_args(argv)
     cuts = W.Cuts()
     try:
@@ -258,11 +292,12 @@ def main(argv=None):
             continue
         wpf = np.mean([W.words_from_bank(b).size for b in banks])
         cab = "old roles" if roles == OLD_ROLES else "1015 roles"
+        ep = None if a.no_epoch_repair else (lambda: epoch_repair_of(nim_cfg, a.shift))
         observe(banks, a.shift, roles, cuts,
-                f"{name} ({cab}{', TOT+NIM' if nim else ''})", nim)
-        steps = time_steps(banks, a.shift, roles, cuts, nim)
+                f"{name} ({cab}{', TOT+NIM' if nim else ''})", nim, ep and ep())
+        steps = time_steps(banks, a.shift, roles, cuts, nim, ep and ep())
         print("    per step [ms/frame]: " + ", ".join(f"{k} {v:.2f}" for k, v in steps.items()))
-        fps, wps = bench(banks, a.shift, roles, cuts, a.repeat, nim)
+        fps, wps = bench(banks, a.shift, roles, cuts, a.repeat, nim, ep and ep())
         verdict = ""
         if wpf >= 0.9 * GATE_WORDS:
             ok = fps >= GATE_FPS

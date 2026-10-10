@@ -117,6 +117,15 @@ histograms, the seeds, the efficiencies and the MuPix in-time matching (its
 S1 sample). ``rf_phase_vs_s1_tot`` leaves the NIM-only S1 hits out (no ToT of
 their own). The rest reads the words (see `pair_frame`).
 
+Epoch repair (``Cuts/epoch repair``, on by default): a channel whose coarse
+field is offset from its fine field by more than half an epoch has its word
+times moved by whole 2^20 ns epochs, chosen by an S1 vote over the run
+(``sma_words.EpochRepair``), before anything above is filled. Every
+histogram then sees the repaired times; the fine/coarse ones (``fine_coarse_diff``,
+``fine_vs_coarse``, the mismatch counts) read the words' own fields. The
+summary says per channel what the residues show and whether the times are
+right, repaired or wrong (`SmaPlugin._verdicts`).
+
 Commands: ``sma::summary``, ``sma::trend``, ``sma::frame``, ``sma::raw`` (see `commands`).
 """
 
@@ -224,6 +233,27 @@ SETTINGS_DEFAULTS: dict[str, object] = {
         #: carry a few words of an earlier run (the stale-hit rule drops them),
         #: and a beam trip or a slow run stretches one to seconds. 0 = no limit.
         "max frame span ms": 60000.0,
+        #: Epoch repair (sma_words.EpochRepair): a channel whose coarse field
+        #: runs ahead of or behind its fine field by more than half an epoch
+        #: (2^19 ns) has its word times whole 2^20 ns epochs off. y: such a
+        #: channel's times are repaired by whole epochs, chosen by an S1 vote at
+        #: the channel's nominal delay after S1 (from NIM/lag nominal ns and
+        #: NIM/offset ns: only counters with a NIM copy and a nonzero lag
+        #: nominal, and their NIM copies, are candidates). n: the vote still
+        #: runs and is reported, nothing is repaired.
+        "epoch repair": True,
+        #: The vote decides with at least this many in-time coincidences above
+        #: the off-time (accidental) count for the winner...
+        "epoch repair min votes": 200,
+        #: ...and at least this many times the runner-up's, per exposed word.
+        "epoch repair min margin": 5.0,
+        #: A vote: a word with an S1 hit at its nominal delay +- this.
+        "epoch repair tol ns": 5.0,
+        #: The coarse-minus-fine residues must be this concentrated (the
+        #: resultant length R on the 2^20 ns circle: 1 = all equal, ~0 =
+        #: spread evenly) to be a coarse offset; below, a scattered fine/coarse
+        #: fault, never repaired.
+        "coarse offset min R": 0.6,
     },
     "Binning": {
         "words per frame max": 50000,
@@ -482,6 +512,27 @@ def _ratio(a, b, digits=6):
     return _num(a / b, digits) if b else None
 
 
+def _kilo(n) -> str:
+    """A count as the flags say it: 180, 1.8k, 531k, 1.2M."""
+    n = int(n)
+    for div, unit in ((1e6, "M"), (1e3, "k")):
+        if n >= div:
+            x = n / div
+            return f"{x:.1f}{unit}" if x < 10 else f"{x:.0f}{unit}"
+    return str(n)
+
+
+def _dur(ns) -> str:
+    """A time in ns as the flags say it: 66 µs, 1.2 ms."""
+    x = abs(float(ns))
+    return f"{x / 1e6:.2g} ms" if x >= 1e6 else f"{x / 1e3:.0f} µs"
+
+
+def _signed(n: int) -> str:
+    """+1 / −1 (a real minus sign) for the flag texts."""
+    return f"{n:+d}".replace("-", "\u2212")
+
+
 # ---------------------------------------------------------------------------
 # settings
 # ---------------------------------------------------------------------------
@@ -536,6 +587,12 @@ class Config:
     raw_ring_bytes: int = 16 << 20
     seed_ring_frames: int = 8
     seed_ring_bytes: int = 24 << 20
+    #: Cuts/epoch repair and its thresholds.
+    epoch_repair: bool = True
+    epoch_min_votes: int = 200
+    epoch_min_margin: float = 5.0
+    epoch_tol_ns: float = 5.0
+    coarse_min_R: float = 0.6
     mupix: W.MuPixCuts = field(default_factory=W.MuPixCuts)
     xy: X.XYSettings = field(default_factory=X.XYSettings)
     pairs: PR.PairSettings = field(default_factory=PR.PairSettings)
@@ -559,6 +616,26 @@ class Config:
     def merging(self) -> bool:
         """Counters are the merged TOT + NIM hits (NIM/merge on and a NIM copy cabled)."""
         return self.nim.merge and self.nim.active
+
+    def epoch_delays(self) -> dict:
+        """The epoch repair's candidates: channel -> nominal delay after S1 (ns).
+
+        From the NIM settings, which hold every delay the DQM knows: a NIM
+        copy is ``lag nominal ns`` after S1 (its fine minus S1's fine), its TOT
+        word ``offset ns`` before that (t'_NIM = t - offset is the TOT time).
+        Only counters with a NIM copy and a nonzero lag nominal (0 is the
+        unmeasured default); S1 itself is the reference and never a candidate.
+        """
+        out = {}
+        for k, c, n in self.nim.pairs(self.roles.counters):
+            nom = self.nim.nominal[k]
+            if not nom:
+                continue
+            out[n] = float(nom)
+            if c != self.roles.s1:
+                out[c] = float(nom - self.nim.offsets[k])
+        out.pop(self.roles.s1, None)
+        return out
 
 
 def _merge(defaults: dict, given: dict | None) -> dict:
@@ -819,6 +896,11 @@ def parse_settings(settings: dict | None) -> Config:
                                 lambda v: 0 <= v <= 1024) * (1 << 20)),
         max_gap_ns=int(get(C, "max gap s", float, pos) * 1e9),
         max_overlap_ns=int(get(C, "max overlap ms", float, lambda v: v >= 0) * 1e6),
+        epoch_repair=get(C, "epoch repair", _as_bool),
+        epoch_min_votes=get(C, "epoch repair min votes", int, lambda v: v >= 1),
+        epoch_min_margin=get(C, "epoch repair min margin", float, lambda v: v >= 1),
+        epoch_tol_ns=get(C, "epoch repair tol ns", float, lambda v: 0 < v < 1000),
+        coarse_min_R=get(C, "coarse offset min R", float, lambda v: 0 <= v <= 1),
         mupix=mupix, xy=xy, pairs=pairs, nim=nim, binning=binning, check=check,
         errors=errors)
 
@@ -1100,8 +1182,21 @@ NIM_LAG_HELD = 1 << 15
 #: decisive vote, else the epoch's last).
 NIM_COLS = ("tot_words", "nim_words", "paired", "tot_only", "nim_only", "echo", "lag_held",
             "shadow", "multi", "frames", *(f"lag_{x}" for x in N.LAG_STATES), "lag_skipped",
-            "state_ok", "state_faulted")
+            "state_ok", "state_faulted", "eff_paired", "eff_tot_only")
 _NC = {name: k for k, name in enumerate(NIM_COLS)}
+#: An efficiency (timed, or TOT + NIM pair) is withheld when less than this
+#: share of its S1 hits (TOT words) fell in frames with known times and inside
+#: their coverage (see `SmaPlugin._fill_analysis`, `_fill_nim`).
+MIN_COVERED = 0.2
+#: Columns of `_Second.ep` (one row per channel), the epoch repair: frames in
+#: which the channel was in the vote, of them repaired, the words moved, the
+#: frames undecided, the frames decided with an offset of half an epoch or more
+#: (times whole epochs off unless repaired), the words a repair would have
+#: moved but did not (repair off, residues too spread), and the frames whose
+#: times are not known to be right (`sma_words.ChannelEpoch.bad_times`: they
+#: count in no efficiency).
+EP_COLS = ("voted", "repaired", "moved", "undecided", "far", "would", "bad")
+_EP = {name: k for k, name in enumerate(EP_COLS)}
 
 
 class NimWords(NamedTuple):
@@ -1298,7 +1393,7 @@ class _Second:
                  "mp_n", "mp_in", "mp_side", "mp_chip", "mp_rows", "mp_unsorted", "nim",
                  "xy_state", "xy_light", "xy_heavy", "xy_ctrk", "pr_l1", "pr_paired",
                  "pr_partners", "pr_light", "pr_heavy", "pr_ctrk", "pr_mponly", "pr_h1",
-                 "pr_h2")
+                 "pr_h2", "eff_n", "resid", "ep")
 
     def __init__(self, t: int, epoch: int, n_counters: int, scan: tuple):
         self.t = t
@@ -1322,6 +1417,13 @@ class _Second:
         #: n_s1: S1 hits analysed (the sample); n_s1_kept: every kept one.
         self.n_s1 = self.n_s1_kept = 0
         self.eff = np.zeros(n_counters, dtype=np.int64)
+        #: Per counter, the S1 hits its efficiency divides by: n_s1, less the
+        #: S1 hits outside the frame's coverage of an epoch-repaired counter.
+        self.eff_n = np.zeros(n_counters, dtype=np.int64)
+        #: Per channel [n, sum cos, sum sin] of coarse minus fine on the 2^20 ns
+        #: circle (sma_words.residue_sums), and the epoch repair (EP_COLS).
+        self.resid = np.zeros((NCH, 3), dtype=np.float64)
+        self.ep = np.zeros((NCH, len(EP_COLS)), dtype=np.int64)
         self.rf_valid = self.rf_vetoed = 0
         self.scan = scan
         self.shift_counts = np.zeros(len(scan), dtype=np.int64)
@@ -1356,11 +1458,15 @@ class _Second:
 
     def nim_eff(self) -> list | None:
         """Pair efficiency paired / (paired + TOT-only) per counter (S1 first),
-        None for a counter without such hits; None when no counter has any."""
-        p, t = self.nim[:, _NC["paired"]], self.nim[:, _NC["tot_only"]]
-        if not (p + t).any():
+        within the coverage of an epoch repair (``eff_*``, see
+        `SmaPlugin._fill_nim`), None for a counter without such hits; None when
+        no counter has any."""
+        p, t = self.nim[:, _NC["eff_paired"]], self.nim[:, _NC["eff_tot_only"]]
+        full = self.nim[:, _NC["paired"]] + self.nim[:, _NC["tot_only"]]
+        if not full.any():
             return None
-        return [_ratio(a, a + b, 4) for a, b in zip(p, t, strict=True)]
+        return [_ratio(a, a + b, 4) if a + b >= MIN_COVERED * f else None
+                for a, b, f in zip(p, t, full, strict=True)]
 
     def mupix_row(self, widths=(1.0, 1.0)) -> dict | None:
         """The trend's MuPix entry: in-time, sideband and accidental-corrected
@@ -1374,21 +1480,30 @@ class _Second:
                          for a, b in zip(fin, fside, strict=True)],
                 "pix_per_frame": _ratio(self.mp_pix, self.mp_frames, 5)}
 
-    def row(self, counters=(), mismatch_max: float | None = None, widths=(1.0, 1.0)) -> dict:
-        """One trend row. With `counters` and `mismatch_max`, a counter whose
-        fine/coarse mismatch fraction this second exceeds `mismatch_max` gets
-        a null efficiency -- the rule `summary` applies to its window: with a
-        timestamp fault the coincidence misses and the efficiency would read
-        as a dead counter rather than as the fault it is."""
+    def row(self, counters=(), wrong=None, widths=(1.0, 1.0), nim=()) -> dict:
+        """One trend row. With `counters` and `wrong` (this second's per-channel
+        verdicts -> the channels whose times are wrong, `SmaPlugin._verdicts`), a
+        counter whose times are wrong gets a null efficiency, and so does a
+        counter with too few S1 hits in frames with known times (MIN_COVERED),
+        and a TOT + NIM pair (`nim`: the NIM channel per counter) with either
+        channel's times wrong -- the rules `summary` applies to its window:
+        with whole epochs or a fine fault in the times the coincidence misses
+        and the efficiency would read as a dead counter rather than as the
+        fault it is."""
         cover_s = self.cover_ns * 1e-9
         eff = None
+        bad = wrong(self) if wrong is not None else ()
         if self.n_s1:
-            eff = [_ratio(e, self.n_s1, 4) for e in self.eff[1:]]
-            if mismatch_max is not None:
-                for k, c in enumerate(list(counters)[1:len(eff) + 1]):
-                    h = int(self.hits[c])
-                    if h and self.mismatch[c] / h > mismatch_max:
-                        eff[k] = None
+            eff = [_ratio(e, n, 4) if n >= MIN_COVERED * self.n_s1 else None
+                   for e, n in zip(self.eff[1:], self.eff_n[1:], strict=True)]
+            for k, c in enumerate(list(counters)[1:len(eff) + 1]):
+                if c in bad:
+                    eff[k] = None
+        nim_eff = self.nim_eff()
+        if nim_eff is not None:
+            for k, n in enumerate(list(nim)[:len(nim_eff)]):
+                if n >= 0 and (counters[k] in bad or n in bad):
+                    nim_eff[k] = None
         return {
             "t": self.t,
             "frames": self.frames,
@@ -1403,7 +1518,7 @@ class _Second:
             "rf_valid": _ratio(self.rf_valid, self.n_s1, 4),
             "mupix": self.mupix_row(widths),
             # TOT + NIM pair efficiency per counter, S1 first (trend's nim_counters).
-            "nim_eff": self.nim_eff(),
+            "nim_eff": nim_eff,
         }
 
 
@@ -1625,6 +1740,9 @@ class SmaPlugin:
         #: Per counter index k: its NIM channel's lag state this epoch
         #: (`LagMemory`: the sticky state, the vote cadence); cleared with each epoch.
         self._nim_mem: dict[int, LagMemory] = {}
+        #: The epoch repair's vote over the run (Cuts/epoch repair); reset with
+        #: each epoch (a run start, a rebuild).
+        self._epoch = self._make_epoch_repair()
         #: The XY table's position for MuPix x/y: (xpos, ypos) in mm as the
         #: table reads it, where it came from, and a note when it is not the
         #: ODB's (see poll_odb, set_stage). One tuple, swapped whole.
@@ -1673,6 +1791,7 @@ class SmaPlugin:
             for name in self.store.names():
                 if name.startswith("sma/"):
                     self.store.remove(name)
+            self._epoch = self._make_epoch_repair()
             self._build()
             self.rebuilds += 1
             self._new_epoch()
@@ -1767,7 +1886,34 @@ class SmaPlugin:
         self._mp_flagged = False
         self._nim_last = {}
         self._nim_mem = {}
+        self._epoch.reset()
         self._roll(force=True)
+
+    def _make_epoch_repair(self) -> W.EpochRepair:
+        cfg = self.cfg
+        return W.EpochRepair(cfg.epoch_delays(), s1=cfg.roles.s1, shift=cfg.shift,
+                             tol_ns=cfg.epoch_tol_ns, min_votes=cfg.epoch_min_votes,
+                             min_margin=cfg.epoch_min_margin, min_R=cfg.coarse_min_R,
+                             enabled=cfg.epoch_repair)
+
+    def _prepare(self, words) -> W.Frame:
+        """`sma_words.prepare_frame` with the settings and the epoch repair: the
+        frame's words are voted on (`EpochRepair.plan`) before any is repaired;
+        the plan is on the frame (``Frame.epoch``), not yet in the run's vote
+        (`EpochRepair.commit`: a good frame's only)."""
+        cfg, c = self.cfg, self.cfg.cuts
+        plan = []
+
+        def repair(d):
+            plan.append(self._epoch.plan(d))
+            return plan[0].offsets
+
+        fr = W.prepare_frame(words, cfg.shift, c.stale_gap_ns, c.latch_margin_ns,
+                             rescue_shifts=cfg.scan, rescue_min_words=c.rescue_min_words,
+                             rescue_min_fraction=c.rescue_min_fraction, mupix=cfg.mupix,
+                             repair=repair)
+        fr.epoch = plan[0] if plan else None
+        return fr
 
     # -- histograms ------------------------------------------------------------
 
@@ -2186,9 +2332,7 @@ class SmaPlugin:
                 self._prev_extent = None
                 self._prev_timed = None
                 return False
-        fr = W.prepare_frame(words, cfg.shift, c.stale_gap_ns, c.latch_margin_ns,
-                             rescue_shifts=cfg.scan, rescue_min_words=c.rescue_min_words,
-                             rescue_min_fraction=c.rescue_min_fraction, mupix=cfg.mupix)
+        fr = self._prepare(words)
         if words is not data:
             bank_positions(fr, pos, n_zero)
         n_s1, scan_counts = kept_s1_scan(fr, cfg)
@@ -2250,6 +2394,8 @@ class SmaPlugin:
             self.frames_suspect += 1
             sec.suspect += 1
         else:
+            if fr.epoch is not None:
+                self._epoch.commit(fr.epoch)
             gap = self._fill_good(fr, sec, now)
             # TOT + NIM: pair every word, then (merging) the counters are the
             # merged hits from here on -- before the S1 sample is drawn.
@@ -2378,9 +2524,9 @@ class SmaPlugin:
                               else (bank.data, 0, None))
         if words is None:
             return None
-        fr = W.prepare_frame(words, cfg.shift, c.stale_gap_ns, c.latch_margin_ns,
-                             rescue_shifts=cfg.scan, rescue_min_words=c.rescue_min_words,
-                             rescue_min_fraction=c.rescue_min_fraction, mupix=cfg.mupix)
+        # Repaired with the run's vote as it stands now (and this frame's votes),
+        # which it does not change.
+        fr = self._prepare(words)
         if pos is not None:
             bank_positions(fr, pos, n_zero)
         n_s1, scan_counts = kept_s1_scan(fr, cfg)
@@ -2537,7 +2683,63 @@ class SmaPlugin:
         occ = np.zeros(h["fine_bit_occupancy"].counts.shape, dtype=np.int64)
         occ[1:W.FINE_BITS + 1, 1:NCH + 1] = W.per_channel_bit_counts(s_ch, fine).T
         h["fine_bit_occupancy"].add_counts(occ, entries=int(hits.sum()))
+
+        # The coarse-minus-fine residues and the epoch repair (the plan was
+        # committed to the run's vote before this).
+        ep = fr.epoch
+        if ep is not None:
+            sec.resid += ep.residue
+            half = W.FINE_WRAP_NS >> 1
+            rep = fr.repaired or {}
+            for c, ce in ep.channels.items():
+                row = sec.ep[c]
+                row[_EP["voted"]] += 1
+                if c in rep:
+                    row[_EP["repaired"]] += 1
+                    row[_EP["moved"]] += rep[c][1]
+                if ce.k is None:
+                    row[_EP["undecided"]] += 1
+                elif abs(ce.offset_ns) >= half:
+                    row[_EP["far"]] += 1
+                row[_EP["would"]] += ce.would_move
+                row[_EP["bad"]] += ce.bad_times
         return gap
+
+    @staticmethod
+    def _bad_times(fr: W.Frame) -> set:
+        """The channels whose times in this frame are not known to be right
+        (`sma_words.ChannelEpoch.bad_times`)."""
+        ep = fr.epoch
+        return {c for c, ce in ep.channels.items() if ce.bad_times} if ep is not None else set()
+
+    @staticmethod
+    def _coverage(fr: W.Frame, chans, with_s1: bool = True) -> tuple[int, int] | None:
+        """``(lo, hi)``: the part of the frame that every channel of ``chans`` (and
+        S1, ``with_s1``) covers, when at least one of them is epoch-repaired in
+        it; None otherwise (every channel covers the whole frame).
+
+        The frame holds the words whose *coarse* fields fall in its extent. A
+        channel repaired by O holds the words of [first - O, last - O] in true
+        time (``Frame.timed_extent``, the channels with consistent fields): with
+        O = +1.2 ms its partners of the frame's last 1.2 ms of S1 hits are in the
+        next frame. A coincidence or a pair is only counted inside the overlap,
+        shrunk by twice the spread of O in the frame (the circular sd of its
+        residues), so that the frame edge does not read as an inefficiency.
+        """
+        rep = fr.repaired
+        if not rep or not any(c in rep for c in chans):
+            return None
+        offs = [rep[c][0] if c in rep else 0 for c in chans] + ([0] if with_s1 else [])
+        margin = 0.0
+        ep = fr.epoch
+        for c in chans:
+            ce = ep.channels.get(c) if (ep is not None and c in rep) else None
+            if ce is not None:
+                r = min(max(ce.R, 1e-3), 1.0)
+                margin = max(margin, 2.0 * math.sqrt(-2.0 * math.log(r)) / (2 * math.pi)
+                             * W.FINE_WRAP_NS)
+        e = fr.timed_extent
+        return (int(e.first - min(offs) + margin), int(e.last - max(offs) - margin))
 
     def _pair(self, fr: W.Frame, update: bool = False) -> NimFrame | None:
         """`pair_frame` with the epoch's lag memory (advanced only with
@@ -2566,6 +2768,19 @@ class SmaPlugin:
             for name in ("tot_words", "nim_words", "paired", "tot_only", "nim_only", "echo",
                          "shadow", "multi"):
                 row[_NC[name]] += cnt[name]
+            # The pair efficiency's counts: with an epoch-repaired TOT or NIM
+            # channel, only the TOT words inside both channels' coverage.
+            pair = (self.cfg.roles.counters[k], self.cfg.nim.channels[k])
+            cov = self._coverage(fr, pair, with_s1=False)
+            if self._bad_times(fr) & set(pair):
+                pass                    # times not known to be right: no count
+            elif cov is None:
+                row[_NC["eff_paired"]] += cnt["paired"]
+                row[_NC["eff_tot_only"]] += cnt["tot_only"]
+            else:
+                inside = (pr.t_tot >= cov[0]) & (pr.t_tot <= cov[1])
+                row[_NC["eff_paired"]] += int(np.count_nonzero(pr.cls_tot[inside] == N.PAIRED))
+                row[_NC["eff_tot_only"]] += int(np.count_nonzero(pr.cls_tot[inside] == N.TOT_ONLY))
             row[_NC["lag_held"]] += n_held
             row[_NC["frames"]] += 1
             if vote is None:
@@ -2627,7 +2842,32 @@ class SmaPlugin:
         _fill_values(h["pattern"], an.pattern)
         nc = an.partner_counts.shape[1]
         coinc = np.count_nonzero(an.partner_counts > 0, axis=0)
-        sec.eff += coinc
+        # The efficiencies (summary, trend): an epoch-repaired counter counts
+        # only the S1 hits inside its coverage of the frame (`_coverage`); the
+        # histograms take every S1 hit.
+        # A counter whose times in this frame are not known to be right (an
+        # undecided vote on suspect fields, whole epochs off and not repaired)
+        # adds nothing: the summary withholds an efficiency left with too few.
+        eff, eff_n = coinc.copy(), np.full(nc, n1, dtype=np.int64)
+        if fr.repaired or self._bad_times(fr):
+            cfg = self.cfg
+            bad = self._bad_times(fr)
+            for k, c in enumerate(cfg.roles.counters[:nc]):
+                if c == cfg.roles.s1:
+                    continue
+                n = cfg.nim.channels[k] if cfg.merging and k < len(cfg.nim.channels) else -1
+                chans = (c, n) if n >= 0 else (c,)
+                if bad & set(chans):
+                    eff[k] = eff_n[k] = 0
+                    continue
+                cov = self._coverage(fr, chans)
+                if cov is None:
+                    continue
+                inside = (an.t_s1 >= cov[0]) & (an.t_s1 <= cov[1])
+                eff[k] = int(np.count_nonzero(an.partner_counts[inside, k] > 0))
+                eff_n[k] = int(np.count_nonzero(inside))
+        sec.eff += eff
+        sec.eff_n += eff_n
         cc = np.zeros(h["s1_coinc"].counts.shape, dtype=np.int64)
         cc[1:nc + 1] = coinc
         h["s1_coinc"].add_counts(cc, entries=n1)
@@ -3092,8 +3332,9 @@ class SmaPlugin:
         rate_hits = vec("rate_hits")
         n_s1 = total("n_s1")
         nc = len(cfg.roles.counters)
-        eff = vec("eff", nc)
+        eff, eff_n = vec("eff", nc), vec("eff_n", nc)
         labels = self.labels()
+        verdicts = self._verdicts(hits, mism, self._sum2(secs, "resid"), self._sum2(secs, "ep"))
 
         channels = [{
             "ch": c, "label": labels[c], "role": self._role_of(c),
@@ -3106,6 +3347,9 @@ class SmaPlugin:
             "flagged": c in cfg.flag_channels,
             #: A NIM row's counter channel, a counter's NIM channel, else None.
             "pair_of": self._pair_of(c),
+            #: The coarse-minus-fine residues and the word times (`_verdicts`):
+            #: kind, offset_ticks, R, times, and the epoch repair's vote.
+            **verdicts[c],
         } for c in range(NCH)]
         efficiency = []
         for k, c in enumerate(cfg.roles.counters):
@@ -3113,12 +3357,21 @@ class SmaPlugin:
                 continue
             m = channels[c]["mismatch_frac"]
             reason = None
-            e = _ratio(eff[k], n_s1, 4)
-            # A timed efficiency needs the counter's timestamps: with a fine
-            # fault the coincidence misses by microseconds and the number
-            # would read as a dead counter. Null, with the reason, instead.
-            if m is not None and m > chk["mismatch warn fraction"]:
-                e, reason = None, f"timestamp fault: {m:.1%} mismatch"
+            e = _ratio(eff[k], eff_n[k], 4)
+            # A timed efficiency needs the counter's word times: with whole
+            # epochs or a fine fault in them the coincidence misses and the
+            # number would read as a dead counter. Null, with the reason,
+            # instead. Times that are right (an offset under half an epoch) or
+            # repaired keep their efficiency; a coarse offset that cannot be
+            # voted on ("unknown") is withheld as before.
+            if channels[c]["times"] in ("wrong", "unknown"):
+                e, reason = None, (f"timestamp fault: times {channels[c]['times']} "
+                                   f"({(m or 0):.1%} mismatch)")
+            elif n_s1 and eff_n[k] < MIN_COVERED * n_s1:
+                # Most S1 hits fell in frames whose times are not known to be
+                # right, or outside the frames' coverage: too few to quote.
+                e, reason = None, (f"timestamp fault: only {_pct(eff_n[k] / n_s1)} of the S1 "
+                                   "hits where its times are known and covered")
             efficiency.append({"counter": f"S{k + 1}", "ch": c, "label": labels[c],
                                "eff": e, "reason": reason})
         shift = self.shift_verdict(now)
@@ -3177,9 +3430,14 @@ class SmaPlugin:
             "rf": {"n_s1": n_s1, "valid_frac": _ratio(total("rf_valid"), n_s1, 4),
                    "vetoed_frac": _ratio(total("rf_vetoed"), n_s1, 4)},
             "shift": shift,
-            #: Counters with a known fine/coarse fault (the ``mismatch`` flags'
-            #: rule); SMAEvents' "incomplete pattern" leaves them out.
-            "timestamp_faults": self._timestamp_faults(hits, mism, shift["verdict"]),
+            #: Counters whose word times are wrong (`_verdicts`); SMAEvents'
+            #: "incomplete pattern" leaves them out.
+            "timestamp_faults": self._timestamp_faults(hits, mism, shift["verdict"], verdicts),
+            #: Cuts/epoch repair: on or off, and the channels it may repair.
+            "epoch_repair": {"enabled": cfg.epoch_repair,
+                             "candidates": {str(c): v for c, v in
+                                            sorted(self._epoch.delays.items())},
+                             "active": self._epoch.active},
             "mupix": self._mupix_summary(secs, now),
             "xy": self._xy_summary(secs),
             "pairs": self._pairs_summary(secs),
@@ -3192,6 +3450,32 @@ class SmaPlugin:
             "settings_errors": list(cfg.errors),
         }
         nim = self._nim_summary(secs, now, hits)
+        for r in nim["counters"]:
+            # The pair efficiency, like the timed one, needs both channels'
+            # times, and enough of the pairs in frames where they are known.
+            bad = [c for c in (r["ch"], r["nim_ch"])
+                   if verdicts[c]["times"] in ("wrong", "unknown")]
+            full = r["paired"] + r["tot_only"]
+            if bad:
+                r["pair_eff"] = None
+                r["pair_eff_reason"] = ("timestamp fault: times " + verdicts[bad[0]]["times"]
+                                        + " on " + " and ".join(f"ch {c}" for c in bad))
+            elif full and r["eff_paired"] + r["eff_tot_only"] < MIN_COVERED * full:
+                r["pair_eff"] = None
+                r["pair_eff_reason"] = (
+                    f"timestamp fault: only {_pct((r['eff_paired'] + r['eff_tot_only']) / full)}"
+                    " of the TOT words where both channels' times are known and covered")
+            # The lag vote pairs a NIM word with the S1 word of the same coarse
+            # field: with a coarse offset that is the wrong S1 word, and any
+            # lag it finds means nothing. Only where the epoch vote has shown
+            # it to be a coarse offset (the fine times meet S1 at whole epochs);
+            # a fine-time lag also puts fine and coarse apart, and there the
+            # lag vote is the diagnosis.
+            v = verdicts[r["nim_ch"]]
+            if (v["kind"] == "coarse_offset" and v["times"] in ("repaired", "ok")
+                    and (v["repair"] or {}).get("k") is not None):
+                r["lag"]["na"] = "coarse offset (repaired)" if v["times"] == "repaired" \
+                    else "coarse offset (times right)"
         out["nim"] = nim
         #: Whether the counters are the merged TOT + NIM hits (pattern,
         #: efficiencies, seeds), and the NIM channels whose NIM-only hits a
@@ -3210,7 +3494,9 @@ class SmaPlugin:
         unpaired NIM word, ``lag_held`` those of them held back from the
         merge), ``pair_eff`` = paired / (paired + TOT-only; echo words are
         left out of the denominator, as reco's pair fraction does and smanim's
-        ``tot_with_nim`` = pairs / all TOT words does not), ``purity`` =
+        ``tot_with_nim`` = pairs / all TOT words does not; with an
+        epoch-repaired channel only the TOT words inside the frames' coverage,
+        ``eff_paired`` / ``eff_tot_only``, see `_fill_nim`), ``purity`` =
         paired / NIM words, ``nim_only_frac`` = NIM-only / merged hits (paired
         + TOT-only + echo + NIM-only: what the merge adds), ``median_dt_ns``
         and ``dt_entries``, ``lag``: frames per vote state (``skipped``: not
@@ -3240,7 +3526,10 @@ class SmaPlugin:
                 "label": labels[c], "nim_label": labels[n],
                 "tot_hits": int(hits[c]), "nim_hits": int(hits[n]),
                 **{name: a[name] for name in NIM_COLS[:10]},
-                "pair_eff": _ratio(a["paired"], a["paired"] + a["tot_only"], 4),
+                # Within the coverage of an epoch repair (`_fill_nim`); the
+                # same as paired and tot_only otherwise.
+                "eff_paired": a["eff_paired"], "eff_tot_only": a["eff_tot_only"],
+                "pair_eff": _ratio(a["eff_paired"], a["eff_paired"] + a["eff_tot_only"], 4),
                 "purity": _ratio(a["paired"], a["nim_words"], 4),
                 "nim_only_frac": _ratio(a["nim_only"], merged, 4),
                 "median_dt_ns": _num(med, 4), "dt_entries": n_dt,
@@ -3262,28 +3551,29 @@ class SmaPlugin:
                 "pair_window_ns": nim.cfg.pair_window_ns, "time_source": nim.cfg.time_source,
                 "counters": rows}
 
-    def _timestamp_faults(self, hits, mism, verdict: str) -> dict:
-        """The counters (S1..S5) with a known timestamp fault, by the rule the
-        summary's per-channel ``mismatch`` flags use (`_flags`): a flagged
-        channel with at least ``min hits`` hits whose fine/coarse mismatch
-        fraction over the summary window is above ``mismatch warn fraction``,
-        and only while the shift verdict is ok (otherwise every channel's
-        mismatch describes the setting, not the board: nothing is judged).
+    def _timestamp_faults(self, hits, mism, verdict: str, verdicts: list) -> dict:
+        """The counters (S1..S5) whose word times are wrong or unknown
+        (`_verdicts`: a scattered fine/coarse fault, or a coarse offset whose
+        epochs are undecided, not repaired or not voted on), among the flagged
+        channels, and only while the
+        shift verdict is ok (otherwise every channel's mismatch describes the
+        setting, not the board: nothing is judged). A counter with a coarse
+        offset whose times are right or repaired is not listed.
 
         ``{"verdict", "judged", "counters": [{"counter": k (1 = S1), "ch",
-        "label", "mismatch_frac"}]}``.
+        "label", "mismatch_frac", "times"}]}``.
         """
-        chk, cfg = self.cfg.check, self.cfg
+        cfg = self.cfg
         labels = self.labels()
         out = {"verdict": verdict, "judged": verdict == "ok", "counters": []}
         if verdict != "ok":
             return out
         for k, c in enumerate(cfg.roles.counters):
             m = _ratio(mism[c], hits[c], 4)
-            if (c in cfg.flag_channels and hits[c] >= chk["min hits"] and m is not None
-                    and m > chk["mismatch warn fraction"]):
+            t = verdicts[c]["times"]
+            if c in cfg.flag_channels and t in ("wrong", "unknown"):
                 out["counters"].append({"counter": k + 1, "ch": int(c), "label": labels[c],
-                                        "mismatch_frac": m})
+                                        "mismatch_frac": m, "times": t})
         return out
 
     def timestamp_faults(self, now: float | None = None) -> dict:
@@ -3296,8 +3586,131 @@ class SmaPlugin:
             return sum((getattr(s, attr) for s in secs if len(getattr(s, attr)) == NCH),
                        np.zeros(NCH, dtype=np.int64))
 
-        return self._timestamp_faults(vec("hits"), vec("mismatch"),
-                                      self.shift_verdict(now)["verdict"])
+        hits, mism = vec("hits"), vec("mismatch")
+        verdicts = self._verdicts(hits, mism, self._sum2(secs, "resid"), self._sum2(secs, "ep"))
+        return self._timestamp_faults(hits, mism, self.shift_verdict(now)["verdict"], verdicts)
+
+    @staticmethod
+    def _sum2(secs: list, attr: str) -> np.ndarray:
+        """A per-channel 2D accumulator (``resid``, ``ep``) summed over ``secs``."""
+        out = None
+        for s in secs:
+            a = getattr(s, attr)
+            out = a.copy() if out is None else out + a
+        return out if out is not None else getattr(_Second(0, 0, 0, ()), attr)
+
+    def _verdicts(self, hits, mism, resid, ep, with_repair: bool = True) -> list[dict]:
+        """Per channel: what its coarse-minus-fine residues say and whether its
+        word times are right, from sums over a window (the summary's, or one
+        second's for a trend row) and the run's epoch vote.
+
+        * ``kind`` (None without hits): "healthy"; "coarse_offset" when more
+          than ``mismatch warn fraction`` of the hits are fine/coarse
+          inconsistent, or the vote has moved (or would move) words by whole
+          epochs, and the residues are concentrated (R >= Cuts/coarse offset
+          min R) at more than EPOCH_MIN_OFFSET_TICKS from 0 or the vote says
+          so; else "scattered" (a fine-bit fault, or a coarse field drifting
+          within a frame).
+        * ``offset_ticks``: the decided offset of the epoch vote (whole epochs
+          included), else the residues' circular mean (known modulo an epoch
+          only); ``R``.
+        * ``times``: "ok" (healthy, or an offset that moves no word),
+          "repaired" (words were moved by whole epochs), "wrong" (scattered;
+          a coarse offset whose times are not known to be right in most of its
+          frames (undecided, or not repaired), or with words that a repair
+          would move but did not), "unknown" (a coarse offset on a channel
+          without a nominal delay: no vote). None without hits. Like the
+          efficiency rule before it, judged on any number of hits; the flags
+          still need ``min hits``.
+        * ``repair``: the channel's epoch vote (`_repair_info`), None without one
+          (or without ``with_repair``: a trend row needs only ``times``).
+        """
+        chk, cfg = self.cfg.check, self.cfg
+        tick = 1 << cfg.shift
+        mean, R = W.circ_of_sums(resid)
+        out = []
+        for c in range(NCH):
+            h = int(hits[c])
+            m = mism[c] / h if h else 0.0
+            e = ep[c]
+            info = self._repair_info(c, h, e) if with_repair else None
+            decided = self._epoch.offset_of(c)
+            off = mean[c] if decided is None else decided
+            kind = times = None
+            moved = e[_EP["repaired"]] or e[_EP["would"]] or e[_EP["far"]]
+            if h:
+                kind, times = "healthy", "ok"
+                if m > chk["mismatch warn fraction"] or moved:
+                    if moved or (R[c] >= cfg.coarse_min_R and math.isfinite(off)
+                                 and abs(off) > W.EPOCH_MIN_OFFSET_TICKS * tick):
+                        kind = "coarse_offset"
+                        if not e[_EP["voted"]]:
+                            times = "unknown"
+                        elif 2 * e[_EP["bad"]] > e[_EP["voted"]]:
+                            times = "wrong"
+                        elif e[_EP["moved"]]:
+                            times = "repaired"
+                        elif e[_EP["would"]] or e[_EP["far"]]:
+                            times = "wrong"
+                        else:
+                            times = "ok"
+                    else:
+                        kind, times = "scattered", "wrong"
+            out.append({"kind": kind, "times": times,
+                        "offset_ticks": _num(off / tick, 4) if math.isfinite(off) else None,
+                        "R": _num(R[c], 3) if resid[c, 0] else None, "repair": info})
+        return out
+
+    def _repair_info(self, c: int, hits: int, e) -> dict | None:
+        """Channel ``c``'s epoch vote: the run's (since the run start or its last
+        resync) and the window's frames (``e``, a row of EP_COLS); None when it
+        was never voted on in this run.
+
+        The candidates are labelled by the correction they apply to the word
+        times (``correction``, whole epochs, -1 = one epoch earlier;
+        `sma_words.epoch_correction`): ``votes`` = [[correction, in time, off time
+        (scaled to the in-time window), exposed words], ...] for every candidate
+        with exposed words. Once one is decided only it and its two neighbours
+        are voted on, so the others stop counting: the neighbours staying at
+        their off-time level is the check that the choice is not made up.
+        ``correction``: the decided one (0 for an offset under half an epoch,
+        where only the words past it move, by ``moved_by``). ``undecided``: why
+        not, with ``excess`` (in time less off time, of ``min_votes``),
+        ``frame_ms`` / ``offset_ms`` for "short".
+        """
+        er = self._epoch
+        st = er.states.get(c)
+        if st is None and not e[_EP["voted"]]:
+            return None
+        dec = er.decision(c)
+        votes = st.votes if st is not None else W._no_votes()
+        ref = st.ref if st is not None else 0.0
+        off = er.offset_of(c)
+        corr = None if off is None else W.epoch_correction(off)
+        table = [[W.epoch_correction(ref + (k << W.FINE_BITS)), int(votes[0, j]),
+                  _num(votes[1, j] * er.scale, 4), int(votes[2, j])]
+                 for j, k in enumerate(W.EPOCH_CANDIDATES) if votes[2, j]]
+        table.sort(key=lambda r: r[0])
+        moved_by = None
+        if off is not None:
+            moved_by = corr or (-1 if off > 0 else 1)
+        short = er.unexposed_offset(c) if dec.reason == "short" else None
+        return {"enabled": self.cfg.epoch_repair, "nominal_ns": er.delays.get(c),
+                "correction": corr, "moved_by": moved_by, "offset_ns": off,
+                "votes": table, "in_time": dec.inn, "off_time": _num(dec.off, 4),
+                "excess": _num(dec.excess, 6), "runner_up": _num(dec.runner_up, 6),
+                "min_votes": er.min_votes,
+                "undecided": dec.reason or None,
+                "frame_ms": _num(st.span / 1e6, 3) if st is not None and short else None,
+                "offset_ms": _num(short / 1e6, 3) if short is not None else None,
+                "R_run": _num(st.R, 3) if st is not None else None,
+                "frames": int(e[_EP["voted"]]), "repaired_frames": int(e[_EP["repaired"]]),
+                "undecided_frames": int(e[_EP["undecided"]]),
+                "bad_frames": int(e[_EP["bad"]]),
+                "moved": int(e[_EP["moved"]]), "moved_share": _ratio(e[_EP["moved"]], hits, 4),
+                "would_move": int(e[_EP["would"]]),
+                "would_move_share": _ratio(e[_EP["would"]], hits, 4),
+                "resyncs": er.resyncs.get(c, 0)}
 
     def incomplete_rule(self, faults: dict) -> dict:
         """How the ``incomplete`` oddity judges seeds, given `timestamp_faults`:
@@ -3549,10 +3962,12 @@ class SmaPlugin:
             m = c["mismatch_frac"] or 0.0
             if not time_base_ok:
                 pass
+            elif c.get("kind") == "coarse_offset":
+                add(*self._coarse_offset_text(c, m), ch=c["ch"])
             elif m > chk["mismatch error fraction"]:
                 add("error", "mismatch",
                     f"{c['label']} (ch {c['ch']}): {m:.0%} of hits fine/coarse inconsistent "
-                    "(a fine-bit fault such as fine = t/2)")
+                    f"(a fine-bit fault).{self._pair_text(c['ch'])}".rstrip())
             elif m > chk["mismatch warn fraction"]:
                 add("warn", "mismatch",
                     f"{c['label']} (ch {c['ch']}): {m:.1%} of hits fine/coarse inconsistent")
@@ -3581,6 +3996,82 @@ class SmaPlugin:
             add("warn", "settings", "; ".join(s["settings_errors"]))
         return flags
 
+    def _coarse_offset_text(self, c: dict, m: float) -> tuple[str, str, str]:
+        """``(severity, "mismatch", text)`` of a channel whose coarse field is
+        offset from its fine field (`_verdicts` kind "coarse_offset"), by what
+        its times are: repaired or still right (warn), not known yet (warn),
+        wrong or unknown (error). Corrections are said as what is done to the
+        word times (``moved -1 epoch`` = one epoch earlier)."""
+        lab = f"{c['label']} (ch {c['ch']})"
+        tick = 1 << self.cfg.shift
+        o = c["offset_ticks"] or 0.0
+        size = f"{abs(o):.0f} ticks ({_dur(o * tick)}) {'late' if o > 0 else 'early'} on fine"
+        rp = c.get("repair") or {}
+        coinc = (f"S1 coincidences {_kilo(rp.get('in_time') or 0)} in time, "
+                 f"{_kilo(round(rp.get('off_time') or 0))} off time")
+        times = c["times"]
+        pair = self._pair_text(c["ch"])
+        if times == "repaired" and 2 * rp.get("bad_frames", 0) <= rp.get("frames", 0):
+            n = rp.get("moved_by") or 0
+            ep = f"{_signed(n)} epoch{'s' if abs(n) != 1 else ''}"
+            moved = rp.get("moved_share") or 0.0
+            what = (f"times moved by {ep}" if rp.get("correction") else
+                    f"the {_pct(moved)} of hits past half an epoch moved by {ep}")
+            late = ""
+            if rp.get("bad_frames"):
+                late = (f" ({rp['bad_frames']} of {rp['frames']} frames before the vote "
+                        "decided left out of the efficiencies)")
+            return ("warn", "mismatch", f"{lab}: coarse field {size}; {what} ({coinc}){late}. "
+                    "Resynchronise the SMA when convenient.")
+        if times == "ok":
+            return ("warn", "mismatch", f"{lab}: coarse field {size}; times still right "
+                    f"({coinc}). Resynchronise the SMA before it reaches half an epoch "
+                    f"({1 << (W.FINE_BITS - 1 - self.cfg.shift)} ticks).")
+        wrap = 1 << (W.FINE_BITS - self.cfg.shift)
+        if times == "unknown":
+            sev = "error" if m > self.cfg.check["mismatch error fraction"] else "warn"
+            return (sev, "mismatch",
+                    f"{lab}: coarse field {size} (modulo an epoch, {wrap} ticks) on {_pct(m)} of "
+                    "hits; no nominal delay to S1 for this channel (NIM/lag nominal ns), so its "
+                    "epochs cannot be voted on and its times may be whole epochs (1.05 ms) off."
+                    f"{pair} Resynchronise the SMA when convenient.")
+        why = rp.get("undecided")
+        if rp.get("correction") is None and why == "few":
+            return ("warn", "mismatch",
+                    f"{lab}: coarse field {size} modulo an epoch ({wrap} ticks); times not "
+                    f"checked yet: not enough S1 coincidences yet ({max(0, round(rp['excess']))} "
+                    f"of {rp['min_votes']}). Its efficiencies wait for the vote.")
+        if rp.get("correction") is None and why == "short":
+            what = (f"frames shorter than the coarse offset ({rp.get('frame_ms')} ms vs "
+                    f"{rp.get('offset_ms')} ms): its words' S1 partners are in the frame before, "
+                    "so the epochs cannot be voted on")
+        elif rp.get("correction") is None:
+            what = (f"fine and coarse fields {abs(o):.0f} ticks apart (modulo an epoch, {wrap} "
+                    f"ticks) and no whole-epoch shift brings its hits to S1 (best {coinc}): a "
+                    "coarse offset past half an epoch, or a fine-time fault")
+        elif not rp.get("enabled"):
+            what = (f"coarse field {size}, and epoch repair is off (/DQM/SMA/Cuts/epoch repair): "
+                    f"{_pct(rp.get('would_move_share') or 0)} of hits are whole epochs off")
+        elif rp.get("frames") and 2 * rp.get("bad_frames", 0) > rp["frames"]:
+            what = (f"coarse field {size}; the vote decided ({coinc}) but most frames "
+                    f"({rp['bad_frames']} of {rp['frames']}) came before it or were not "
+                    "repaired")
+        else:
+            what = (f"coarse field {size}, past half an epoch, and its residues too spread to "
+                    f"repair (R {rp.get('R_run')}, Cuts/coarse offset min R "
+                    f"{self.cfg.coarse_min_R:g})")
+        return ("error", "mismatch", f"{lab}: timestamps wrong: {what}.{pair} Resynchronise "
+                "the SMA (FEB reprogram or power cycle).")
+
+    def _pair_text(self, c: int) -> str:
+        """" Its TOT + NIM pairing (S2 + S2L) ..." for a channel with a NIM partner."""
+        labels = self.labels()
+        for _k, ct, n in self.cfg.nim.pairs(self.cfg.roles.counters):
+            if c in (ct, n):
+                return (f" Its TOT + NIM pairing ({labels[ct]} + {labels[n]}) collapses with it "
+                        "(pair efficiency withheld).")
+        return ""
+
     def _nim_flags(self, s: dict, add, time_base_ok: bool = True) -> None:
         """nim_missing, nim_pairing, nim_offset, nim_lag, per counter with a NIM
         copy; each needs ``min hits`` (TOT hits; TOT words paired or not; dt
@@ -3588,18 +4079,25 @@ class SmaPlugin:
 
         Only ``nim_missing`` (it counts hits) is judged whatever the time base.
         The others compare times: like the efficiency flags they wait for the
-        shift check to say ok (``time_base_ok``), and ``nim_pairing`` /
-        ``nim_offset`` skip a counter whose TOT channel has a known timestamp
-        fault (``timestamp_faults``). The NIM channel's own fine/coarse
-        mismatch does not gate them: the lag fault is such a mismatch.
-        ``nim_lag`` also needs ``nim lag min votes`` frames voted "faulted"
-        since the last rebuild or run start, and judges the lag state of the
-        window's frames (a quiet or unvoted frame takes the last decisive
-        vote)."""
+        shift check to say ok (``time_base_ok``). With the TOT or the NIM
+        channel's times wrong or unknown (`_verdicts`) the pair efficiency is
+        withheld and ``nim_offset`` skips the pair; ``nim_pairing`` then says
+        so only when no mismatch flag of its own reports that channel (the
+        mismatch flag's text says the pairing collapsed).
+        The NIM channel's fine/coarse mismatch alone does not gate them: the
+        lag fault is such a mismatch. ``nim_lag`` also needs ``nim lag min
+        votes`` frames voted "faulted" since the last rebuild or run start, and
+        judges the lag state of the window's frames (a quiet or unvoted frame
+        takes the last decisive vote); it is not raised for a NIM channel whose
+        coarse offset the epoch vote has shown (lag ``na``)."""
         chk = self.cfg.check
         min_hits = chk["min hits"]
         win = f"{s['window_s']:.0f} s"
-        bad_tot = {f["ch"] for f in (s.get("timestamp_faults") or {}).get("counters", [])}
+        # Every channel whose times are wrong or unknown, NIM copies included
+        # (`_verdicts`), and those of them that have a mismatch flag of their own.
+        wrong = {c["ch"] for c in s["channels"] if c.get("times") in ("wrong", "unknown")}
+        own_flag = {c["ch"] for c in s["channels"] if c["ch"] in wrong and c["flagged"]
+                    and c["hits"] >= min_hits}
         flag = add
         for r in s["nim"]["counters"]:
             tot, nim = f"{r['label']} (ch {r['ch']})", f"{r['nim_label']} (ch {r['nim_ch']})"
@@ -3617,9 +4115,15 @@ class SmaPlugin:
             if not time_base_ok:
                 continue
             e = r["pair_eff"]
-            if r["ch"] in bad_tot:
-                e = None
-            if e is not None and r["paired"] + r["tot_only"] >= min_hits:
+            bad = [c for c in (r["ch"], r["nim_ch"]) if c in wrong]
+            if bad and not own_flag & set(bad) and r["paired"] + r["tot_only"] >= min_hits:
+                # Withheld for a timestamp fault that no mismatch flag reports
+                # (a channel outside Self check/mismatch flag channels).
+                add("warn", "nim_pairing",
+                    f"{tot} + {nim}: pair efficiency withheld: timestamp fault on "
+                    + " and ".join(f"ch {c}" for c in bad)
+                    + f" ({r.get('pair_eff_reason') or 'times wrong'})")
+            elif e is not None and r["eff_paired"] + r["eff_tot_only"] >= min_hits:
                 sev = ("error" if e < chk["nim pairing error fraction"] else
                        "warn" if e < chk["nim pairing warn fraction"] else None)
                 if sev:
@@ -3629,14 +4133,18 @@ class SmaPlugin:
                         f"{r['median_dt_ns']} ns): NIM threshold, timing (NIM/offset ns) "
                         "or a lag fault")
             m = r["median_dt_ns"]
-            if (m is not None and r["ch"] not in bad_tot and r["dt_entries"] >= min_hits
-                    and abs(m) > chk["nim offset max ns"]):
+            if (m is not None and r["ch"] not in wrong and r["nim_ch"] not in wrong
+                    and r["dt_entries"] >= min_hits and abs(m) > chk["nim offset max ns"]):
                 add("warn", "nim_offset",
                     f"{nim}: median NIM - TOT (since the run start or the last settings change) "
                     f"is {m:g} ns after the {r['offset_ns']} ns offset: "
                     f"set /DQM/SMA/NIM/offset ns[{r['k'] - 1}] = {r['offset_ns'] + round(m)}")
             lg = r["lag"]
             ff = lg["state_faulted_frac"]
+            if lg.get("na"):
+                # A coarse offset: the lag vote's pairs (equal coarse fields)
+                # are the wrong S1 words; the mismatch flag says what is wrong.
+                continue
             if (ff is not None and r["nim_words"] >= min_hits and ff > chk["nim lag max fraction"]
                     and lg["epoch_faulted_votes"] >= chk["nim lag min votes"]):
                 held = (f"; its NIM-only hits ({r['lag_held']}) were held back from the merge"
@@ -3691,20 +4199,21 @@ class SmaPlugin:
         def eff(secs):
             n = sum(s.n_s1 for s in secs)
             e = sum((s.eff for s in secs if s.eff.size == nc), np.zeros(nc, dtype=np.int64))
-            return n, e
+            d = sum((s.eff_n for s in secs if s.eff_n.size == nc), np.zeros(nc, dtype=np.int64))
+            return n, e, d
 
-        n_r, e_r = eff(recent)
-        n_b, e_b = eff(base)
+        n_r, e_r, d_r = eff(recent)
+        n_b, e_b, d_b = eff(base)
         if n_r < chk["min hits"] or n_b - n_r < chk["min hits"]:
             return []
         # The baseline without the recent part, so a drop is not diluted by itself.
-        n_o, e_o = n_b - n_r, e_b - e_r
+        e_o, d_o = e_b - e_r, d_b - d_r
         out = []
         labels = self.labels()
         for k, c in enumerate(cfg.roles.counters):
-            if c == cfg.roles.s1 or c in skip:
+            if c == cfg.roles.s1 or c in skip or not d_r[k] or not d_o[k]:
                 continue
-            r, b = e_r[k] / n_r, e_o[k] / n_o
+            r, b = e_r[k] / d_r[k], e_o[k] / d_o[k]
             if b - r > chk["efficiency drop"]:
                 out.append({"severity": "warn", "code": "efficiency_drop",
                             "text": f"{labels[c]} (ch {c}) timed efficiency given S1 fell "
@@ -3724,10 +4233,16 @@ class SmaPlugin:
         for s in self._seconds:
             if s.t >= now - TREND_S and (since is None or s.t > since):
                 by_t.setdefault(s.t, []).append(s)
-        warn = self.cfg.check["mismatch warn fraction"]
         counters = self.cfg.roles.counters
         widths = self._mupix_widths()
-        rows = [(v[0] if len(v) == 1 else _merge_seconds(v)).row(counters, warn, widths)
+
+        def wrong(sec):
+            # This second's verdicts, by the summary's rule (`_verdicts`).
+            v = self._verdicts(sec.hits, sec.mismatch, sec.resid, sec.ep, with_repair=False)
+            return {c for c in counters if v[c]["times"] in ("wrong", "unknown")}
+
+        nim = list(self.cfg.nim.channels) or [-1] * len(counters)
+        rows = [(v[0] if len(v) == 1 else _merge_seconds(v)).row(counters, wrong, widths, nim)
                 for _t, v in sorted(by_t.items())]
         return {"t": now, "labels": self.labels(),
                 # The columns of each row's "eff": the counters after S1.
@@ -4043,6 +4558,11 @@ class SmaPlugin:
         if fr.n_zero:
             # Only when some were dropped: a clean frame's payload is unchanged.
             meta["n_zero"] = fr.n_zero
+        if fr.repaired:
+            # The epoch-repaired channels (Cuts/epoch repair): channel -> [O ns,
+            # words moved]; their lanes are tagged. Only when there are some,
+            # so a frame without them keeps its payload byte for byte.
+            meta["repaired"] = {str(c): [o, m] for c, (o, m) in sorted(fr.repaired.items())}
         if snap.nim is not None:
             # With NIM copies configured when the frame was analysed: its
             # channel map (as sma::summary's "roles"; -1 = none, "nim" follows
@@ -4340,8 +4860,11 @@ def _merge_seconds(secs: list[_Second]) -> _Second:
         out.mp_chip += s.mp_chip
         if s.eff.size == out.eff.size:
             out.eff += s.eff
+            out.eff_n += s.eff_n
         if s.nim.shape == out.nim.shape:
             out.nim += s.nim
+        out.resid += s.resid
+        out.ep += s.ep
     return out
 
 

@@ -516,6 +516,38 @@ function labelOf(ch, r) {
 }
 
 /**
+ * The frame's epoch-repaired channels (meta.repaired, Cuts/epoch repair):
+ * {ch: {o: offset ns, moved: hits moved}}; {} when none.
+ */
+function repairedOf(frame) {
+  const out = {};
+  const r = ((frame && frame.meta) || {}).repaired || {};
+  for (const [c, v] of Object.entries(r)) out[c] = { o: v[0], moved: v[1] };
+  return out;
+}
+
+/**
+ * How far a repaired word moves: −round(O / 2^20) epochs, half up as the
+ * analyzer rounds (sma_words.epoch_correction); −1 for an offset under half
+ * an epoch (only the words past it move).
+ */
+function epochText(o) {
+  const k = -Math.floor(o / 1048576 + 0.5) || (o > 0 ? -1 : 1);
+  return `${k > 0 ? "+" : "−"}${Math.abs(k)} epoch${Math.abs(k) === 1 ? "" : "s"}`;
+}
+
+/** A small "repaired" tag at the right end of a lane or row whose times were repaired. */
+function repairTag(ctx, x1, yMid) {
+  ctx.save();
+  ctx.font = "italic 10px sans-serif";
+  ctx.textAlign = "right";
+  ctx.textBaseline = "middle";
+  ctx.fillStyle = "#1f5fa8";
+  ctx.fillText("epoch-repaired", x1 - 4, yMid);
+  ctx.restore();
+}
+
+/**
  * Seeded-view lanes: counters in order (each with its NIM copy's lane right
  * under it, `nim: true`, `edge` the counter's colour), RF, delayed channels, current, then
  * the MuPix planes when the frame has a pixel block (L1 and L2 always, "no
@@ -713,6 +745,15 @@ function frameHeader(frame, holder) {
                              "yellow"));
   }
   if (m.shift !== undefined) holder.appendChild(badge(`coarse shift ${m.shift}`));
+  const rep = repairedOf(frame);
+  const repCh = Object.keys(rep);
+  if (repCh.length) {
+    // Cuts/epoch repair: these channels' times were moved by whole epochs
+    // (their coarse field is offset from the fine one); the lanes say so too.
+    holder.appendChild(badge("times epoch-repaired: " + repCh.map((c) =>
+      `${labelOf(Number(c))} (${c}) ${num(rep[c].moved)} hits moved ${epochText(rep[c].o)}`)
+      .join(", "), "blue"));
+  }
   const mp = m.mupix;
   if (mp && mp.per_plane) {
     const pp = mp.per_plane;
@@ -1002,6 +1043,7 @@ function paintSeed(canvas, frame, seed, a, b, ls, laneOf, range, nums, pix) {
 
   ctx.fillStyle = "#fff";
   ctx.fillRect(0, 0, W, H);
+  const rep = repairedOf(frame);
   ls.forEach(function (l, i) {
     const y = MARGIN.top + i * LANE_H;
     if (i % 2) { ctx.fillStyle = "#f4f4f4"; ctx.fillRect(x0, y, x1 - x0, LANE_H); }
@@ -1010,6 +1052,7 @@ function paintSeed(canvas, frame, seed, a, b, ls, laneOf, range, nums, pix) {
     ctx.textBaseline = "middle";
     ctx.textAlign = "right";
     ctx.fillText(l.pix === undefined ? `${l.label} (${l.ch})` : l.label, x0 - 6, y + LANE_H / 2);
+    if (l.pix === undefined && rep[l.ch]) repairTag(ctx, x1, y + LANE_H / 2);
   });
   const s1Seed = seed.seed_ch === undefined || seed.seed_ch === roles().counters[0];
   timeAxis(ctx, range, X, MARGIN.top + ls.length * LANE_H, s1Seed ? "ns from S1" : "ns from the seed");
@@ -1318,12 +1361,14 @@ function paintRaster(frame) {
   ctx.fillRect(0, 0, W, H);
   ctx.font = "12px sans-serif";
   ctx.textBaseline = "middle";
+  const rep = repairedOf(frame);
   for (let c = 0; c < nCh; c++) {
     const y = M.top + c * ROW_H;
     if (c % 2) { ctx.fillStyle = "#f4f4f4"; ctx.fillRect(x0, y, x1 - x0, ROW_H); }
     ctx.fillStyle = "#333";
     ctx.textAlign = "right";
     ctx.fillText(`${labelOf(c, r)} (${c})`, x0 - 6, y + ROW_H / 2);
+    if (rep[c]) repairTag(ctx, x1, y + ROW_H / 2);
     // Every kept hit of the channel, dropped ones included: hiding ch 7's
     // points must not hide the fact that it has 30k of them.
     const n = meta.per_channel ? meta.per_channel[c] : null;

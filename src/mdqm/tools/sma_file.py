@@ -340,6 +340,27 @@ def _good(f: dict) -> int:
     return f["processed"] - f["stale"] - f["empty"] - f.get("suspect", 0)
 
 
+def epoch_repair_line(c: dict, enabled) -> str:
+    """One channel's coarse offset and epoch vote (summary ``channels[]`` entry).
+
+    The vote per candidate correction (whole epochs moved: -1 = one earlier):
+    in time / off time (scaled) / exposed words."""
+    rp = c.get("repair")
+    head = (f"coarse offset {c['label']} (ch {c['ch']}): {c['offset_ticks']} ticks, R {c['R']}, "
+            f"times {c['times']}")
+    if not rp:
+        return head + "; no epoch vote (no nominal delay to S1 for this channel)"
+    votes = " ".join(f"{k:+d}:{n}/{o:g}/{x}" for k, n, o, x in rp["votes"])
+    verdict = (f"undecided ({rp['undecided']})" if rp["correction"] is None
+               else f"correction {rp['correction']:+d} epochs")
+    moved = (f", moved {_frac(rp['moved_share'])} of hits by {rp['moved_by']:+d} epoch(s)"
+             if rp["moved"] else ", no hit moved")
+    if rp.get("would_move"):
+        moved += f", {_frac(rp['would_move_share'])} would move (repair off or R low)"
+    return (head + f"; epoch repair {'on' if enabled else 'off'}, {verdict}{moved}; "
+            f"votes (correction:in/off/exposed) {votes}")
+
+
 def _eff(e: dict, digits=1) -> str:
     """A timed efficiency, or "n/a (reason)" when the plugin withheld it."""
     if e["eff"] is None:
@@ -426,6 +447,9 @@ def text_summary(summary: dict, stats: FeedStats, file_label: str, elapsed_s: fl
     if mm:
         lines.append("fine/coarse mismatch: "
                      + "  ".join(f"{c['label']} {_frac(c['mismatch_frac'])}" for c in mm))
+    for c in ch:
+        if c.get("kind") == "coarse_offset" and c.get("flagged"):
+            lines.append(epoch_repair_line(c, (summary.get("epoch_repair") or {}).get("enabled")))
     lines.append("timed efficiency given S1: "
                  + "  ".join(f"{e['counter']} {_eff(e)}" for e in summary["efficiency"]))
     rf = summary["rf"]
